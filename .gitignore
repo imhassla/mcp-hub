@@ -1,0 +1,23 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# Local observability / benchmark / report artifacts
+.local/
+hub-observer/
+hub-reports/
+*.jsonl
+*.summary.json
+pool-report-*.json
+pool-report-*.md
+wait-mode-ab-*.json
+
+# Local deployment overlay (host-specific binds/secrets)
+deploy/hub.local.env
+
+# Local MCP client config
+.mcp.json
+.claude/

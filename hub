@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENDPOINT="${HUB_ENDPOINT:-http://localhost:3000/mcp}"
+ROLE="assistant"
+BACKEND="codex"
+AGENT_ID=""
+AGENT_NAME=""
+NAMESPACE=""
+ONBOARDING_MODE="compact"
+DRY_RUN=0
+EXTRA_NOTE=""
+RUNTIME_MODE_OVERRIDE=""
+LIFECYCLE_OVERRIDE=""
+
+usage() {
+  cat <<USAGE
+Usage: ./hub [options]
+
+Options:
+  --role <assistant|reviewer|orchestrator|executor|helper>
+  --backend <codex|claude>
+  --endpoint <http://host:port/mcp>
+  --agent-id <id>
+  --agent-name <name>
+  --namespace <tag>
+  --onboarding <full|compact|none>
+  --lifecycle <persistent|ephemeral>
+  --runtime-mode <repo|isolated|unknown>
+  --repo-runtime         Shortcut for --runtime-mode repo
+  --isolated-runtime     Shortcut for --runtime-mode isolated
+  --note <text>
+  --dry-run              Print composed prompt only
+  -h, --help             Show this help
+USAGE
+}
+
+require_cmd() {
+  local bin="$1"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "Missing command: $bin" >&2
+    exit 1
+  fi
+}
+
+normalize_role() {
+  case "$1" in
+    assistant|reviewer|orchestrator) printf '%s' "$1" ;;
+    executor|helper) printf 'assistant' ;;
+    *)
+      echo "Unsupported role: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+default_lifecycle_for_role() {
+  case "$1" in
+    orchestrator|reviewer) printf 'persistent' ;;
+    assistant) printf 'persistent' ;;
+    *) printf 'persistent' ;;
+  esac
+}
+
+default_capabilities_for_role() {
+  case "$1" in
+    orchestrator) printf 'orchestration,task-dispatch,planning' ;;
+    reviewer) printf 'review,verification,consensus' ;;
+    assistant) printf 'execution,implementation,handoff' ;;
+    *) printf 'general' ;;
+  esac
+}
+
+detect_runtime_profile_json() {
+  local cwd has_git file_count empty_dir mode source notes
+  cwd="$(pwd)"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    has_git=true
+  else
+    has_git=false
+  fi
+
+  file_count=$(find . -maxdepth 2 -type f ! -path './.git/*' 2>/dev/null | wc -l | tr -d ' ')
+  if [ -z "$file_count" ]; then
+    file_count=0
+  fi
+
+  if [ "$file_count" -eq 0 ]; then
+    empty_dir=true
+  else
+    empty_dir=false
+  fi
+
+  if [ "$has_git" = "true" ] || [ "$file_count" -gt 0 ]; then
+    mode='repo'
+  elif [ "$empty_dir" = "true" ]; then
+    mode='isolated'
+  else
+    mode='unknown'
+  fi
+
+  source="client_auto"
+  notes=""
+  if [ -n "$RUNTIME_MODE_OVERRIDE" ]; then
+    mode="$RUNTIME_MODE_OVERRIDE"
+    source="client_declared"
+    notes="runtime_mode_forced_via_hub_flag"
+  fi
+
+  jq -cn \
+    --arg mode "$mode" \
+    --arg cwd "$cwd" \
+    --argjson has_git "$has_git" \
+    --argjson file_count "$file_count" \
+    --argjson empty_dir "$empty_dir" \
+    --arg source "$source" \
+    --arg notes "$notes" \
+    --argjson detected_at "$(date +%s000)" \
+    '{
+      mode:$mode,
+      cwd:$cwd,
+      has_git:$has_git,
+      file_count:$file_count,
+      empty_dir:$empty_dir,
+      source:$source,
+      detected_at:$detected_at,
+      notes:(if ($notes|length)>0 then $notes else null end)
+    }'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role)
+      ROLE="$(normalize_role "${2:-}")"
+      shift 2
+      ;;
+    --backend)
+      BACKEND="${2:-}"
+      shift 2
+      ;;
+    --endpoint)
+      ENDPOINT="${2:-}"
+      shift 2
+      ;;
+    --agent-id)
+      AGENT_ID="${2:-}"
+      shift 2
+      ;;
+    --agent-name)
+      AGENT_NAME="${2:-}"
+      shift 2
+      ;;
+    --namespace)
+      NAMESPACE="${2:-}"
+      shift 2
+      ;;
+    --onboarding)
+      ONBOARDING_MODE="${2:-}"
+      shift 2
+      ;;
+    --runtime-mode)
+      RUNTIME_MODE_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --lifecycle)
+      LIFECYCLE_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --repo-runtime)
+      RUNTIME_MODE_OVERRIDE="repo"
+      shift
+      ;;
+    --isolated-runtime)
+      RUNTIME_MODE_OVERRIDE="isolated"
+      shift
+      ;;
+    --note)
+      EXTRA_NOTE="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$BACKEND" != "codex" ] && [ "$BACKEND" != "claude" ]; then
+  echo "Unsupported backend: $BACKEND (use codex|claude)" >&2
+  exit 1
+fi
+
+if [ "$ONBOARDING_MODE" != "full" ] && [ "$ONBOARDING_MODE" != "compact" ] && [ "$ONBOARDING_MODE" != "none" ]; then
+  echo "Unsupported onboarding mode: $ONBOARDING_MODE" >&2
+  exit 1
+fi
+
+if [ -n "$RUNTIME_MODE_OVERRIDE" ] && [ "$RUNTIME_MODE_OVERRIDE" != "repo" ] && [ "$RUNTIME_MODE_OVERRIDE" != "isolated" ] && [ "$RUNTIME_MODE_OVERRIDE" != "unknown" ]; then
+  echo "Unsupported runtime mode override: $RUNTIME_MODE_OVERRIDE (use repo|isolated|unknown)" >&2
+  exit 1
+fi
+
+if [ -n "$LIFECYCLE_OVERRIDE" ] && [ "$LIFECYCLE_OVERRIDE" != "persistent" ] && [ "$LIFECYCLE_OVERRIDE" != "ephemeral" ]; then
+  echo "Unsupported lifecycle override: $LIFECYCLE_OVERRIDE (use persistent|ephemeral)" >&2
+  exit 1
+fi
+
+require_cmd jq
+
+if [ -z "$AGENT_ID" ]; then
+  AGENT_ID="${ROLE}-${BACKEND}-$(date +%s)"
+fi
+if [ -z "$AGENT_NAME" ]; then
+  role_title="$(printf '%s' "$ROLE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  backend_title="$(printf '%s' "$BACKEND" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+  AGENT_NAME="${role_title} ${backend_title}"
+fi
+
+ROLE_PROMPT_FILE="$ROOT_DIR/prompts/hub/${ROLE}.md"
+if [ ! -f "$ROLE_PROMPT_FILE" ]; then
+  echo "Missing role prompt: $ROLE_PROMPT_FILE" >&2
+  exit 1
+fi
+
+RUNTIME_PROFILE_JSON="$(detect_runtime_profile_json)"
+RUNTIME_MODE="$(printf '%s' "$RUNTIME_PROFILE_JSON" | jq -r '.mode')"
+CAPABILITIES="$(default_capabilities_for_role "$ROLE")"
+LIFECYCLE="$(default_lifecycle_for_role "$ROLE")"
+if [ -n "$LIFECYCLE_OVERRIDE" ]; then
+  LIFECYCLE="$LIFECYCLE_OVERRIDE"
+fi
+
+if [ -n "$NAMESPACE" ]; then
+  NS_LINE="- Preferred namespace for all task operations: $NAMESPACE"
+else
+  NS_LINE='- Use explicit namespace for every swarm/experiment task operation.'
+fi
+
+if [ "$RUNTIME_MODE" = "isolated" ]; then
+  RUNTIME_NOTICE='Detected isolated runtime (empty/no-repo context). Prefer artifact/context handoff and avoid repo file assumptions.'
+else
+  RUNTIME_NOTICE='Detected repo runtime (local files available).'
+fi
+
+if [ -n "$RUNTIME_MODE_OVERRIDE" ]; then
+  RUNTIME_NOTICE="$RUNTIME_NOTICE Runtime mode was explicitly forced via launcher flag."
+fi
+
+PROMPT="$(cat <<EOF_PROMPT
+$(cat "$ROOT_DIR/AGENT_PROMPT.md")
+
+## Hub Launcher Contract
+
+Runtime profile (auto-detected):
+authoritative_runtime_profile_json = $RUNTIME_PROFILE_JSON
+
+Startup contract for this session:
+1. register_agent with:
+   - id: \"$AGENT_ID\"
+   - name: \"$AGENT_NAME\"
+   - type: \"$BACKEND\"
+   - role: \"$ROLE\"
+   - capabilities: \"$CAPABILITIES\"
+   - lifecycle: \"$LIFECYCLE\"
+   - onboarding_mode: \"$ONBOARDING_MODE\"
+   - runtime_profile: authoritative_runtime_profile_json
+2. Extract auth.token and attach auth_token to every following tool call.
+3. Call get_onboarding(mode=\"compact\", role=\"$ROLE\", runtime_mode=\"${RUNTIME_MODE}\", empty_dir=$(printf '%s' "$RUNTIME_PROFILE_JSON" | jq -r '.empty_dir')) once and cache tool/rule map.
+4. Respect execution_mode routing on tasks (repo|isolated|any).
+
+Session facts:
+- Endpoint: $ENDPOINT
+- Role: $ROLE
+- $RUNTIME_NOTICE
+$NS_LINE
+$( [ -n "$EXTRA_NOTE" ] && printf '%s\n' "- Extra note: $EXTRA_NOTE" )
+
+$(cat "$ROLE_PROMPT_FILE")
+EOF_PROMPT
+)"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf '%s\n' "$PROMPT"
+  exit 0
+fi
+
+if [ "$BACKEND" = "codex" ]; then
+  require_cmd codex
+  if [ -n "${CODEX_MODEL:-}" ]; then
+    codex -c "mcp_servers.agent-hub.url=\"$ENDPOINT\"" exec \
+      --full-auto \
+      --skip-git-repo-check \
+      --sandbox workspace-write \
+      --model "$CODEX_MODEL" \
+      "$PROMPT"
+  else
+    codex -c "mcp_servers.agent-hub.url=\"$ENDPOINT\"" exec \
+      --full-auto \
+      --skip-git-repo-check \
+      --sandbox workspace-write \
+      "$PROMPT"
+  fi
+  exit $?
+fi
+
+require_cmd claude
+TMP_MCP_CONFIG="$(mktemp)"
+cleanup() {
+  rm -f "$TMP_MCP_CONFIG"
+}
+trap cleanup EXIT
+
+cat > "$TMP_MCP_CONFIG" <<EOF_CFG
+{
+  "mcpServers": {
+    "agent-hub": {
+      "url": "$ENDPOINT"
+    }
+  }
+}
+EOF_CFG
+
+if [ -n "${CLAUDE_MODEL:-}" ]; then
+  claude -p \
+    --permission-mode bypassPermissions \
+    --mcp-config "$TMP_MCP_CONFIG" \
+    --strict-mcp-config \
+    --model "$CLAUDE_MODEL" \
+    "$PROMPT"
+else
+  claude -p \
+    --permission-mode bypassPermissions \
+    --mcp-config "$TMP_MCP_CONFIG" \
+    --strict-mcp-config \
+    "$PROMPT"
+fi
