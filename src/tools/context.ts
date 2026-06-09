@@ -39,6 +39,24 @@ interface ResolvedContext extends Context {
   resolved_value?: string | null;
 }
 
+interface ContextCursor {
+  ts: number;
+  id: number;
+}
+
+function parseContextCursor(cursor?: string): ContextCursor | null {
+  if (!cursor || typeof cursor !== 'string') return null;
+  const [tsRaw, idRaw] = cursor.split(':');
+  const ts = Number(tsRaw);
+  const id = Number(idRaw);
+  if (!Number.isFinite(ts) || !Number.isFinite(id) || ts <= 0 || id <= 0) return null;
+  return { ts: Math.floor(ts), id: Math.floor(id) };
+}
+
+function formatContextCursor(ctx: { updated_at: number; id: number }): string {
+  return `${ctx.updated_at}:${ctx.id}`;
+}
+
 function maybeCompressValue(value: string, mode: 'none' | 'json' | 'whitespace' | 'auto'): { value: string; compressed: boolean } {
   if (mode === 'none') return { value, compressed: false };
   if (mode === 'json') {
@@ -212,6 +230,7 @@ export function handleGetContext(args: {
   limit?: number;
   offset?: number;
   updated_after?: number;
+  cursor?: string;
   response_mode?: 'full' | 'compact' | 'tiny' | 'nano' | 'summary';
   polling?: boolean;
   resolve_blob_refs?: boolean;
@@ -227,24 +246,31 @@ export function handleGetContext(args: {
     };
   }
   const limit = Math.max(1, Math.min(MAX_CONTEXT_LIMIT, Math.floor(args.limit ?? DEFAULT_CONTEXT_LIMIT)));
-  const offset = Math.max(0, Math.floor(args.offset ?? 0));
+  const cursor = parseContextCursor(args.cursor);
   const updatedAfter = Number.isFinite(args.updated_after) ? Math.floor(Number(args.updated_after)) : undefined;
+  const useDeltaOrdering = cursor !== null || updatedAfter !== undefined;
+  const queryLimit = useDeltaOrdering ? Math.min(MAX_CONTEXT_LIMIT + 1, limit + 1) : limit;
+  const offset = useDeltaOrdering ? 0 : Math.max(0, Math.floor(args.offset ?? 0));
   const contexts = getContext({
     agent_id: args.agent_id,
     key: args.key,
     namespace: args.namespace,
-    limit,
+    limit: queryLimit,
     offset,
     updated_after: updatedAfter,
+    cursor: cursor || undefined,
   });
+  const hasMore = useDeltaOrdering ? contexts.length > limit : false;
+  const slicedContexts = hasMore ? contexts.slice(0, limit) : contexts;
+  const nextCursor = slicedContexts.length > 0 ? formatContextCursor(slicedContexts[slicedContexts.length - 1]) : args.cursor || null;
   logActivity(
     args.requesting_agent || 'system',
     'get_context',
-    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}) : ${contexts.length} results`
+    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'}) : ${slicedContexts.length} results`
   );
 
   const resolvedContexts: ResolvedContext[] = args.resolve_blob_refs
-    ? contexts.map((ctx) => {
+    ? slicedContexts.map((ctx) => {
       const blobRef = parseBlobRefEnvelope(ctx.value);
       if (!blobRef) return { ...ctx };
       const blob = getProtocolBlob(blobRef.hash);
@@ -261,7 +287,7 @@ export function handleGetContext(args: {
         resolved_value: decoded ? decoded.value : null,
       };
     })
-    : contexts;
+    : slicedContexts;
 
   if (responseMode === 'nano') {
     const nano = resolvedContexts.map((ctx) => {
@@ -286,6 +312,8 @@ export function handleGetContext(args: {
     });
     return {
       c: nano,
+      h: hasMore ? 1 : 0,
+      n: nextCursor,
     };
   }
 
@@ -316,6 +344,8 @@ export function handleGetContext(args: {
     });
     return {
       contexts: compactLike,
+      has_more: hasMore,
+      next_cursor: nextCursor,
     };
   }
 
@@ -353,7 +383,7 @@ export function handleGetContext(args: {
     };
   }
 
-  return { contexts: resolvedContexts };
+  return { contexts: resolvedContexts, has_more: hasMore, next_cursor: nextCursor };
 }
 
 export const contextTools = {
@@ -406,6 +436,7 @@ export const contextTools = {
         limit: { type: 'number', description: `Max rows to return (default ${DEFAULT_CONTEXT_LIMIT}, max ${MAX_CONTEXT_LIMIT})` },
         offset: { type: 'number', description: 'Row offset for pagination (default 0)' },
         updated_after: { type: 'number', description: 'Delta mode: return context rows with updated_at > updated_after (ms epoch)' },
+        cursor: { type: 'string', description: 'Delta cursor "<updated_at>:<id>" returned by previous get_context call' },
         response_mode: { type: 'string', enum: ['full', 'compact', 'tiny', 'nano', 'summary'], description: 'compact shows previews, tiny shows digests/sizes, nano uses short keys, summary returns aggregates' },
         polling: { type: 'boolean', description: 'Mark this call as polling-cycle read; full mode is forbidden when polling=true' },
         resolve_blob_refs: { type: 'boolean', description: 'Resolve CAEP blob-ref values from protocol blob store' },

@@ -5,6 +5,9 @@ import {
   runMaintenance,
   getKpiWindows,
   getUpdateWatermark,
+  getMinStreamEventId,
+  getStreamEventWatermark,
+  listStreamEventsAfter,
   evaluateSloAlerts,
   listSloAlerts,
   getAuthCoverageSnapshot,
@@ -12,6 +15,7 @@ import {
 import { handleReadMessages } from './messages.js';
 import { handleListTasks } from './tasks.js';
 import { handleGetContext } from './context.js';
+import type { StreamEventName } from '../types.js';
 
 const DEFAULT_WINDOWS_SEC = [60, 300, 1800];
 const MAX_WINDOWS = 6;
@@ -37,6 +41,8 @@ const WAIT_TIMEOUT_RESPONSE_MODES = ['default', 'minimal'] as const;
 type WaitTimeoutResponseMode = (typeof WAIT_TIMEOUT_RESPONSE_MODES)[number];
 const WAIT_STREAMS = ['messages', 'tasks', 'context', 'activity'] as const;
 type WaitStream = (typeof WAIT_STREAMS)[number];
+const EVENT_DELTA_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const;
+type EventDeltaStream = (typeof EVENT_DELTA_STREAMS)[number];
 const DEFAULT_WAIT_RESPONSE_MODE: WaitResponseMode = (() => {
   const configured = String(process.env.MCP_HUB_WAIT_DEFAULT_RESPONSE_MODE || '').toLowerCase().trim();
   if (configured === 'nano') return 'nano';
@@ -49,7 +55,7 @@ const DEFAULT_WAIT_TIMEOUT_RESPONSE_MODE: WaitTimeoutResponseMode = (() => {
   const configured = String(process.env.MCP_HUB_WAIT_DEFAULT_TIMEOUT_RESPONSE || '').toLowerCase().trim();
   return configured === 'minimal' ? 'minimal' : 'default';
 })();
-const WAIT_LOG_HITS = String(process.env.MCP_HUB_WAIT_LOG_HITS || 'true').toLowerCase() !== 'false';
+const WAIT_LOG_HITS = String(process.env.MCP_HUB_WAIT_LOG_HITS || '').toLowerCase() === 'true';
 const WAIT_LOG_TIMEOUTS = String(process.env.MCP_HUB_WAIT_LOG_TIMEOUTS || '').toLowerCase() === 'true';
 const waitTimeoutStreak = new Map<string, number>();
 const MAX_SNAPSHOT_LIMIT = 500;
@@ -118,40 +124,45 @@ function normalizeWaitStreams(input?: unknown): { ok: true; streams: WaitStream[
   return { ok: true, streams: normalized as WaitStream[] };
 }
 
-function encodeWaitCursor(watermark: {
-  latest_message_ts: number;
-  latest_task_ts: number;
-  latest_context_ts: number;
-  latest_activity_ts: number;
-}): string {
-  const parts = [
-    watermark.latest_message_ts,
-    watermark.latest_task_ts,
-    watermark.latest_context_ts,
-    watermark.latest_activity_ts,
-  ];
-  return parts
-    .map((value) => Math.max(0, Math.floor(Number(value) || 0)).toString(36))
-    .join('.');
+function normalizeEventDeltaStreams(input?: unknown): { ok: true; streams: EventDeltaStream[] } | { ok: false; invalid: string[] } {
+  if (!Array.isArray(input) || input.length === 0) {
+    return { ok: true, streams: [...EVENT_DELTA_STREAMS] };
+  }
+  const normalized = [...new Set(input
+    .map((value) => String(value || '').toLowerCase().trim())
+    .filter((value) => value.length > 0))];
+  const invalid = normalized.filter((value) => !EVENT_DELTA_STREAMS.includes(value as EventDeltaStream));
+  if (invalid.length > 0) {
+    return { ok: false, invalid };
+  }
+  return { ok: true, streams: normalized as EventDeltaStream[] };
 }
 
-function parseWaitCursor(cursor?: string): {
-  message_since_ts: number;
-  task_since_ts: number;
-  context_since_ts: number;
-  activity_since_ts: number;
-} | null {
-  if (typeof cursor !== 'string' || cursor.trim().length === 0) return null;
-  const parts = cursor.trim().split('.');
-  if (parts.length !== 4) return null;
-  const values = parts.map((part) => Number.parseInt(part, 36));
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) return null;
+function encodeEventCursor(eventId: number): string {
+  return `e:${Math.max(0, Math.floor(Number(eventId) || 0)).toString(36)}`;
+}
+
+function getCursorStaleness(agentId: string, afterId: number, streams: StreamEventName[]) {
+  const minEventId = getMinStreamEventId({ agent_id: agentId, streams });
+  if (afterId <= 0 || minEventId <= 0 || afterId >= minEventId) {
+    return { stale: false, min_event_id: minEventId };
+  }
   return {
-    message_since_ts: Math.floor(values[0]),
-    task_since_ts: Math.floor(values[1]),
-    context_since_ts: Math.floor(values[2]),
-    activity_since_ts: Math.floor(values[3]),
+    stale: true,
+    min_event_id: minEventId,
+    resync_required: true,
+    resync_hint: 'read_snapshot',
   };
+}
+
+function parseEventCursor(cursor?: string): number | null {
+  if (typeof cursor !== 'string' || cursor.trim().length === 0) return null;
+  const value = cursor.trim();
+  const match = /^e:([0-9a-z]+)$/i.exec(value);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 36);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
 }
 
 export function handleGetActivityLog(args: {
@@ -345,12 +356,12 @@ export function handleReadSnapshot(args: {
     return { success: false, error_code: 'AGENT_ID_REQUIRED', error: 'agent_id or requesting_agent is required' };
   }
 
-  const parsedCursor = parseWaitCursor(args.cursor);
-  if (typeof args.cursor === 'string' && args.cursor.trim().length > 0 && !parsedCursor) {
+  const parsedEventCursor = parseEventCursor(args.cursor);
+  if (typeof args.cursor === 'string' && args.cursor.trim().length > 0 && parsedEventCursor === null) {
     return {
       success: false,
       error_code: 'CURSOR_INVALID',
-      error: 'Invalid cursor. Expected 4 base36 segments: <message>.<task>.<context>.<activity>.',
+      error: 'Invalid cursor. Expected event cursor "e:<id>".',
     };
   }
 
@@ -367,21 +378,34 @@ export function handleReadSnapshot(args: {
   const messageLimit = normalizeSnapshotLimit(args.message_limit);
   const taskLimit = normalizeSnapshotLimit(args.task_limit);
   const contextLimit = normalizeSnapshotLimit(args.context_limit);
-  const messageSinceTs = parsedCursor?.message_since_ts;
-  const taskSinceTs = parsedCursor?.task_since_ts;
-  const contextSinceTs = parsedCursor?.context_since_ts;
-  const activitySinceTs = parsedCursor?.activity_since_ts;
+  const eventChanges = parsedEventCursor !== null
+    ? listStreamEventsAfter({
+      agent_id: watcherAgentId,
+      after_id: parsedEventCursor,
+      streams: ['messages', 'tasks', 'context', 'activity'],
+      limit: 1000,
+    })
+    : [];
+  const eventStreams = new Set(eventChanges.map((event) => event.stream));
+  const shouldReadAll = parsedEventCursor === null;
+  const shouldReadMessages = shouldReadAll || eventStreams.has('messages');
+  const shouldReadTasks = shouldReadAll || eventStreams.has('tasks');
+  const shouldReadContext = shouldReadAll || eventStreams.has('context');
 
-  const messages = handleReadMessages({
+  const messages = shouldReadMessages ? handleReadMessages({
     agent_id: watcherAgentId,
     from: args.message_from,
     unread_only: args.message_unread_only,
     limit: messageLimit,
-    since_ts: messageSinceTs,
     response_mode: responseMode,
     polling: true,
     resolve_blob_refs: args.resolve_blob_refs,
-  }) as Record<string, unknown>;
+    mark_read: false,
+  }) as Record<string, unknown> : (
+    responseMode === 'nano'
+      ? { m: [], h: 0, n: null }
+      : { messages: [], has_more: false, next_cursor: null }
+  );
   if (isToolErrorPayload(messages)) {
     return {
       success: false,
@@ -392,7 +416,7 @@ export function handleReadSnapshot(args: {
     };
   }
 
-  const tasks = handleListTasks({
+  const tasks = shouldReadTasks ? handleListTasks({
     agent_id: args.requesting_agent || watcherAgentId,
     status: args.task_status,
     assigned_to: args.task_assigned_to,
@@ -401,10 +425,13 @@ export function handleReadSnapshot(args: {
     ready_only: args.task_ready_only,
     include_dependencies: args.include_dependencies,
     limit: taskLimit,
-    updated_after: taskSinceTs,
     response_mode: responseMode,
     polling: true,
-  }) as Record<string, unknown>;
+  }) as Record<string, unknown> : (
+    responseMode === 'nano'
+      ? { t: [], h: 0, n: null }
+      : { tasks: [], has_more: false, next_cursor: null }
+  );
   if (isToolErrorPayload(tasks)) {
     return {
       success: false,
@@ -415,17 +442,20 @@ export function handleReadSnapshot(args: {
     };
   }
 
-  const context = handleGetContext({
+  const context = shouldReadContext ? handleGetContext({
     requesting_agent: args.requesting_agent || watcherAgentId,
     agent_id: args.context_agent_id,
     key: args.context_key,
     namespace: args.context_namespace,
     limit: contextLimit,
-    updated_after: contextSinceTs,
     response_mode: responseMode,
     polling: true,
     resolve_blob_refs: args.resolve_blob_refs,
-  }) as Record<string, unknown>;
+  }) as Record<string, unknown> : (
+    responseMode === 'nano'
+      ? { c: [], h: 0, n: null }
+      : { contexts: [], has_more: false, next_cursor: null }
+  );
   if (isToolErrorPayload(context)) {
     return {
       success: false,
@@ -436,15 +466,16 @@ export function handleReadSnapshot(args: {
     };
   }
 
-  const watermark = getUpdateWatermark(watcherAgentId, { streams: ['messages', 'tasks', 'context', 'activity'] });
+  const eventWatermark = getStreamEventWatermark({
+    agent_id: watcherAgentId,
+    streams: ['messages', 'tasks', 'context', 'activity'],
+  });
   const changed = {
-    messages: watermark.latest_message_ts > (messageSinceTs || 0),
-    tasks: watermark.latest_task_ts > (taskSinceTs || 0),
-    context: watermark.latest_context_ts > (contextSinceTs || 0),
-    activity: watermark.latest_activity_ts > (activitySinceTs || 0),
+    messages: eventStreams.has('messages'),
+    tasks: eventStreams.has('tasks'),
+    context: eventStreams.has('context'),
+    activity: eventStreams.has('activity'),
   };
-  const cursor = encodeWaitCursor(watermark);
-
   const messagesCount = Array.isArray((messages as { m?: unknown[] }).m)
     ? (messages as { m: unknown[] }).m.length
     : Array.isArray((messages as { messages?: unknown[] }).messages)
@@ -464,8 +495,10 @@ export function handleReadSnapshot(args: {
   logActivity(
     args.requesting_agent || watcherAgentId,
     'read_snapshot',
-    `messages=${messagesCount} tasks=${tasksCount} context=${contextCount} mode=${responseMode} cursor_in=${args.cursor || '-'} cursor_out=${cursor}`
+    `messages=${messagesCount} tasks=${tasksCount} context=${contextCount} mode=${responseMode} cursor_in=${args.cursor || '-'} cursor_out=${encodeEventCursor(eventWatermark)}`,
+    { emit_stream_event: false }
   );
+  const cursor = encodeEventCursor(eventWatermark);
 
   if (responseMode === 'nano') {
     return {
@@ -489,6 +522,7 @@ export function handleReadSnapshot(args: {
         t: (tasks as { n?: string | null }).n ?? null,
       },
       u: cursor,
+      ei: eventWatermark,
     };
   }
 
@@ -497,6 +531,14 @@ export function handleReadSnapshot(args: {
     response_mode: responseMode,
     changed,
     cursor,
+    event_id: eventWatermark,
+    events: eventChanges.map((event) => ({
+      id: event.id,
+      stream: event.stream,
+      op: event.op,
+      entity_id: event.entity_id,
+      created_at: event.created_at,
+    })),
     snapshot: {
       messages,
       tasks,
@@ -515,10 +557,6 @@ export async function handleWaitForUpdates(args: {
   agent_id?: string;
   streams?: WaitStream[];
   cursor?: string;
-  message_since_ts?: number;
-  task_since_ts?: number;
-  context_since_ts?: number;
-  activity_since_ts?: number;
   wait_ms?: number;
   poll_interval_ms?: number;
   adaptive_retry?: boolean;
@@ -540,74 +578,84 @@ export async function handleWaitForUpdates(args: {
     };
   }
   const watchedStreams = streamSelection.streams;
-  const watchSet = new Set<WaitStream>(watchedStreams);
 
   const responseMode = normalizeWaitResponseMode(args.response_mode || DEFAULT_WAIT_RESPONSE_MODE);
   const timeoutResponseMode = normalizeWaitTimeoutResponseMode(args.timeout_response || DEFAULT_WAIT_TIMEOUT_RESPONSE_MODE);
-  const parsedCursor = parseWaitCursor(args.cursor);
-  if (typeof args.cursor === 'string' && args.cursor.trim().length > 0 && !parsedCursor) {
+  const parsedEventCursor = parseEventCursor(args.cursor);
+  if (typeof args.cursor === 'string' && args.cursor.trim().length > 0 && parsedEventCursor === null) {
     return {
       success: false,
       error_code: 'CURSOR_INVALID',
-      error: 'Invalid cursor. Expected 4 base36 segments: <message>.<task>.<context>.<activity>.',
+      error: 'Invalid cursor. Expected event cursor "e:<id>".',
     };
   }
   const waitMs = Math.max(100, Math.min(MAX_WAIT_MS, Math.floor(Number(args.wait_ms ?? DEFAULT_WAIT_MS))));
   const pollIntervalMs = Math.max(100, Math.min(2_000, Math.floor(Number(args.poll_interval_ms ?? DEFAULT_POLL_INTERVAL_MS))));
   const startedAt = Date.now();
   const deadline = startedAt + waitMs;
-
-  const messageSince = Number.isFinite(args.message_since_ts)
-    ? Math.floor(Number(args.message_since_ts))
-    : (parsedCursor?.message_since_ts ?? 0);
-  const taskSince = Number.isFinite(args.task_since_ts)
-    ? Math.floor(Number(args.task_since_ts))
-    : (parsedCursor?.task_since_ts ?? 0);
-  const contextSince = Number.isFinite(args.context_since_ts)
-    ? Math.floor(Number(args.context_since_ts))
-    : (parsedCursor?.context_since_ts ?? 0);
-  const activitySince = Number.isFinite(args.activity_since_ts)
-    ? Math.floor(Number(args.activity_since_ts))
-    : (parsedCursor?.activity_since_ts ?? 0);
+  const afterId = parsedEventCursor ?? getStreamEventWatermark({
+    agent_id: watcherAgentId,
+    streams: watchedStreams,
+  });
+  const cursorState = getCursorStaleness(watcherAgentId, afterId, watchedStreams);
+  if (cursorState.stale) {
+    const watermarkEventId = getStreamEventWatermark({
+      agent_id: watcherAgentId,
+      streams: watchedStreams,
+    });
+    const cursor = encodeEventCursor(watermarkEventId);
+    const adaptiveRetry = args.adaptive_retry !== false;
+    const retryAfterMs = adaptiveRetry
+      ? computeAdaptiveWaitRetryMs(watcherAgentId, pollIntervalMs)
+      : pollIntervalMs;
+    logActivity(
+      watcherAgentId,
+      'wait_for_updates_cursor_stale',
+      `cursor_in=${args.cursor || '-'} min_event_id=${cursorState.min_event_id} event_cursor=${watermarkEventId}`,
+      { emit_stream_event: false }
+    );
+    if (responseMode === 'nano') {
+      return { c: 0, u: cursor, r: retryAfterMs, i: watermarkEventId, x: 1, m: cursorState.min_event_id };
+    }
+    return {
+      success: true,
+      changed: false,
+      cursor,
+      retry_after_ms: retryAfterMs,
+      event_id: watermarkEventId,
+      cursor_stale: true,
+      resync_required: true,
+      resync_hint: cursorState.resync_hint,
+      min_event_id: cursorState.min_event_id,
+    };
+  }
 
   while (Date.now() <= deadline) {
-    const watermark = getUpdateWatermark(watcherAgentId, {
+    const events = listStreamEventsAfter({
+      agent_id: watcherAgentId,
+      after_id: afterId,
       streams: watchedStreams,
-      fallback: {
-        latest_message_ts: messageSince,
-        latest_task_ts: taskSince,
-        latest_context_ts: contextSince,
-        latest_activity_ts: activitySince,
-      },
+      limit: 100,
     });
-    const changed = {
-      messages: watchSet.has('messages') && watermark.latest_message_ts > messageSince,
-      tasks: watchSet.has('tasks') && watermark.latest_task_ts > taskSince,
-      context: watchSet.has('context') && watermark.latest_context_ts > contextSince,
-      activity: watchSet.has('activity') && watermark.latest_activity_ts > activitySince,
-    };
-    if (changed.messages || changed.tasks || changed.context || changed.activity) {
+    if (events.length > 0) {
       resetAdaptiveWaitRetry(watcherAgentId);
+      const nextEventId = events[events.length - 1].id;
+      const cursor = encodeEventCursor(nextEventId);
+      const changedStreams = [...new Set(events.map((event) => event.stream))];
+      const changed = {
+        messages: changedStreams.includes('messages'),
+        tasks: changedStreams.includes('tasks'),
+        context: changedStreams.includes('context'),
+        activity: changedStreams.includes('activity'),
+      };
       if (WAIT_LOG_HITS) {
-        logActivity(watcherAgentId, 'wait_for_updates_hit', `changed=${JSON.stringify(changed)}`);
+        logActivity(watcherAgentId, 'wait_for_updates_hit', `event_cursor=${afterId} changed=${JSON.stringify(changed)}`, { emit_stream_event: false });
       }
-      const cursor = encodeWaitCursor(watermark);
-      const changedStreams = (Object.entries(changed)
-        .filter(([, value]) => value)
-        .map(([key]) => key));
       if (responseMode === 'nano') {
-        return {
-          c: 1,
-          s: changedStreams,
-          u: cursor,
-        };
+        return { c: 1, s: changedStreams, u: cursor, i: nextEventId };
       }
       if (responseMode === 'micro') {
-        return {
-          changed: true,
-          streams: changedStreams,
-          cursor,
-        };
+        return { changed: true, streams: changedStreams, cursor, event_id: nextEventId };
       }
       if (responseMode === 'tiny') {
         return {
@@ -615,12 +663,7 @@ export async function handleWaitForUpdates(args: {
           changed: true,
           streams: changedStreams,
           cursor,
-          watermark: {
-            message: watermark.latest_message_ts,
-            task: watermark.latest_task_ts,
-            context: watermark.latest_context_ts,
-            activity: watermark.latest_activity_ts,
-          },
+          event_id: nextEventId,
         };
       }
       if (responseMode === 'compact') {
@@ -628,11 +671,16 @@ export async function handleWaitForUpdates(args: {
           success: true,
           changed: true,
           elapsed_ms: Date.now() - startedAt,
-          streams: (Object.entries(changed)
-            .filter(([, value]) => value)
-            .map(([key]) => key)),
+          streams: changedStreams,
           cursor,
-          watermark,
+          event_id: nextEventId,
+          events: events.map((event) => ({
+            id: event.id,
+            stream: event.stream,
+            op: event.op,
+            entity_id: event.entity_id,
+            created_at: event.created_at,
+          })),
         };
       }
       return {
@@ -640,23 +688,20 @@ export async function handleWaitForUpdates(args: {
         changed: true,
         elapsed_ms: Date.now() - startedAt,
         cursor,
+        event_id: nextEventId,
         changed_streams: changed,
-        watermark,
+        watermark: getUpdateWatermark(watcherAgentId, { streams: watchedStreams }),
+        events,
       };
     }
     await sleep(pollIntervalMs);
   }
 
-  const watermark = getUpdateWatermark(watcherAgentId, {
+  const watermarkEventId = Math.max(afterId, getStreamEventWatermark({
+    agent_id: watcherAgentId,
     streams: watchedStreams,
-    fallback: {
-      latest_message_ts: messageSince,
-      latest_task_ts: taskSince,
-      latest_context_ts: contextSince,
-      latest_activity_ts: activitySince,
-    },
-  });
-  const cursor = encodeWaitCursor(watermark);
+  }));
+  const cursor = encodeEventCursor(watermarkEventId);
   const adaptiveRetry = args.adaptive_retry !== false;
   const retryAfterMs = adaptiveRetry
     ? computeAdaptiveWaitRetryMs(watcherAgentId, pollIntervalMs)
@@ -665,7 +710,8 @@ export async function handleWaitForUpdates(args: {
     logActivity(
       watcherAgentId,
       'wait_for_updates_timeout',
-      `wait_ms=${waitMs} retry_after_ms=${retryAfterMs} mode=${responseMode} adaptive=${adaptiveRetry ? 1 : 0} streams=${watchedStreams.join(',')}`
+      `wait_ms=${waitMs} retry_after_ms=${retryAfterMs} mode=${responseMode} adaptive=${adaptiveRetry ? 1 : 0} streams=${watchedStreams.join(',')} event_cursor=${watermarkEventId}`,
+      { emit_stream_event: false }
     );
   }
   if (timeoutResponseMode === 'minimal') {
@@ -676,6 +722,7 @@ export async function handleWaitForUpdates(args: {
       c: 0,
       u: cursor,
       r: retryAfterMs,
+      i: watermarkEventId,
     };
   }
   if (responseMode === 'micro') {
@@ -683,6 +730,7 @@ export async function handleWaitForUpdates(args: {
       changed: false,
       cursor,
       retry_after_ms: retryAfterMs,
+      event_id: watermarkEventId,
     };
   }
   if (responseMode === 'tiny') {
@@ -691,6 +739,7 @@ export async function handleWaitForUpdates(args: {
       changed: false,
       cursor,
       retry_after_ms: retryAfterMs,
+      event_id: watermarkEventId,
     };
   }
   if (responseMode === 'compact') {
@@ -700,6 +749,7 @@ export async function handleWaitForUpdates(args: {
       elapsed_ms: Date.now() - startedAt,
       cursor,
       retry_after_ms: retryAfterMs,
+      event_id: watermarkEventId,
     };
   }
   return {
@@ -707,8 +757,121 @@ export async function handleWaitForUpdates(args: {
     changed: false,
     elapsed_ms: Date.now() - startedAt,
     cursor,
+    event_id: watermarkEventId,
     changed_streams: { messages: false, tasks: false, context: false, activity: false },
-    watermark,
+    watermark: getUpdateWatermark(watcherAgentId, { streams: watchedStreams }),
+  };
+}
+
+export function handleReadEventDeltas(args: {
+  requesting_agent?: string;
+  agent_id?: string;
+  cursor?: string;
+  streams?: EventDeltaStream[];
+  limit?: number;
+  include_payload?: boolean;
+  response_mode?: 'compact' | 'tiny' | 'nano';
+}) {
+  const watcherAgentId = args.agent_id || args.requesting_agent;
+  if (args.requesting_agent) heartbeat(args.requesting_agent);
+  if (!watcherAgentId) {
+    return { success: false, error_code: 'AGENT_ID_REQUIRED', error: 'agent_id or requesting_agent is required' };
+  }
+
+  const parsedEventCursor = parseEventCursor(args.cursor);
+  if (typeof args.cursor === 'string' && args.cursor.trim().length > 0 && parsedEventCursor === null) {
+    return {
+      success: false,
+      error_code: 'CURSOR_INVALID',
+      error: 'Invalid cursor. Expected event cursor "e:<id>".',
+    };
+  }
+
+  const streamSelection = normalizeEventDeltaStreams(args.streams);
+  if (!streamSelection.ok) {
+    return {
+      success: false,
+      error_code: 'STREAMS_INVALID',
+      error: `Invalid streams: ${streamSelection.invalid.join(', ')}. Allowed: ${EVENT_DELTA_STREAMS.join(', ')}`,
+    };
+  }
+  const streams = streamSelection.streams;
+  const limit = Math.max(1, Math.min(1000, Math.floor(Number(args.limit ?? 100))));
+  const afterId = parsedEventCursor ?? getStreamEventWatermark({
+    agent_id: watcherAgentId,
+    streams: streams as StreamEventName[],
+  });
+  const cursorState = getCursorStaleness(watcherAgentId, afterId, streams as StreamEventName[]);
+  const events = listStreamEventsAfter({
+    agent_id: watcherAgentId,
+    after_id: afterId,
+    streams: streams as StreamEventName[],
+    limit,
+  });
+  const watermark = Math.max(afterId, events.length > 0 ? events[events.length - 1].id : getStreamEventWatermark({
+    agent_id: watcherAgentId,
+    streams: streams as StreamEventName[],
+  }));
+  const cursor = encodeEventCursor(watermark);
+  const changedStreams = [...new Set(events.map((event) => event.stream))];
+  const includePayload = args.include_payload === true;
+  const mode = args.response_mode === 'nano' ? 'nano' : (args.response_mode === 'tiny' ? 'tiny' : 'compact');
+
+  logActivity(
+    args.requesting_agent || watcherAgentId,
+    'read_event_deltas',
+    `events=${events.length} streams=${streams.join(',')} cursor_in=${args.cursor || '-'} cursor_out=${cursor} mode=${mode}`,
+    { emit_stream_event: false }
+  );
+
+  if (mode === 'nano') {
+    return {
+      c: events.length,
+      u: cursor,
+      i: watermark,
+      s: changedStreams,
+      x: cursorState.stale ? 1 : undefined,
+      m: cursorState.stale ? cursorState.min_event_id : undefined,
+      e: events.map((event) => [
+        event.id,
+        event.stream,
+        event.op,
+        event.entity_id,
+      ]),
+    };
+  }
+
+  const formattedEvents = events.map((event) => {
+    const base = {
+      event_id: event.id,
+      stream: event.stream,
+      op: event.op,
+      entity_id: event.entity_id,
+      created_at: event.created_at,
+    };
+    if (mode === 'tiny') return base;
+    return {
+      ...base,
+      agent_id: event.agent_id,
+      target_agent_id: event.target_agent_id,
+      namespace: event.namespace,
+      payload: includePayload ? JSON.parse(event.payload_json || '{}') : undefined,
+      payload_chars: event.payload_json.length,
+    };
+  });
+
+  return {
+    success: true,
+    changed: events.length > 0,
+    streams: changedStreams,
+    cursor,
+    event_id: watermark,
+    cursor_stale: cursorState.stale || undefined,
+    resync_required: cursorState.stale || undefined,
+    resync_hint: cursorState.stale ? cursorState.resync_hint : undefined,
+    min_event_id: cursorState.stale ? cursorState.min_event_id : undefined,
+    events: formattedEvents,
+    has_more: events.length >= limit,
   };
 }
 
@@ -761,7 +924,7 @@ export function handleRunMaintenance(args: { requesting_agent?: string; dry_run?
     logActivity(
       args.requesting_agent,
       'run_maintenance',
-      `claims=${summary.claims_cleaned} eph_claims=${summary.ephemeral_claims_reaped} requeued=${summary.orphaned_assignments_requeued} offline=${summary.agents_marked_offline} agents_deleted=${summary.agents_deleted} messages=${summary.messages_cleaned} activity=${summary.activity_log_cleaned} blobs=${summary.protocol_blobs_cleaned} artifacts=${summary.artifacts_cleaned} archived=${summary.tasks_archived} auth_events=${summary.auth_events_cleaned} slo_open=${summary.slo.open_alerts}`
+      `claims=${summary.claims_cleaned} eph_claims=${summary.ephemeral_claims_reaped} requeued=${summary.orphaned_assignments_requeued} offline=${summary.agents_marked_offline} agents_deleted=${summary.agents_deleted} messages=${summary.messages_cleaned} activity=${summary.activity_log_cleaned} stream_events=${summary.stream_events_cleaned} blobs=${summary.protocol_blobs_cleaned} artifacts=${summary.artifacts_cleaned} archived=${summary.tasks_archived} auth_events=${summary.auth_events_cleaned} slo_open=${summary.slo.open_alerts}`
     );
   }
   return { success: true, maintenance: summary };
@@ -847,11 +1010,7 @@ export const activityTools = {
         requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat)' },
         agent_id: { type: 'string', description: 'Target agent scope (defaults to requesting_agent)' },
         streams: { type: 'array', items: { type: 'string', enum: [...WAIT_STREAMS] }, description: 'Optional stream filter (default all): messages|tasks|context|activity' },
-        cursor: { type: 'string', description: 'Compact cursor from previous wait_for_updates response (<message>.<task>.<context>.<activity> in base36)' },
-        message_since_ts: { type: 'number', description: 'Last seen message watermark' },
-        task_since_ts: { type: 'number', description: 'Last seen task watermark' },
-        context_since_ts: { type: 'number', description: 'Last seen context watermark' },
-        activity_since_ts: { type: 'number', description: 'Last seen activity watermark' },
+        cursor: { type: 'string', description: 'Event cursor from previous wait_for_updates/read_snapshot response ("e:<id>")' },
         wait_ms: { type: 'number', description: `Wait timeout in milliseconds (max ${MAX_WAIT_MS})` },
         poll_interval_ms: { type: 'number', description: 'Internal poll interval in milliseconds (default 500)' },
         adaptive_retry: { type: 'boolean', description: 'If true (default), timeout responses include adaptive retry_after_ms with backoff+jitter' },
@@ -860,6 +1019,22 @@ export const activityTools = {
       },
     },
     handler: handleWaitForUpdates,
+  },
+  read_event_deltas: {
+    description: 'Read exact stream_events refs after an event cursor without hydrating full lists. Use before selective fetch/handoff flows.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat)' },
+        agent_id: { type: 'string', description: 'Target agent scope (defaults to requesting_agent)' },
+        cursor: { type: 'string', description: 'Event cursor from wait_for_updates/read_snapshot/read_event_deltas ("e:<id>"). Omit to start at current edge; pass e:0 to replay retained events.' },
+        streams: { type: 'array', items: { type: 'string', enum: [...EVENT_DELTA_STREAMS] }, description: 'Optional stream filter; defaults to messages,tasks,context,activity,artifacts,consensus' },
+        limit: { type: 'number', description: 'Max events to return (default 100, max 1000)' },
+        include_payload: { type: 'boolean', description: 'If true in compact mode, include event payload_json parsed as payload' },
+        response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'nano returns tuples; tiny returns event refs; compact can include payload metadata' },
+      },
+    },
+    handler: handleReadEventDeltas,
   },
   evaluate_slo_alerts: {
     description: 'Evaluate SLO rules (pending-age, claim-churn, stale in-progress) and upsert alert state.',

@@ -257,6 +257,7 @@ export function handleReadMessages(args: {
   response_mode?: 'full' | 'compact' | 'tiny' | 'nano';
   polling?: boolean;
   resolve_blob_refs?: boolean;
+  mark_read?: boolean;
 }) {
   heartbeat(args.agent_id);
   const limit = Math.max(1, Math.min(MAX_READ_LIMIT, Math.floor(args.limit ?? DEFAULT_READ_LIMIT)));
@@ -282,6 +283,7 @@ export function handleReadMessages(args: {
     offset,
     since_ts: sinceTs,
     cursor: cursor || undefined,
+    mark_read: args.mark_read,
   });
   const hasMore = useDeltaOrdering ? messages.length > limit : false;
   const slicedMessages = hasMore ? messages.slice(0, limit) : messages;

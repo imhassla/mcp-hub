@@ -28,6 +28,8 @@ import type {
   KpiWindowSnapshot,
   SloAlert,
   AuthCoverageSnapshot,
+  StreamEvent,
+  StreamEventName,
 } from './types.js';
 
 let db: Database.Database;
@@ -45,6 +47,9 @@ const ACTIVITY_LOG_TTL_MS = Number(process.env.MCP_HUB_ACTIVITY_LOG_TTL_MS || 24
 const PROTOCOL_BLOB_TTL_MS = Number(process.env.MCP_HUB_PROTOCOL_BLOB_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const DONE_TASK_TTL_MS = Number(process.env.MCP_HUB_DONE_TASK_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const ARTIFACT_TTL_MS = Number(process.env.MCP_HUB_ARTIFACT_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const STREAM_EVENT_TTL_MS = Number(process.env.MCP_HUB_STREAM_EVENT_TTL_MS || 24 * 60 * 60 * 1000);
+const FEED_ACK_TTL_MS = Number(process.env.MCP_HUB_FEED_ACK_TTL_MS || 30 * 24 * 60 * 60 * 1000);
+const SAVED_FILTER_TTL_MS = Number(process.env.MCP_HUB_SAVED_FILTER_TTL_MS || 0);
 const ARCHIVE_BATCH_LIMIT = Number(process.env.MCP_HUB_ARCHIVE_BATCH_LIMIT || 200);
 const AUTH_EVENTS_TTL_MS = Number(process.env.MCP_HUB_AUTH_EVENTS_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const RESOLVED_SLO_TTL_MS = Number(process.env.MCP_HUB_RESOLVED_SLO_TTL_MS || 14 * 24 * 60 * 60 * 1000);
@@ -232,6 +237,18 @@ function initSchema(d: Database.Database): void {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS stream_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      stream TEXT NOT NULL,
+      op TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      agent_id TEXT,
+      target_agent_id TEXT,
+      namespace TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS agent_quality (
       agent_id TEXT PRIMARY KEY,
       completed_count INTEGER NOT NULL DEFAULT 0,
@@ -345,6 +362,26 @@ function initSchema(d: Database.Database): void {
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS saved_filters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_agent_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      namespace TEXT,
+      filter_json TEXT NOT NULL,
+      cursor TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(owner_agent_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS feed_acks (
+      agent_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      acked_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, source, entity_id)
+    );
   `);
 
   ensureColumn(d, 'tasks', 'namespace', "ALTER TABLE tasks ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'");
@@ -389,6 +426,9 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_context_trace_updated_at ON context(trace_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_activity_log_agent_id_created_at ON activity_log(agent_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_stream_id ON stream_events(stream, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_target_stream_id ON stream_events(target_agent_id, stream, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_created_at ON stream_events(created_at);
     CREATE INDEX IF NOT EXISTS idx_protocol_blobs_updated_at ON protocol_blobs(updated_at);
     CREATE INDEX IF NOT EXISTS idx_consensus_decisions_proposal_created_at ON consensus_decisions(proposal_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_consensus_decisions_created_at ON consensus_decisions(created_at DESC);
@@ -406,6 +446,9 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_artifact_shares_to_agent_created_at ON artifact_shares(to_agent, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_artifacts_task_id_created_at ON task_artifacts(task_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_artifacts_artifact_id ON task_artifacts(artifact_id);
+    CREATE INDEX IF NOT EXISTS idx_saved_filters_owner_updated_at ON saved_filters(owner_agent_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_saved_filters_namespace_updated_at ON saved_filters(namespace, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_feed_acks_agent_source ON feed_acks(agent_id, source, acked_at DESC);
   `);
 }
 
@@ -414,6 +457,181 @@ function ensureColumn(d: Database.Database, tableName: string, columnName: strin
   if (!columns.some((column) => column.name === columnName)) {
     d.exec(alterSql);
   }
+}
+
+function normalizeStreamEventName(stream: string): StreamEventName {
+  if (stream === 'messages' || stream === 'tasks' || stream === 'context' || stream === 'activity' || stream === 'artifacts' || stream === 'consensus') {
+    return stream;
+  }
+  return 'activity';
+}
+
+function normalizeStreamEventPayload(payload?: unknown): string {
+  if (payload === undefined || payload === null) return '{}';
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return '{}';
+  }
+}
+
+function insertStreamEvent(d: Database.Database, args: {
+  stream: StreamEventName;
+  op: string;
+  entity_id: string | number;
+  agent_id?: string | null;
+  target_agent_id?: string | null;
+  namespace?: string | null;
+  payload?: unknown;
+  created_at?: number;
+}): StreamEvent {
+  const now = Number.isFinite(args.created_at) ? Math.floor(Number(args.created_at)) : Date.now();
+  const stream = normalizeStreamEventName(args.stream);
+  const op = String(args.op || 'updated').trim() || 'updated';
+  const entityId = String(args.entity_id);
+  const payloadJson = normalizeStreamEventPayload(args.payload);
+  const result = d.prepare(`
+    INSERT INTO stream_events (stream, op, entity_id, agent_id, target_agent_id, namespace, payload_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    stream,
+    op,
+    entityId,
+    args.agent_id || null,
+    args.target_agent_id || null,
+    args.namespace || null,
+    payloadJson,
+    now,
+  );
+  return d.prepare('SELECT * FROM stream_events WHERE id = ?').get(result.lastInsertRowid) as StreamEvent;
+}
+
+export function appendStreamEvent(args: {
+  stream: StreamEventName;
+  op: string;
+  entity_id: string | number;
+  agent_id?: string | null;
+  target_agent_id?: string | null;
+  namespace?: string | null;
+  payload?: unknown;
+  created_at?: number;
+}): StreamEvent {
+  return insertStreamEvent(getDb(), args);
+}
+
+export function listStreamEventsAfter(options: {
+  agent_id?: string;
+  after_id?: number;
+  streams?: StreamEventName[];
+  limit?: number;
+} = {}): StreamEvent[] {
+  const d = getDb();
+  const afterId = Number.isFinite(options.after_id) ? Math.max(0, Math.floor(Number(options.after_id))) : 0;
+  const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(1000, Math.floor(Number(options.limit)))) : 100;
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  let query = `
+    SELECT *
+    FROM stream_events
+    WHERE id > ?
+      AND stream IN (${placeholders})
+  `;
+  const params: unknown[] = [afterId, ...streams];
+  if (options.agent_id) {
+    query += ` AND (target_agent_id IS NULL OR target_agent_id IN (?, '*'))`;
+    params.push(options.agent_id);
+  }
+  query += ' ORDER BY id ASC LIMIT ?';
+  params.push(limit);
+  return d.prepare(query).all(...params) as StreamEvent[];
+}
+
+export function getStreamEventWatermark(options: {
+  agent_id?: string;
+  streams?: StreamEventName[];
+} = {}): number {
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  let query = `SELECT COALESCE(MAX(id), 0) AS id FROM stream_events WHERE stream IN (${placeholders})`;
+  const params: unknown[] = [...streams];
+  if (options.agent_id) {
+    query += ` AND (target_agent_id IS NULL OR target_agent_id IN (?, '*'))`;
+    params.push(options.agent_id);
+  }
+  const row = getDb().prepare(query).get(...params) as { id: number } | undefined;
+  return row?.id || 0;
+}
+
+export function getMinStreamEventId(options: {
+  agent_id?: string;
+  streams?: StreamEventName[];
+} = {}): number {
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  let query = `SELECT COALESCE(MIN(id), 0) AS id FROM stream_events WHERE stream IN (${placeholders})`;
+  const params: unknown[] = [...streams];
+  if (options.agent_id) {
+    query += ` AND (target_agent_id IS NULL OR target_agent_id IN (?, '*'))`;
+    params.push(options.agent_id);
+  }
+  const row = getDb().prepare(query).get(...params) as { id: number } | undefined;
+  return row?.id || 0;
+}
+
+export function cleanupStreamEvents(now = Date.now(), ttlMs = STREAM_EVENT_TTL_MS): number {
+  if (ttlMs <= 0) return 0;
+  const cutoff = now - ttlMs;
+  const result = getDb().prepare('DELETE FROM stream_events WHERE created_at < ?').run(cutoff);
+  return result.changes;
+}
+
+export function cleanupFeedAcks(now = Date.now(), ttlMs = FEED_ACK_TTL_MS): number {
+  const d = getDb();
+  const statements = [
+    `DELETE FROM feed_acks
+      WHERE source = 'messages'
+        AND NOT EXISTS (SELECT 1 FROM messages m WHERE CAST(m.id AS TEXT) = feed_acks.entity_id)`,
+    `DELETE FROM feed_acks
+      WHERE source = 'tasks'
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE CAST(t.id AS TEXT) = feed_acks.entity_id AND t.status IN ('pending', 'in_progress', 'blocked'))`,
+    `DELETE FROM feed_acks
+      WHERE source = 'artifacts'
+        AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = feed_acks.entity_id AND a.storage_path IS NOT NULL)`,
+    `DELETE FROM feed_acks
+      WHERE source = 'slo'
+        AND NOT EXISTS (SELECT 1 FROM slo_alerts s WHERE CAST(s.id AS TEXT) = feed_acks.entity_id AND s.resolved_at IS NULL)`,
+  ];
+  let cleaned = 0;
+  const tx = d.transaction(() => {
+    for (const statement of statements) cleaned += d.prepare(statement).run().changes;
+    if (ttlMs > 0) {
+      cleaned += d.prepare('DELETE FROM feed_acks WHERE acked_at < ?').run(now - ttlMs).changes;
+    }
+  });
+  tx();
+  return cleaned;
+}
+
+export function cleanupSavedFilters(now = Date.now(), ttlMs = SAVED_FILTER_TTL_MS): number {
+  const d = getDb();
+  let cleaned = 0;
+  const tx = d.transaction(() => {
+    cleaned += d.prepare(`
+      DELETE FROM saved_filters
+      WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = saved_filters.owner_agent_id)
+    `).run().changes;
+    if (ttlMs > 0) {
+      cleaned += d.prepare('DELETE FROM saved_filters WHERE updated_at < ?').run(now - ttlMs).changes;
+    }
+  });
+  tx();
+  return cleaned;
 }
 
 function normalizeLeaseSeconds(leaseSeconds?: number): number {
@@ -508,11 +726,26 @@ export function cleanupExpiredTaskClaims(now = Date.now(), options: { force?: bo
 
   const tx = d.transaction(() => {
     for (const row of expired) {
-      d.prepare(`
+      const result = d.prepare(`
         UPDATE tasks
         SET status = 'pending', assigned_to = NULL, updated_at = ?
         WHERE id = ? AND status = 'in_progress' AND assigned_to = ?
       `).run(now, row.task_id, row.agent_id);
+      if (result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.claim.expired',
+          entity_id: row.task_id,
+          agent_id: row.agent_id,
+          target_agent_id: null,
+          payload: {
+            status: 'pending',
+            assigned_to: null,
+            expired_agent_id: row.agent_id,
+          },
+          created_at: now,
+        });
+      }
     }
     d.prepare('DELETE FROM task_claims WHERE lease_expires_at <= ?').run(now);
   });
@@ -679,7 +912,7 @@ export function sendMessage(
     INSERT INTO messages (from_agent, to_agent, content, metadata, trace_id, span_id, created_at, read)
     VALUES (?, ?, ?, ?, ?, ?, ?, 0)
   `).run(fromAgent, toAgent, content, metadata, traceId || null, spanId || null, now);
-  return {
+  const message = {
     id: result.lastInsertRowid as number,
     from_agent: fromAgent,
     to_agent: toAgent,
@@ -690,6 +923,22 @@ export function sendMessage(
     created_at: now,
     read: 0,
   };
+  insertStreamEvent(d, {
+    stream: 'messages',
+    op: 'message.created',
+    entity_id: message.id,
+    agent_id: fromAgent,
+    target_agent_id: toAgent,
+    payload: {
+      from_agent: fromAgent,
+      to_agent: toAgent,
+      content_chars: content.length,
+      trace_id: traceId || null,
+      span_id: spanId || null,
+    },
+    created_at: now,
+  });
+  return message;
 }
 
 export function readMessages(agentId: string, options: {
@@ -699,6 +948,7 @@ export function readMessages(agentId: string, options: {
   offset?: number;
   since_ts?: number;
   cursor?: { ts: number; id: number };
+  mark_read?: boolean;
 } = {}): Message[] {
   const d = getDb();
   let query = `
@@ -743,7 +993,7 @@ export function readMessages(agentId: string, options: {
 
   // Mark as read per-agent
   const ids = messages.filter((m) => m.read === 0).map((m) => m.id);
-  if (ids.length > 0) {
+  if (ids.length > 0 && options.mark_read !== false) {
     const now = Date.now();
     const tx = d.transaction((messageIds: number[]) => {
       const insert = d.prepare('INSERT OR IGNORE INTO message_reads (message_id, agent_id, read_at) VALUES (?, ?, ?)');
@@ -831,6 +1081,22 @@ export function createTask(task: {
         insertDep.run(taskId, depId, now);
       }
     }
+    insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.created',
+      entity_id: taskId,
+      agent_id: task.created_by,
+      target_agent_id: null,
+      namespace,
+      payload: {
+        status: 'pending',
+        priority: task.priority || 'medium',
+        execution_mode: executionMode,
+        consistency_mode: consistencyMode,
+        depends_on_count: deps.length,
+      },
+      created_at: now,
+    });
     return taskId;
   });
 
@@ -912,7 +1178,25 @@ export function updateTask(id: number, updates: {
   });
 
   tx();
-  return d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task;
+  const updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task;
+  insertStreamEvent(d, {
+    stream: 'tasks',
+    op: fields.length > 0 ? 'task.updated' : 'task.dependencies.updated',
+    entity_id: id,
+    agent_id: updatedTask.assigned_to || updatedTask.created_by,
+    target_agent_id: null,
+    namespace: updatedTask.namespace,
+    payload: {
+      status: updatedTask.status,
+      assigned_to: updatedTask.assigned_to,
+      fields: [
+        ...Object.keys(updates).filter((key) => key !== 'depends_on'),
+        ...(hasDependencyUpdate ? ['depends_on'] : []),
+      ],
+    },
+    created_at: now,
+  });
+  return updatedTask;
 }
 
 export function getTaskById(id: number): Task | null {
@@ -1171,6 +1455,19 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
   }
   const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
   const updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+  insertStreamEvent(d, {
+    stream: 'tasks',
+    op: existing?.agent_id === agentId ? 'task.claim.refreshed' : 'task.claimed',
+    entity_id: taskId,
+    agent_id: agentId,
+    namespace: updatedTask.namespace,
+    payload: {
+      status: updatedTask.status,
+      assigned_to: updatedTask.assigned_to,
+      lease_expires_at: claim.lease_expires_at,
+    },
+    created_at: now,
+  });
   return { success: true, task: updatedTask, claim };
 }
 
@@ -1230,6 +1527,19 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
   }
   const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
   const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+  insertStreamEvent(d, {
+    stream: 'tasks',
+    op: 'task.claim.renewed',
+    entity_id: taskId,
+    agent_id: agentId,
+    namespace: task.namespace,
+    payload: {
+      status: task.status,
+      assigned_to: task.assigned_to,
+      lease_expires_at: claim.lease_expires_at,
+    },
+    created_at: now,
+  });
   return { success: true, task, claim };
 }
 
@@ -1286,6 +1596,18 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
     throw error;
   }
   const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+  insertStreamEvent(d, {
+    stream: 'tasks',
+    op: 'task.claim.released',
+    entity_id: taskId,
+    agent_id: agentId,
+    namespace: task.namespace,
+    payload: {
+      status: task.status,
+      assigned_to: task.assigned_to,
+    },
+    created_at: now,
+  });
   return { success: true, task };
 }
 
@@ -1383,6 +1705,19 @@ export function pollAndClaim(agentId: string, leaseSeconds?: number, namespace?:
 
     const updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Task;
     const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(task.id) as TaskClaim;
+    insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.polled_and_claimed',
+      entity_id: task.id,
+      agent_id: agentId,
+      namespace: updatedTask.namespace,
+      payload: {
+        status: updatedTask.status,
+        assigned_to: updatedTask.assigned_to,
+        lease_expires_at: claim.lease_expires_at,
+      },
+      created_at: now,
+    });
     return { task: updatedTask, claim };
   });
 
@@ -1420,6 +1755,20 @@ export function shareContext(
       updated_at = excluded.updated_at
   `).run(agentId, key, value, contextNamespace, traceId || null, spanId || null, now);
   const row = d.prepare('SELECT * FROM context WHERE agent_id = ? AND key = ?').get(agentId, key) as Context;
+  insertStreamEvent(d, {
+    stream: 'context',
+    op: 'context.upserted',
+    entity_id: row.id,
+    agent_id: agentId,
+    namespace: row.namespace,
+    payload: {
+      key,
+      value_chars: value.length,
+      trace_id: traceId || null,
+      span_id: spanId || null,
+    },
+    created_at: now,
+  });
   return row;
 }
 
@@ -1430,6 +1779,7 @@ export function getContext(options: {
   limit?: number;
   offset?: number;
   updated_after?: number;
+  cursor?: { ts: number; id: number };
 } = {}): Context[] {
   const d = getDb();
   let query = 'SELECT * FROM context WHERE 1=1';
@@ -1447,13 +1797,18 @@ export function getContext(options: {
     query += ' AND namespace = ?';
     params.push(options.namespace);
   }
-  if (Number.isFinite(options.updated_after)) {
+  const hasCursor = Boolean(options.cursor && Number.isFinite(options.cursor.ts) && Number.isFinite(options.cursor.id));
+  const hasUpdatedAfter = Number.isFinite(options.updated_after);
+  if (hasCursor) {
+    query += ' AND (updated_at > ? OR (updated_at = ? AND id > ?))';
+    params.push(options.cursor!.ts, options.cursor!.ts, options.cursor!.id);
+  } else if (hasUpdatedAfter) {
     query += ' AND updated_at > ?';
     params.push(Math.floor(Number(options.updated_after)));
   }
-  query += ' ORDER BY updated_at DESC';
+  query += (hasCursor || hasUpdatedAfter) ? ' ORDER BY updated_at ASC, id ASC' : ' ORDER BY updated_at DESC, id DESC';
   const limit = Number.isFinite(options.limit) ? Math.max(1, Math.floor(Number(options.limit))) : 100;
-  const offset = Number.isFinite(options.offset) ? Math.max(0, Math.floor(Number(options.offset))) : 0;
+  const offset = hasCursor || hasUpdatedAfter ? 0 : (Number.isFinite(options.offset) ? Math.max(0, Math.floor(Number(options.offset))) : 0);
   query += ' LIMIT ? OFFSET ?';
   params.push(limit, offset);
 
@@ -1592,7 +1947,19 @@ export function saveConsensusDecision(args: {
     JSON.stringify(args.reasons ?? []),
     now
   );
-  return getDb().prepare('SELECT * FROM consensus_decisions WHERE id = ?').get(result.lastInsertRowid) as ConsensusDecision;
+  const decision = getDb().prepare('SELECT * FROM consensus_decisions WHERE id = ?').get(result.lastInsertRowid) as ConsensusDecision;
+  appendStreamEvent({
+    stream: 'consensus',
+    op: 'consensus.decision.saved',
+    entity_id: decision.id,
+    agent_id: args.requesting_agent,
+    payload: {
+      proposal_id: args.proposal_id,
+      outcome: args.outcome,
+    },
+    created_at: now,
+  });
+  return decision;
 }
 
 export function listConsensusDecisions(options: { proposal_id?: string; limit?: number; offset?: number } = {}): ConsensusDecision[] {
@@ -1701,13 +2068,28 @@ export function createArtifactRecord(args: {
   const mimeType = (args.mime_type || 'application/octet-stream').trim() || 'application/octet-stream';
   const summary = (args.summary || '').trim();
   const ttlExpiresAt = Number.isFinite(args.ttl_expires_at) ? Math.floor(Number(args.ttl_expires_at)) : null;
-  getDb().prepare(`
+  const d = getDb();
+  d.prepare(`
     INSERT INTO artifacts (
       id, created_by, name, mime_type, size_bytes, sha256, storage_path, namespace, summary,
       created_at, updated_at, access_count, ttl_expires_at
     ) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, 0, ?)
   `).run(args.id, args.created_by, args.name, mimeType, namespace, summary, now, now, ttlExpiresAt);
-  return getDb().prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.created',
+    entity_id: artifact.id,
+    agent_id: artifact.created_by,
+    namespace: artifact.namespace,
+    payload: {
+      name: artifact.name,
+      mime_type: artifact.mime_type,
+      summary_chars: artifact.summary.length,
+    },
+    created_at: now,
+  });
+  return artifact;
 }
 
 export function finalizeArtifactUpload(args: {
@@ -1718,7 +2100,8 @@ export function finalizeArtifactUpload(args: {
   mime_type?: string;
 }): Artifact | null {
   const now = Date.now();
-  const updated = getDb().prepare(`
+  const d = getDb();
+  const updated = d.prepare(`
     UPDATE artifacts
     SET size_bytes = ?, sha256 = ?, storage_path = ?, mime_type = COALESCE(?, mime_type), updated_at = ?
     WHERE id = ?
@@ -1731,7 +2114,21 @@ export function finalizeArtifactUpload(args: {
     args.id,
   );
   if (updated.changes !== 1) return null;
-  return getDb().prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.upload.finalized',
+    entity_id: artifact.id,
+    agent_id: artifact.created_by,
+    namespace: artifact.namespace,
+    payload: {
+      size_bytes: artifact.size_bytes,
+      sha256: artifact.sha256,
+      mime_type: artifact.mime_type,
+    },
+    created_at: now,
+  });
+  return artifact;
 }
 
 export function getArtifactById(artifactId: string): Artifact | null {
@@ -1782,10 +2179,24 @@ export function grantArtifactAccess(args: {
   granted_by: string;
 }): void {
   const now = Date.now();
-  getDb().prepare(`
+  const d = getDb();
+  d.prepare(`
     INSERT OR REPLACE INTO artifact_shares (artifact_id, to_agent, granted_by, created_at)
     VALUES (?, ?, ?, ?)
   `).run(args.artifact_id, args.to_agent, args.granted_by, now);
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.artifact_id) as Artifact | undefined;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.shared',
+    entity_id: args.artifact_id,
+    agent_id: args.granted_by,
+    target_agent_id: args.to_agent,
+    namespace: artifact?.namespace || null,
+    payload: {
+      to_agent: args.to_agent,
+    },
+    created_at: now,
+  });
 }
 
 export function hasArtifactAccess(agentId: string, artifactId: string): boolean {
@@ -1807,15 +2218,31 @@ export function hasArtifactAccess(agentId: string, artifactId: string): boolean 
 
 export function attachTaskArtifact(taskId: number, artifactId: string, addedBy: string): { created: boolean; row: TaskArtifact | null } {
   const now = Date.now();
-  const insertResult = getDb().prepare(`
+  const d = getDb();
+  const insertResult = d.prepare(`
     INSERT OR IGNORE INTO task_artifacts (task_id, artifact_id, added_by, created_at)
     VALUES (?, ?, ?, ?)
   `).run(taskId, artifactId, addedBy, now);
-  const row = getDb().prepare(`
+  const row = d.prepare(`
     SELECT task_id, artifact_id, added_by, created_at
     FROM task_artifacts
     WHERE task_id = ? AND artifact_id = ?
   `).get(taskId, artifactId) as TaskArtifact | undefined;
+  if (insertResult.changes === 1) {
+    const task = d.prepare('SELECT namespace FROM tasks WHERE id = ?').get(taskId) as { namespace?: string } | undefined;
+    insertStreamEvent(d, {
+      stream: 'artifacts',
+      op: 'task_artifact.attached',
+      entity_id: `${taskId}:${artifactId}`,
+      agent_id: addedBy,
+      namespace: task?.namespace || null,
+      payload: {
+        task_id: taskId,
+        artifact_id: artifactId,
+      },
+      created_at: now,
+    });
+  }
   return {
     created: insertResult.changes === 1,
     row: row || null,
@@ -1855,14 +2282,15 @@ export function incrementArtifactAccess(artifactId: string): void {
 
 export function cleanupArtifacts(now = Date.now(), ttlMs = ARTIFACT_TTL_MS): { deleted: number; paths: string[] } {
   const d = getDb();
-  const cutoff = now - Math.max(1, ttlMs);
+  const includeFallbackTtl = ttlMs > 0;
+  const cutoff = includeFallbackTtl ? now - ttlMs : now;
   const rows = d.prepare(`
     SELECT id, storage_path
     FROM artifacts
     WHERE
       (ttl_expires_at IS NOT NULL AND ttl_expires_at < ?)
-      OR (ttl_expires_at IS NULL AND updated_at < ?)
-  `).all(now, cutoff) as Array<{ id: string; storage_path: string | null }>;
+      ${includeFallbackTtl ? 'OR (ttl_expires_at IS NULL AND updated_at < ?)' : ''}
+  `).all(...(includeFallbackTtl ? [now, cutoff] : [now])) as Array<{ id: string; storage_path: string | null }>;
   if (rows.length === 0) return { deleted: 0, paths: [] };
 
   const tx = d.transaction((ids: string[]) => {
@@ -2487,8 +2915,31 @@ export function cleanupStaleOfflineAgents(
     const deleteAgent = d.prepare('DELETE FROM agents WHERE id = ?');
 
     for (const id of ids) {
+      const tasksToRelease = d.prepare(`
+        SELECT id, namespace, status
+        FROM tasks
+        WHERE assigned_to = ?
+          AND status IN ('pending', 'in_progress')
+      `).all(id) as Array<{ id: number; namespace: string; status: string }>;
       clearClaims.run(id);
       releaseAssignedTasks.run(now, id);
+      for (const task of tasksToRelease) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.agent_deleted_requeued',
+          entity_id: task.id,
+          agent_id: id,
+          target_agent_id: null,
+          namespace: task.namespace,
+          payload: {
+            previous_status: task.status,
+            status: task.status === 'in_progress' ? 'pending' : task.status,
+            assigned_to: null,
+            deleted_agent_id: id,
+          },
+          created_at: now,
+        });
+      }
       deleteAgent.run(id);
     }
 
@@ -2508,13 +2959,14 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
   const cutoff = now - Math.max(1_000, reapAfterMs);
   const d = getDb();
   const rows = d.prepare(`
-    SELECT tc.task_id AS task_id
+    SELECT tc.task_id AS task_id, t.namespace AS namespace, tc.agent_id AS agent_id
     FROM task_claims tc
     JOIN agents a ON a.id = tc.agent_id
+    JOIN tasks t ON t.id = tc.task_id
     WHERE a.lifecycle = 'ephemeral'
       AND a.status = 'offline'
       AND tc.updated_at < ?
-  `).all(cutoff) as Array<{ task_id: number }>;
+  `).all(cutoff) as Array<{ task_id: number; namespace: string; agent_id: string }>;
 
   if (rows.length === 0) return 0;
   const taskIds = [...new Set(rows.map((row) => row.task_id))];
@@ -2527,8 +2979,25 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
     `);
     const deleteClaim = d.prepare('DELETE FROM task_claims WHERE task_id = ?');
     for (const taskId of ids) {
-      releaseTask.run(now, taskId);
+      const result = releaseTask.run(now, taskId);
       deleteClaim.run(taskId);
+      const row = rows.find((candidate) => candidate.task_id === taskId);
+      if (row && result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.ephemeral_claim_reaped',
+          entity_id: taskId,
+          agent_id: row.agent_id,
+          target_agent_id: null,
+          namespace: row.namespace,
+          payload: {
+            status: 'pending',
+            assigned_to: null,
+            reaped_agent_id: row.agent_id,
+          },
+          created_at: now,
+        });
+      }
     }
   });
 
@@ -2537,11 +3006,10 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
 }
 
 export function requeueOrphanedAssignments(now = Date.now()): number {
-  const result = getDb().prepare(`
-    UPDATE tasks
-    SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END,
-        assigned_to = NULL,
-        updated_at = ?
+  const d = getDb();
+  const rows = d.prepare(`
+    SELECT id, namespace, status, assigned_to
+    FROM tasks
     WHERE assigned_to IS NOT NULL
       AND status IN ('pending', 'in_progress')
       AND (
@@ -2552,8 +3020,40 @@ export function requeueOrphanedAssignments(now = Date.now()): number {
           WHERE lifecycle = 'ephemeral' AND status = 'offline'
         )
       )
-  `).run(now);
-  return result.changes;
+  `).all() as Array<{ id: number; namespace: string; status: string; assigned_to: string | null }>;
+  if (rows.length === 0) return 0;
+
+  const tx = d.transaction((tasksToRequeue: typeof rows) => {
+    const update = d.prepare(`
+    UPDATE tasks
+    SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END,
+        assigned_to = NULL,
+        updated_at = ?
+    WHERE id = ?
+  `);
+    for (const task of tasksToRequeue) {
+      const result = update.run(now, task.id);
+      if (result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.orphan_requeued',
+          entity_id: task.id,
+          agent_id: task.assigned_to,
+          target_agent_id: null,
+          namespace: task.namespace,
+          payload: {
+            previous_status: task.status,
+            status: task.status === 'in_progress' ? 'pending' : task.status,
+            assigned_to: null,
+            previous_assigned_to: task.assigned_to,
+          },
+          created_at: now,
+        });
+      }
+    }
+  });
+  tx(rows);
+  return rows.length;
 }
 
 export function cleanupMessages(now = Date.now(), ttlMs = MESSAGE_TTL_MS): number {
@@ -2637,6 +3137,19 @@ export function archiveDoneTasks(now = Date.now(), ttlMs = DONE_TASK_TTL_MS, lim
         now,
         'ttl_cleanup'
       );
+      insertStreamEvent(d, {
+        stream: 'tasks',
+        op: 'task.archived',
+        entity_id: task.id,
+        agent_id: 'system',
+        target_agent_id: null,
+        namespace: task.namespace,
+        payload: {
+          status: task.status,
+          archive_reason: 'ttl_cleanup',
+        },
+        created_at: now,
+      });
       del.run(task.id);
     }
   });
@@ -2692,6 +3205,19 @@ export function deleteTask(taskId: number, options: { archive?: boolean; reason?
         options.reason || 'manual_delete'
       );
     }
+    insertStreamEvent(d, {
+      stream: 'tasks',
+      op: archive ? 'task.archived' : 'task.deleted',
+      entity_id: task.id,
+      agent_id: 'system',
+      target_agent_id: null,
+      namespace: task.namespace,
+      payload: {
+        status: task.status,
+        archive_reason: archive ? (options.reason || 'manual_delete') : null,
+      },
+      created_at: now,
+    });
     d.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
   });
   tx();
@@ -2708,10 +3234,13 @@ export function runMaintenance(now = Date.now()): {
   messages_cleaned: number;
   activity_log_cleaned: number;
   protocol_blobs_cleaned: number;
-  artifacts_cleaned: number;
-  tasks_archived: number;
-  auth_events_cleaned: number;
-  resolved_slo_cleaned: number;
+	  artifacts_cleaned: number;
+	  tasks_archived: number;
+	  auth_events_cleaned: number;
+	  stream_events_cleaned: number;
+	  feed_acks_cleaned: number;
+	  saved_filters_cleaned: number;
+	  resolved_slo_cleaned: number;
   slo: {
     evaluated_at: number;
     triggered: number;
@@ -2731,10 +3260,13 @@ export function runMaintenance(now = Date.now()): {
     messages_cleaned: cleanupMessages(now),
     activity_log_cleaned: cleanupActivityLog(now),
     protocol_blobs_cleaned: cleanupProtocolBlobs(now),
-    artifacts_cleaned: artifacts.deleted,
-    tasks_archived: archiveDoneTasks(now),
-    auth_events_cleaned: cleanupAuthEvents(now),
-    resolved_slo_cleaned: cleanupResolvedSloAlerts(now),
+	    artifacts_cleaned: artifacts.deleted,
+	    tasks_archived: archiveDoneTasks(now),
+	    auth_events_cleaned: cleanupAuthEvents(now),
+	    stream_events_cleaned: cleanupStreamEvents(now),
+	    feed_acks_cleaned: cleanupFeedAcks(now),
+	    saved_filters_cleaned: cleanupSavedFilters(now),
+	    resolved_slo_cleaned: cleanupResolvedSloAlerts(now),
     slo: {
       evaluated_at: slo.evaluated_at,
       triggered: slo.triggered,
@@ -2746,20 +3278,39 @@ export function runMaintenance(now = Date.now()): {
 
 // --- Activity Log ---
 
-export function logActivity(agentId: string, action: string, details: string = ''): ActivityLogEntry {
+export function logActivity(
+  agentId: string,
+  action: string,
+  details: string = '',
+  options: { emit_stream_event?: boolean } = {}
+): ActivityLogEntry {
   const now = Date.now();
   const d = getDb();
   const result = d.prepare(`
     INSERT INTO activity_log (agent_id, action, details, created_at)
     VALUES (?, ?, ?, ?)
   `).run(agentId, action, details, now);
-  return {
+  const entry = {
     id: result.lastInsertRowid as number,
     agent_id: agentId,
     action,
     details,
     created_at: now,
   };
+  if (options.emit_stream_event !== false) {
+    insertStreamEvent(d, {
+      stream: 'activity',
+      op: 'activity.logged',
+      entity_id: entry.id,
+      agent_id: agentId,
+      payload: {
+        action,
+        details_chars: details.length,
+      },
+      created_at: now,
+    });
+  }
+  return entry;
 }
 
 export function getActivityLog(options: { agent_id?: string; limit?: number; offset?: number } = {}): ActivityLogEntry[] {

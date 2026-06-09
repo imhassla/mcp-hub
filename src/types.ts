@@ -115,6 +115,20 @@ export interface ActivityLogEntry {
   created_at: number;
 }
 
+export type StreamEventName = 'messages' | 'tasks' | 'context' | 'activity' | 'artifacts' | 'consensus';
+
+export interface StreamEvent {
+  id: number;
+  stream: StreamEventName;
+  op: string;
+  entity_id: string;
+  agent_id: string | null;
+  target_agent_id: string | null;
+  namespace: string | null;
+  payload_json: string;
+  created_at: number;
+}
+
 export interface AgentQuality {
   agent_id: string;
   completed_count: number;

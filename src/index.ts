@@ -35,6 +35,7 @@ import {
   handleGetTransportSnapshot,
   handleReadSnapshot,
   handleWaitForUpdates,
+  handleReadEventDeltas,
   handleEvaluateSloAlerts,
   handleListSloAlerts,
   handleGetAuthCoverage,
@@ -58,13 +59,14 @@ import {
 } from './tools/protocol.js';
 import {
   runMaintenance,
-  getUpdateWatermark,
   validateAgentToken,
   recordAuthEvent,
   finalizeArtifactUpload,
   getArtifactById,
   incrementArtifactAccess,
   logActivity,
+  getStreamEventWatermark,
+  listStreamEventsAfter,
 } from './db.js';
 import {
   artifactTools,
@@ -75,6 +77,14 @@ import {
   handleListArtifacts,
   handleShareArtifact,
 } from './tools/artifacts.js';
+import { searchTools, handleSearchHub } from './tools/search.js';
+import { refTools, handleFetchHubRefs } from './tools/refs.js';
+import { filterTools, handleSaveFilter, handleListFilters, handleReadFilterFeed, handleDeleteFilter } from './tools/filters.js';
+import { signalTools, handleReadSignalFeed, handleAckFeedItems } from './tools/signals.js';
+import { digestTools, handleGetHubDigest } from './tools/digest.js';
+import { memoryTools, handleWriteMemory, handleSearchMemory, handleGetMemoryDigest } from './tools/memory.js';
+import { traceTools, handleGetTraceTimeline } from './tools/traces.js';
+import { threadTools, handleStartThread, handleReplyThread, handleReadThread } from './tools/threads.js';
 
 function createServer() {
   return new McpServer({
@@ -106,7 +116,7 @@ function mcpTextResponse(payload: unknown) {
 }
 
 function setServerCapabilityHeaders(res: express.Response) {
-  res.setHeader('x-mcp-hub-capabilities', 'nano,blob_resolve,artifact_tickets,read_snapshot,sse_events,namespace_quotas,adaptive_consistency');
+  res.setHeader('x-mcp-hub-capabilities', 'nano,blob_resolve,artifact_tickets,read_snapshot,read_event_deltas,sse_events,search_hub,fetch_hub_refs,saved_filters,signal_feed,hub_digest,shared_memory,trace_timeline,discussion_threads,namespace_quotas,adaptive_consistency');
 }
 
 function isInitializeMethod(body: unknown): boolean {
@@ -152,8 +162,6 @@ type TokenBucket = {
   lastRefillAt: number;
 };
 
-type UnknownSessionPolicy = 'error' | 'stateless_fallback';
-
 const rateLimitBuckets = new Map<string, TokenBucket>();
 const namespaceRateBuckets = new Map<string, TokenBucket>();
 const namespaceTokenBudgetWindows = new Map<string, { windowStartAt: number; tokensUsed: number }>();
@@ -187,10 +195,6 @@ const SESSION_IDLE_TIMEOUT_LABEL = SESSION_GC_ENABLED ? String(SESSION_IDLE_TIME
 const SESSION_GC_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_HUB_SESSION_GC_INTERVAL_MS))
   ? Math.max(1_000, Math.min(30 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_SESSION_GC_INTERVAL_MS))))
   : 60_000;
-const UNKNOWN_SESSION_POLICY: UnknownSessionPolicy = (() => {
-  const configured = String(process.env.MCP_HUB_UNKNOWN_SESSION_POLICY || '').toLowerCase().trim();
-  return configured === 'stateless_fallback' ? 'stateless_fallback' : 'error';
-})();
 const ARTIFACT_TICKET_TTL_SEC = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_TICKET_TTL_SEC))
   ? Math.max(30, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_TICKET_TTL_SEC)))
   : 300;
@@ -204,6 +208,11 @@ const EVENT_STREAM_DEFAULT_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_
 const EVENT_STREAM_HEARTBEAT_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))
   ? Math.max(2_000, Math.min(60_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))))
   : 15_000;
+const ORIGIN_MODE = (() => {
+  const configured = String(process.env.MCP_HUB_ORIGIN_MODE || 'warn').toLowerCase().trim();
+  return configured === 'enforce' ? 'enforce' : 'warn';
+})();
+const STRICT_SESSION_STATUS = String(process.env.MCP_HUB_STRICT_SESSION_STATUS || '').toLowerCase() === 'true';
 
 type ArtifactTicket = {
   token: string;
@@ -325,7 +334,8 @@ function extractNamespace(toolName: string, args: Record<string, unknown>): stri
   return NAMESPACE_QUOTA_FALLBACK;
 }
 
-type EventStream = 'messages' | 'tasks' | 'context' | 'activity';
+type EventStream = 'messages' | 'tasks' | 'context' | 'activity' | 'artifacts' | 'consensus';
+const EVENT_STREAMS: EventStream[] = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'];
 
 function parseEventStreams(raw: string | string[] | undefined): EventStream[] {
   const values = Array.isArray(raw) ? raw.join(',') : (raw || '');
@@ -333,45 +343,103 @@ function parseEventStreams(raw: string | string[] | undefined): EventStream[] {
     .split(',')
     .map((item) => item.trim().toLowerCase())
     .filter((item) => item.length > 0);
-  const supported = new Set<EventStream>(['messages', 'tasks', 'context', 'activity']);
+  const supported = new Set<EventStream>(EVENT_STREAMS);
   const normalized = items.filter((item): item is EventStream => supported.has(item as EventStream));
-  if (normalized.length === 0) return ['messages', 'tasks', 'context', 'activity'];
+  if (normalized.length === 0) return [...EVENT_STREAMS];
   return [...new Set(normalized)];
 }
 
-function encodeEventCursor(watermark: {
-  latest_message_ts: number;
-  latest_task_ts: number;
-  latest_context_ts: number;
-  latest_activity_ts: number;
-}): string {
-  return [
-    watermark.latest_message_ts,
-    watermark.latest_task_ts,
-    watermark.latest_context_ts,
-    watermark.latest_activity_ts,
-  ]
-    .map((value) => Math.max(0, Math.floor(Number(value) || 0)).toString(36))
-    .join('.');
+function encodeStreamEventCursor(eventId: number): string {
+  return `e:${Math.max(0, Math.floor(Number(eventId) || 0)).toString(36)}`;
 }
 
-function parseEventCursor(cursor?: string): {
-  message_since_ts: number;
-  task_since_ts: number;
-  context_since_ts: number;
-  activity_since_ts: number;
-} | null {
+function parseStreamEventCursor(cursor?: string): number | null {
   if (typeof cursor !== 'string' || cursor.trim().length === 0) return null;
-  const parts = cursor.trim().split('.');
-  if (parts.length !== 4) return null;
-  const values = parts.map((part) => Number.parseInt(part, 36));
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) return null;
-  return {
-    message_since_ts: Math.floor(values[0]),
-    task_since_ts: Math.floor(values[1]),
-    context_since_ts: Math.floor(values[2]),
-    activity_since_ts: Math.floor(values[3]),
+  const value = cursor.trim();
+  const match = /^e:([0-9a-z]+)$/i.exec(value);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 36);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+}
+
+function parseLastEventId(value: string | string[] | undefined): number | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string' || raw.trim().length === 0) return null;
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+}
+
+function parseAllowedOrigins(port: number): Set<string> | '*' {
+  const configured = String(process.env.MCP_HUB_ALLOWED_ORIGINS || '').trim();
+  if (configured === '*') return '*';
+  const values = configured.length > 0
+    ? configured.split(',').map((item) => item.trim()).filter(Boolean)
+    : [
+      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
+      `http://[::1]:${port}`,
+    ];
+  return new Set(values.map((value) => {
+    try {
+      return new URL(value).origin;
+    } catch {
+      return value.replace(/\/+$/, '');
+    }
+  }));
+}
+
+function isAllowedOrigin(origin: string | undefined, allowedOrigins: Set<string> | '*'): boolean {
+  if (!origin) return true;
+  if (allowedOrigins === '*') return true;
+  try {
+    return allowedOrigins.has(new URL(origin).origin);
+  } catch {
+    return false;
+  }
+}
+
+function originGuard(allowedOrigins: Set<string> | '*'): express.RequestHandler {
+  return (req, res, next) => {
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+    if (isAllowedOrigin(origin, allowedOrigins)) {
+      next();
+      return;
+    }
+    res.setHeader('x-mcp-hub-origin-rejected', '1');
+    if (ORIGIN_MODE === 'enforce') {
+      res.status(403).json({
+        success: false,
+        error_code: 'ORIGIN_FORBIDDEN',
+        error: 'Origin is not allowed for this MCP Hub endpoint',
+        origin,
+      });
+      return;
+    }
+    res.setHeader('x-mcp-hub-origin-warning', 'Origin is not in MCP_HUB_ALLOWED_ORIGINS');
+    next();
   };
+}
+
+function extractBearerToken(req: express.Request): string {
+  const header = Array.isArray(req.headers.authorization)
+    ? req.headers.authorization[0]
+    : req.headers.authorization;
+  if (typeof header !== 'string') return '';
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match ? match[1].trim() : '';
+}
+
+function sendUnknownSessionError(res: express.Response, requestId: unknown, statusCode: number) {
+  res.setHeader('x-mcp-reinit-required', '1');
+  res.setHeader('x-mcp-error-reason', 'unknown_or_expired_session');
+  res.status(statusCode).json(jsonRpcErrorResponse(requestId, -32000, 'MCP session not found. Start a new session with initialize.', {
+    reinitialize_required: true,
+    retryable: true,
+    reason: 'unknown_or_expired_session',
+    recovery_sequence: ['initialize', 'notifications/initialized', 'retry_original_request_once'],
+  }));
 }
 
 function sanitizeArtifactId(value: string): string {
@@ -477,8 +545,29 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     }
   }
 
-  if (!agentId || shouldBypassAuth(toolName)) {
+  if (shouldBypassAuth(toolName)) {
     recordAuthEvent(agentId, toolName, 'skipped');
+    return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
+  }
+
+  if (!agentId) {
+    recordAuthEvent(null, toolName, 'missing');
+    const warning = 'Agent identity is missing. This will fail once auth_mode=enforce.';
+    if (AUTH_MODE === 'enforce') {
+      return {
+        allowed: false,
+        response: {
+          success: false,
+          error_code: 'AUTH_AGENT_ID_REQUIRED',
+          error: 'agent_id/from_agent/created_by/requesting_agent is required in enforce mode',
+          auth_mode: AUTH_MODE,
+        },
+      };
+    }
+    if (AUTH_MODE === 'warn') {
+      warnings.push(warning);
+      return { allowed: true, warnings };
+    }
     return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
   }
 
@@ -674,6 +763,255 @@ function registerTools(server: McpServer) {
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('read_messages', (args) => handleReadMessages(args as any))
+  );
+
+  server.tool(
+    'start_thread',
+    threadTools.start_thread.description,
+    {
+      from_agent: z.string().describe('Your agent ID'),
+      to_agent: z.string().optional().describe('Optional target agent; omit for broadcast thread'),
+      title: z.string().describe('Thread title'),
+      content: z.string().describe('Initial message content'),
+      thread_id: z.string().optional().describe('Optional stable thread id; generated if omitted'),
+      idempotency_key: z.string().optional().describe('Optional idempotency key'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('start_thread', (args) => handleStartThread(args as any))
+  );
+
+  server.tool(
+    'reply_thread',
+    threadTools.reply_thread.description,
+    {
+      from_agent: z.string().describe('Your agent ID'),
+      thread_id: z.string().describe('Thread id returned by start_thread'),
+      content: z.string().describe('Reply content'),
+      to_agent: z.string().optional().describe('Optional target agent; omit for broadcast reply'),
+      parent_message_id: z.number().optional().describe('Optional parent message id'),
+      role: z.string().optional().describe('Optional role label, e.g. hypothesis/review/decision'),
+      idempotency_key: z.string().optional().describe('Optional idempotency key'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('reply_thread', (args) => handleReplyThread(args as any))
+  );
+
+  server.tool(
+    'read_thread',
+    threadTools.read_thread.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      thread_id: z.string().describe('Thread id'),
+      limit: z.number().optional().describe('Max messages'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('read_thread', (args) => handleReadThread(args as any))
+  );
+
+  server.tool(
+    'search_hub',
+    searchTools.search_hub.description,
+    {
+      agent_id: z.string().describe('Your agent ID; used for message/artifact visibility and heartbeat'),
+      q: z.string().describe('Text query; tokens are matched case-insensitively'),
+      scopes: z.array(z.enum(['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'])).optional().describe('Optional sources to search; defaults to all'),
+      namespace: z.string().optional().describe('Optional namespace filter for tasks/context/artifacts'),
+      from_agent: z.string().optional().describe('Optional sender filter for message search'),
+      context_agent_id: z.string().optional().describe('Optional context owner filter'),
+      context_key: z.string().optional().describe('Optional exact context key filter'),
+      task_status: z.enum(['pending', 'in_progress', 'done', 'blocked']).optional().describe('Optional task status filter'),
+      task_assigned_to: z.string().optional().describe('Optional task assignee filter'),
+      activity_agent_id: z.string().optional().describe('Optional activity owner filter'),
+      since_ts: z.number().optional().describe('Optional lower timestamp bound. Messages/activity/consensus use created_at; tasks/context/artifacts use updated_at.'),
+      limit: z.number().optional().describe('Max results to return (default 20, max 100)'),
+      preview_chars: z.number().optional().describe('Preview chars per compact/nano result (default 180, max 500)'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('compact includes previews; tiny returns refs/digests; nano uses shortest keys'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('search_hub', (args) => handleSearchHub(args as any))
+  );
+
+  server.tool(
+    'fetch_hub_refs',
+    refTools.fetch_hub_refs.description,
+    {
+      agent_id: z.string().describe('Your agent ID; used for message/artifact visibility and heartbeat'),
+      refs: z.object({
+        messages: z.array(z.number()).optional().describe('Message IDs'),
+        tasks: z.array(z.number()).optional().describe('Task IDs'),
+        context: z.array(z.number()).optional().describe('Context row IDs'),
+        activity: z.array(z.number()).optional().describe('Activity log IDs'),
+        artifacts: z.array(z.string()).optional().describe('Artifact IDs'),
+        consensus: z.array(z.number()).optional().describe('Consensus decision IDs'),
+      }).optional().describe('Refs to hydrate, grouped by source'),
+      response_mode: z.enum(['compact', 'tiny', 'nano', 'full']).optional().describe('compact previews by default; full returns full stored rows for visible refs'),
+      preview_chars: z.number().optional().describe('Preview chars for compact rows'),
+      mark_messages_read: z.boolean().optional().describe('If true, mark fetched visible messages as read. Default false.'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('fetch_hub_refs', (args) => handleFetchHubRefs(args as any))
+  );
+
+  server.tool(
+    'save_filter',
+    filterTools.save_filter.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      name: z.string().describe('Unique filter name for this agent'),
+      filter: z.record(z.unknown()).describe('Filter JSON. Use {kind:"search", q, scopes...} or {kind:"event_deltas", streams...}'),
+      namespace: z.string().optional().describe('Optional namespace/tag for grouping saved filters'),
+      cursor: z.string().optional().describe('Optional initial event cursor for event_deltas filters'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('save_filter', (args) => handleSaveFilter(args as any))
+  );
+
+  server.tool(
+    'list_filters',
+    filterTools.list_filters.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      namespace: z.string().optional().describe('Optional namespace/tag filter'),
+      limit: z.number().optional().describe('Max rows to return'),
+      offset: z.number().optional().describe('Row offset'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('list_filters', (args) => handleListFilters(args as any))
+  );
+
+  server.tool(
+    'read_filter_feed',
+    filterTools.read_filter_feed.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      filter_id: z.number().optional().describe('Saved filter ID'),
+      name: z.string().optional().describe('Saved filter name if filter_id is omitted'),
+      cursor: z.string().optional().describe('Optional cursor override for event_deltas filters'),
+      advance_cursor: z.boolean().optional().describe('If true, persist returned cursor on the saved filter'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity override'),
+      limit: z.number().optional().describe('Max feed items/events'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('read_filter_feed', (args) => handleReadFilterFeed(args as any))
+  );
+
+  server.tool(
+    'delete_filter',
+    filterTools.delete_filter.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      filter_id: z.number().optional().describe('Saved filter ID'),
+      name: z.string().optional().describe('Saved filter name if filter_id is omitted'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('delete_filter', (args) => handleDeleteFilter(args as any))
+  );
+
+  server.tool(
+    'read_signal_feed',
+    signalTools.read_signal_feed.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      sources: z.array(z.enum(['messages', 'tasks', 'artifacts', 'slo'])).optional().describe('Optional feed sources; defaults to all'),
+      limit: z.number().optional().describe('Max items to return (default 50, max 200)'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('read_signal_feed', (args) => handleReadSignalFeed(args as any))
+  );
+
+  server.tool(
+    'ack_feed_items',
+    signalTools.ack_feed_items.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      refs: z.object({
+        messages: z.array(z.union([z.string(), z.number()])).optional(),
+        tasks: z.array(z.union([z.string(), z.number()])).optional(),
+        artifacts: z.array(z.union([z.string(), z.number()])).optional(),
+        slo: z.array(z.union([z.string(), z.number()])).optional(),
+      }).optional().describe('Refs grouped by source: messages/tasks/artifacts/slo'),
+      mark_messages_read: z.boolean().optional().describe('If true, message refs are also marked read'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('ack_feed_items', (args) => handleAckFeedItems(args as any))
+  );
+
+  server.tool(
+    'get_hub_digest',
+    digestTools.get_hub_digest.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      sections: z.array(z.enum(['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory'])).optional().describe('Optional digest sections; defaults to all'),
+      streams: z.array(z.enum(['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'])).optional().describe('Event streams used by the events section'),
+      cursor: z.string().optional().describe('Event cursor for the events section ("e:<id>"). Omit to start at current edge.'),
+      namespace: z.string().optional().describe('Optional namespace for tasks/context/artifacts sections'),
+      memory_namespace: z.string().optional().describe('Optional namespace for shared memory section'),
+      context_agent_id: z.string().optional().describe('Optional context owner; defaults to agent_id'),
+      limit_per_source: z.number().optional().describe('Bound each section (default 5, max 50)'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('get_hub_digest', (args) => handleGetHubDigest(args as any))
+  );
+
+  server.tool(
+    'write_memory',
+    memoryTools.write_memory.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      key: z.string().describe('Stable memory key; normalized under memory:<key>'),
+      text: z.string().describe('Memory text'),
+      namespace: z.string().optional().describe('Memory namespace (default memory)'),
+      tags: z.array(z.string()).optional().describe('Optional tags'),
+      importance: z.number().optional().describe('Importance 0..1 for digest ordering'),
+      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('write_memory', (args) => handleWriteMemory(args as any))
+  );
+
+  server.tool(
+    'search_memory',
+    memoryTools.search_memory.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      q: z.string().optional().describe('Optional text query'),
+      namespace: z.string().optional().describe('Optional namespace filter'),
+      tags: z.array(z.string()).optional().describe('Optional tag filters'),
+      limit: z.number().optional().describe('Max memories'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('search_memory', (args) => handleSearchMemory(args as any))
+  );
+
+  server.tool(
+    'get_memory_digest',
+    memoryTools.get_memory_digest.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      namespace: z.string().optional().describe('Optional namespace filter'),
+      limit: z.number().optional().describe('Max memories'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('get_memory_digest', (args) => handleGetMemoryDigest(args as any))
+  );
+
+  server.tool(
+    'get_trace_timeline',
+    traceTools.get_trace_timeline.description,
+    {
+      agent_id: z.string().describe('Your agent ID'),
+      trace_id: z.string().describe('Trace identifier to inspect'),
+      limit: z.number().optional().describe('Max timeline items'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('get_trace_timeline', (args) => handleGetTraceTimeline(args as any))
   );
 
   // --- Task tools ---
@@ -928,6 +1266,7 @@ function registerTools(server: McpServer) {
       limit: z.number().optional().describe('Max rows to return (default 100, max 500)'),
       offset: z.number().optional().describe('Row offset for pagination (default 0)'),
       updated_after: z.number().optional().describe('Delta mode: return context rows with updated_at > updated_after (ms epoch)'),
+      cursor: z.string().optional().describe('Delta cursor "<updated_at>:<id>" from previous get_context response'),
       response_mode: z.enum(['full', 'compact', 'tiny', 'nano', 'summary']).optional().describe('compact shows previews, tiny shows digests/sizes, nano uses short keys, summary returns aggregates'),
       polling: z.boolean().optional().describe('Mark this call as polling-cycle read; full mode is forbidden when polling=true'),
       resolve_blob_refs: z.boolean().optional().describe('Resolve CAEP blob-ref values from protocol blob store'),
@@ -1231,12 +1570,8 @@ function registerTools(server: McpServer) {
     {
       requesting_agent: z.string().optional().describe('Your agent ID (for heartbeat)'),
       agent_id: z.string().optional().describe('Target agent scope (defaults to requesting_agent)'),
-      streams: z.array(z.enum(['messages', 'tasks', 'context', 'activity'])).optional().describe('Optional stream filter (default all): messages|tasks|context|activity'),
-      cursor: z.string().optional().describe('Compact cursor from previous wait_for_updates response (<message>.<task>.<context>.<activity> in base36)'),
-      message_since_ts: z.number().optional().describe('Last seen message watermark'),
-      task_since_ts: z.number().optional().describe('Last seen task watermark'),
-      context_since_ts: z.number().optional().describe('Last seen context watermark'),
-      activity_since_ts: z.number().optional().describe('Last seen activity watermark'),
+      streams: z.array(z.enum(['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'])).optional().describe('Optional stream filter (default all): messages|tasks|context|activity|artifacts|consensus'),
+      cursor: z.string().optional().describe('Event cursor from previous wait_for_updates/read_snapshot response ("e:<id>")'),
       wait_ms: z.number().optional().describe('Wait timeout in ms (server max applies)'),
       poll_interval_ms: z.number().optional().describe('Internal poll interval in ms (default 500)'),
       adaptive_retry: z.boolean().optional().describe('If true (default), timeout responses include adaptive retry_after_ms with backoff+jitter'),
@@ -1273,6 +1608,22 @@ function registerTools(server: McpServer) {
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('read_snapshot', (args) => handleReadSnapshot(args as any))
+  );
+
+  server.tool(
+    'read_event_deltas',
+    activityTools.read_event_deltas.description,
+    {
+      requesting_agent: z.string().optional().describe('Your agent ID (for heartbeat)'),
+      agent_id: z.string().optional().describe('Target agent scope (defaults to requesting_agent)'),
+      cursor: z.string().optional().describe('Event cursor from wait_for_updates/read_snapshot/read_event_deltas ("e:<id>"). Omit to start at current edge; pass e:0 to replay retained events.'),
+      streams: z.array(z.enum(['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'])).optional().describe('Optional stream filter; defaults to all stream_events sources'),
+      limit: z.number().optional().describe('Max events to return (default 100, max 1000)'),
+      include_payload: z.boolean().optional().describe('If true in compact mode, include event payload'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('nano returns tuples; tiny returns event refs; compact can include payload metadata'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('read_event_deltas', (args) => handleReadEventDeltas(args as any))
   );
 
   server.tool(
@@ -1326,8 +1677,10 @@ function registerTools(server: McpServer) {
 
 const PORT = parseInt(process.env.MCP_HUB_PORT || '3000');
 const HOST = process.env.MCP_HUB_HOST || '0.0.0.0';
+const ALLOWED_ORIGINS = parseAllowedOrigins(PORT);
 
 const app = createMcpExpressApp({ host: HOST });
+app.use(originGuard(ALLOWED_ORIGINS));
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 const artifactUploadRaw = express.raw({ type: '*/*', limit: ARTIFACT_MAX_BYTES });
 
@@ -1441,10 +1794,9 @@ function touchSession(sessionId: string | undefined) {
   sessionLastActivity.set(sessionId, Date.now());
 }
 
-async function createConnectedTransport(options?: { stateless?: boolean }) {
-  const stateless = options?.stateless === true;
+async function createConnectedTransport() {
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: stateless ? undefined : () => randomUUID(),
+    sessionIdGenerator: () => randomUUID(),
     // Improves compatibility with clients that expect JSON response bodies on POST requests.
     enableJsonResponse: true,
   });
@@ -1452,14 +1804,6 @@ async function createConnectedTransport(options?: { stateless?: boolean }) {
   registerTools(server);
   await server.connect(transport);
   return { server, transport };
-}
-
-async function closeConnectedTransport(server: McpServer, transport: StreamableHTTPServerTransport) {
-  const maybeClosableTransport = transport as unknown as { close?: () => void | Promise<void> };
-  await Promise.allSettled([
-    Promise.resolve(maybeClosableTransport.close?.()),
-    server.close(),
-  ]);
 }
 
 app.post('/mcp', async (req, res) => {
@@ -1488,19 +1832,10 @@ app.post('/mcp', async (req, res) => {
   }
 
   if (!isInitialize) {
-    if (sessionId && UNKNOWN_SESSION_POLICY === 'stateless_fallback') {
-      // Unknown/expired stateful session: recover transparently using one-shot stateless transport.
-      // This avoids mid-task client failures after container restarts or session GC.
-      const { server, transport } = await createConnectedTransport({ stateless: true });
-      try {
-        res.setHeader('x-mcp-session-recovery', 'stateless_fallback');
-        await transport.handleRequest(req, res, req.body);
-      } finally {
-        await closeConnectedTransport(server, transport);
-      }
+    if (sessionId && STRICT_SESSION_STATUS) {
+      sendUnknownSessionError(res, requestId, 404);
       return;
     }
-
     const message = sessionId
       ? 'Bad Request: Unknown or expired MCP session. Re-run initialize + notifications/initialized.'
       : 'Bad Request: Server not initialized. Call initialize first, then notifications/initialized.';
@@ -1520,7 +1855,7 @@ app.post('/mcp', async (req, res) => {
   }
 
   // New session — create server + transport
-  const { server, transport } = await createConnectedTransport({ stateless: false });
+  const { server, transport } = await createConnectedTransport();
 
   transport.onclose = () => {
     const sid = [...transports.entries()].find(([, t]) => t === transport)?.[0];
@@ -1543,6 +1878,10 @@ app.get('/mcp', async (req, res) => {
   setServerCapabilityHeaders(res);
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
   if (!sessionId || !transports.has(sessionId)) {
+    if (sessionId && STRICT_SESSION_STATUS) {
+      sendUnknownSessionError(res, null, 404);
+      return;
+    }
     res.status(400).json({ error: 'No active session. Send POST /mcp first.' });
     return;
   }
@@ -1559,6 +1898,11 @@ app.delete('/mcp', async (req, res) => {
     transports.delete(sessionId);
     sessionLastActivity.delete(sessionId);
   } else {
+    if (sessionId && STRICT_SESSION_STATUS) {
+      setServerCapabilityHeaders(res);
+      sendUnknownSessionError(res, null, 404);
+      return;
+    }
     res.status(404).json({ error: 'Session not found' });
   }
 });
@@ -1566,11 +1910,14 @@ app.delete('/mcp', async (req, res) => {
 app.get('/events', (req, res) => {
   setServerCapabilityHeaders(res);
   const agentId = typeof req.query.agent_id === 'string' ? req.query.agent_id.trim() : '';
-  const authToken = typeof req.query.auth_token === 'string' ? req.query.auth_token.trim() : '';
+  const bearerToken = extractBearerToken(req);
+  const queryAuthToken = typeof req.query.auth_token === 'string' ? req.query.auth_token.trim() : '';
+  const authToken = bearerToken;
   const responseMode = typeof req.query.response_mode === 'string' ? req.query.response_mode.trim().toLowerCase() : 'compact';
   const streams = parseEventStreams(req.query.streams as string | string[] | undefined);
   const cursorRaw = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
-  const parsedCursor = parseEventCursor(cursorRaw);
+  const parsedStreamCursor = parseStreamEventCursor(cursorRaw);
+  const lastEventId = parseLastEventId(req.headers['last-event-id']);
   const pollMs = Number.isFinite(Number(req.query.poll_ms))
     ? Math.max(250, Math.min(10_000, Math.floor(Number(req.query.poll_ms))))
     : EVENT_STREAM_DEFAULT_INTERVAL_MS;
@@ -1579,8 +1926,16 @@ app.get('/events', (req, res) => {
     res.status(400).json({ success: false, error: 'agent_id is required' });
     return;
   }
-  if (cursorRaw && !parsedCursor) {
-    res.status(400).json({ success: false, error: 'Invalid cursor format' });
+  if (cursorRaw && parsedStreamCursor === null) {
+    res.status(400).json({ success: false, error: 'Invalid cursor format. Expected event cursor "e:<id>".' });
+    return;
+  }
+  if (queryAuthToken) {
+    res.status(401).json({
+      success: false,
+      error_code: 'QUERY_AUTH_TOKEN_DENIED',
+      error: 'auth_token query parameter is disabled; use Authorization: Bearer <token>',
+    });
     return;
   }
 
@@ -1598,22 +1953,22 @@ app.get('/events', (req, res) => {
     return;
   }
 
+  logActivity(agentId, 'events_subscribe', `streams=${streams.join(',')} mode=${responseMode} poll_ms=${pollMs}`, { emit_stream_event: false });
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const initialWatermark = getUpdateWatermark(agentId, { streams });
-  let since = parsedCursor || {
-    message_since_ts: initialWatermark.latest_message_ts,
-    task_since_ts: initialWatermark.latest_task_ts,
-    context_since_ts: initialWatermark.latest_context_ts,
-    activity_since_ts: initialWatermark.latest_activity_ts,
-  };
+  const initialEventId = getStreamEventWatermark({ agent_id: agentId, streams });
+  let sinceEventId = lastEventId ?? parsedStreamCursor ?? initialEventId;
   let lastHeartbeatAt = Date.now();
 
-  const writeEvent = (eventName: string, payload: Record<string, unknown>) => {
+  const writeEvent = (eventName: string, payload: Record<string, unknown>, eventId?: number) => {
+    if (Number.isFinite(eventId)) {
+      res.write(`id: ${Math.floor(Number(eventId))}\n`);
+    }
     res.write(`event: ${eventName}\n`);
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
@@ -1623,80 +1978,82 @@ app.get('/events', (req, res) => {
       ? 'Auth token is invalid (warn mode). This will fail once auth_mode=enforce.'
       : 'Auth token missing (warn mode). This will fail once auth_mode=enforce.')
     : null;
-
   writeEvent('hello', {
     success: true,
     mode: responseMode === 'nano' ? 'nano' : 'compact',
     streams,
-    cursor: encodeEventCursor(initialWatermark),
+    cursor: encodeStreamEventCursor(sinceEventId),
+    event_id: sinceEventId,
+    resume: lastEventId !== null ? 'last-event-id' : (parsedStreamCursor !== null ? 'cursor' : 'edge'),
     warning: authWarning || undefined,
-  });
-  logActivity(agentId, 'events_subscribe', `streams=${streams.join(',')} mode=${responseMode} poll_ms=${pollMs}`);
+    warnings: [authWarning].filter(Boolean),
+  }, sinceEventId);
 
-  const timer = setInterval(() => {
+  const emitAvailableEvents = () => {
     try {
-      const watermark = getUpdateWatermark(agentId, {
+      const events = listStreamEventsAfter({
+        agent_id: agentId,
         streams,
-        fallback: {
-          latest_message_ts: since.message_since_ts,
-          latest_task_ts: since.task_since_ts,
-          latest_context_ts: since.context_since_ts,
-          latest_activity_ts: since.activity_since_ts,
-        },
+        after_id: sinceEventId,
+        limit: 100,
       });
-      const changed = {
-        messages: streams.includes('messages') && watermark.latest_message_ts > since.message_since_ts,
-        tasks: streams.includes('tasks') && watermark.latest_task_ts > since.task_since_ts,
-        context: streams.includes('context') && watermark.latest_context_ts > since.context_since_ts,
-        activity: streams.includes('activity') && watermark.latest_activity_ts > since.activity_since_ts,
-      };
-      const changedStreams = Object.entries(changed)
-        .filter(([, value]) => value)
-        .map(([key]) => key);
-      const cursor = encodeEventCursor(watermark);
-
-      if (changedStreams.length > 0) {
+      if (events.length > 0) {
+        const eventId = events[events.length - 1].id;
+        const changedStreams = [...new Set(events.map((event) => event.stream))];
+        const cursor = encodeStreamEventCursor(eventId);
         if (responseMode === 'nano') {
           writeEvent('update', {
             c: 1,
             s: changedStreams,
             u: cursor,
-          });
+            i: eventId,
+          }, eventId);
         } else {
           writeEvent('update', {
             changed: true,
             streams: changedStreams,
             cursor,
-            watermark,
-          });
+            event_id: eventId,
+            events: events.map((event) => ({
+              id: event.id,
+              stream: event.stream,
+              op: event.op,
+              entity_id: event.entity_id,
+              created_at: event.created_at,
+            })),
+          }, eventId);
         }
-        since = {
-          message_since_ts: watermark.latest_message_ts,
-          task_since_ts: watermark.latest_task_ts,
-          context_since_ts: watermark.latest_context_ts,
-          activity_since_ts: watermark.latest_activity_ts,
-        };
+        sinceEventId = eventId;
         lastHeartbeatAt = Date.now();
-        return;
+        return true;
       }
 
       const now = Date.now();
       if ((now - lastHeartbeatAt) >= EVENT_STREAM_HEARTBEAT_MS) {
+        const eventId = Math.max(sinceEventId, getStreamEventWatermark({ agent_id: agentId, streams }));
+        const cursor = encodeStreamEventCursor(eventId);
         if (responseMode === 'nano') {
-          writeEvent('heartbeat', { c: 0, u: cursor });
+          writeEvent('heartbeat', { c: 0, u: cursor, i: eventId });
         } else {
-          writeEvent('heartbeat', { changed: false, cursor });
+          writeEvent('heartbeat', { changed: false, cursor, event_id: eventId });
         }
         lastHeartbeatAt = now;
       }
     } catch (error) {
       writeEvent('error', { success: false, error: 'event_stream_internal_error' });
     }
+    return false;
+  };
+
+  emitAvailableEvents();
+
+  const timer = setInterval(() => {
+    emitAvailableEvents();
   }, pollMs);
 
   const cleanup = () => {
     clearInterval(timer);
-    logActivity(agentId, 'events_unsubscribe', `streams=${streams.join(',')}`);
+    logActivity(agentId, 'events_unsubscribe', `streams=${streams.join(',')}`, { emit_stream_event: false });
   };
   req.on('close', cleanup);
   req.on('end', cleanup);
@@ -1708,6 +2065,8 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     sessions: transports.size,
     auth_mode: AUTH_MODE,
+    origin_mode: ORIGIN_MODE,
+    query_auth_token_mode: 'deny',
     namespace_quota_mode: NAMESPACE_QUOTA_MODE,
     namespace_quota_rps: NAMESPACE_QUOTA_RPS,
     namespace_token_budget_per_min: NAMESPACE_TOKEN_BUDGET_PER_MIN,
@@ -1719,7 +2078,8 @@ app.get('/health', (_req, res) => {
     artifact_tickets: artifactTickets.size,
     session_idle_timeout_ms: SESSION_IDLE_TIMEOUT_MS,
     session_gc_enabled: SESSION_GC_ENABLED,
-    unknown_session_policy: UNKNOWN_SESSION_POLICY,
+    unknown_session_policy: 'error',
+    strict_session_status: STRICT_SESSION_STATUS,
   });
 });
 
@@ -1729,7 +2089,7 @@ setInterval(() => {
     const maintenance = runMaintenance();
     if (expiredTickets > 0 || maintenance.slo.triggered > 0 || maintenance.slo.resolved > 0) {
       console.log(
-        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} tickets_expired=${expiredTickets} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
+        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} stream_events=${maintenance.stream_events_cleaned} tickets_expired=${expiredTickets} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
       );
     }
   } catch (error) {
@@ -1761,6 +2121,6 @@ setInterval(() => {
 
 app.listen(PORT, HOST, () => {
   console.log(
-    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, unknown_session_policy=${UNKNOWN_SESSION_POLICY}, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
+    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, unknown_session_policy=error, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
   );
 });
