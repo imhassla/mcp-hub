@@ -806,6 +806,9 @@ function registerTools(server: McpServer) {
       thread_id: z.string().describe('Thread id'),
       limit: z.number().optional().describe('Max messages'),
       response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      after_message_id: z.number().optional().describe('Only return thread messages with id greater than this cursor'),
+      before_message_id: z.number().optional().describe('Only return thread messages with id lower than this cursor'),
+      order: z.enum(['latest', 'oldest']).optional().describe('Default latest returns newest tail in chronological output order'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('read_thread', (args) => handleReadThread(args as any))
@@ -919,6 +922,7 @@ function registerTools(server: McpServer) {
       sources: z.array(z.enum(['messages', 'tasks', 'artifacts', 'slo'])).optional().describe('Optional feed sources; defaults to all'),
       limit: z.number().optional().describe('Max items to return (default 50, max 200)'),
       response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
+      include_self: z.boolean().optional().describe('If true, include your own broadcast messages; default false reduces self-noise'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('read_signal_feed', (args) => handleReadSignalFeed(args as any))

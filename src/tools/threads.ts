@@ -3,6 +3,7 @@ import type { Message } from '../types.js';
 import { sha256Hex, withIdempotency } from '../utils.js';
 
 type ThreadMode = 'compact' | 'tiny' | 'nano';
+type ThreadOrder = 'latest' | 'oldest';
 
 const DEFAULT_THREAD_LIMIT = 50;
 const MAX_THREAD_LIMIT = 200;
@@ -17,6 +18,10 @@ function normalizeMode(mode?: string): ThreadMode {
 
 function normalizeThreadId(threadId?: string): string {
   return String(threadId || '').trim().slice(0, 120);
+}
+
+function normalizeOrder(order?: string): ThreadOrder {
+  return order === 'oldest' ? 'oldest' : 'latest';
 }
 
 function makeThreadId(seed: string): string {
@@ -152,31 +157,61 @@ export function handleReadThread(args: {
   thread_id: string;
   limit?: number;
   response_mode?: ThreadMode;
+  after_message_id?: number;
+  before_message_id?: number;
+  order?: ThreadOrder;
 }) {
   heartbeat(args.agent_id);
   const threadId = normalizeThreadId(args.thread_id);
   if (!threadId) return { success: false, error_code: 'THREAD_ID_REQUIRED', error: 'thread_id is required' };
   const mode = normalizeMode(args.response_mode);
+  const order = normalizeOrder(args.order);
   const limit = Math.max(1, Math.min(MAX_THREAD_LIMIT, Math.floor(Number(args.limit ?? DEFAULT_THREAD_LIMIT))));
-  const messages = getDb().prepare(`
+  const afterMessageId = Math.max(0, Math.floor(Number(args.after_message_id || 0)));
+  const beforeMessageId = Math.max(0, Math.floor(Number(args.before_message_id || 0)));
+  const where: string[] = [
+    'm.trace_id = ?',
+    '(m.to_agent = ? OR m.to_agent IS NULL OR m.from_agent = ?)',
+  ];
+  const params: Array<string | number> = [args.agent_id, threadId, args.agent_id, args.agent_id];
+  if (afterMessageId > 0) {
+    where.push('m.id > ?');
+    params.push(afterMessageId);
+  }
+  if (beforeMessageId > 0) {
+    where.push('m.id < ?');
+    params.push(beforeMessageId);
+  }
+  const orderSql = afterMessageId > 0 || order === 'oldest'
+    ? 'm.created_at ASC, m.id ASC'
+    : 'm.created_at DESC, m.id DESC';
+  const rows = getDb().prepare(`
     SELECT
       m.*,
       CASE WHEN mr.message_id IS NULL THEN 0 ELSE 1 END AS read
     FROM messages m
     LEFT JOIN message_reads mr
       ON mr.message_id = m.id AND mr.agent_id = ?
-    WHERE m.trace_id = ?
-      AND (m.to_agent = ? OR m.to_agent IS NULL OR m.from_agent = ?)
-    ORDER BY m.created_at ASC, m.id ASC
+    WHERE ${where.join(' AND ')}
+    ORDER BY ${orderSql}
     LIMIT ?
-  `).all(args.agent_id, threadId, args.agent_id, args.agent_id, limit) as Message[];
-  logActivity(args.agent_id, 'read_thread', `thread_id=${threadId} messages=${messages.length} mode=${mode}`, { emit_stream_event: false });
-  if (mode === 'nano') return { t: threadId, c: messages.length, m: formatThreadMessages(messages, mode) };
+  `).all(...params, limit + 1) as Message[];
+  const hasMore = rows.length > limit;
+  let messages = rows.slice(0, limit);
+  if (afterMessageId === 0 && order !== 'oldest') messages = messages.reverse();
+  const nextCursor = messages.length > 0 ? Math.max(...messages.map((message) => message.id)) : afterMessageId;
+  const previousCursor = messages.length > 0 ? Math.min(...messages.map((message) => message.id)) : beforeMessageId;
+  logActivity(args.agent_id, 'read_thread', `thread_id=${threadId} messages=${messages.length} mode=${mode} order=${order}`, { emit_stream_event: false });
+  if (mode === 'nano') return { t: threadId, c: messages.length, m: formatThreadMessages(messages, mode), u: nextCursor, p: previousCursor, h: hasMore ? 1 : 0 };
   return {
     success: true,
     thread_id: threadId,
     count: messages.length,
     messages: formatThreadMessages(messages, mode),
+    next_cursor: nextCursor,
+    previous_cursor: previousCursor,
+    has_more: hasMore,
+    order,
   };
 }
 
@@ -225,6 +260,9 @@ export const threadTools = {
         thread_id: { type: 'string', description: 'Thread id' },
         limit: { type: 'number', description: `Max messages (default ${DEFAULT_THREAD_LIMIT}, max ${MAX_THREAD_LIMIT})` },
         response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'Response verbosity' },
+        after_message_id: { type: 'number', description: 'Only return messages with id greater than this cursor' },
+        before_message_id: { type: 'number', description: 'Only return messages with id lower than this cursor' },
+        order: { type: 'string', enum: ['latest', 'oldest'], description: 'Default latest returns the newest tail in chronological output order' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },
       },
       required: ['agent_id', 'thread_id'],

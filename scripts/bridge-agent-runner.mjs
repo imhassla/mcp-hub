@@ -43,6 +43,7 @@ function parseArgs(argv) {
     rememberTags: '',
     threadId: '',
     threadRole: 'bridge-result',
+    threadTail: Number(process.env.BRIDGE_THREAD_TAIL || 12),
     runtimeMode: process.env.BRIDGE_RUNTIME_MODE || 'auto',
     timeoutMs: Number(process.env.BRIDGE_TIMEOUT_MS || 180000),
     publishMessage: true,
@@ -79,6 +80,7 @@ function parseArgs(argv) {
     else if (arg === '--remember-tags') out.rememberTags = next();
     else if (arg === '--thread-id') out.threadId = next();
     else if (arg === '--thread-role') out.threadRole = next();
+    else if (arg === '--thread-tail') out.threadTail = Number(next());
     else if (arg === '--runtime-mode') out.runtimeMode = next();
     else if (arg === '--timeout-ms') out.timeoutMs = Number(next());
     else if (arg === '--expect-json') out.expectJson = true;
@@ -107,6 +109,7 @@ Options:
   --remember-tags CSV  Tags for --remember-key memory
   --thread-id ID       Publish compact result as a discussion thread reply
   --thread-role ROLE   Thread reply role (default bridge-result)
+  --thread-tail N      Include latest N visible thread messages in backend preflight (default 12)
   --runtime-mode MODE  Runtime profile override: auto|repo|isolated|unknown
   --timeout-ms MS      Backend timeout
 
@@ -128,6 +131,10 @@ function validateBridgeOptions(opts) {
   if (!['none', 'compact', 'full'].includes(opts.onboardingMode)) {
     throw new Error('--onboarding-mode must be none|compact|full');
   }
+  if (!Number.isFinite(opts.threadTail) || opts.threadTail < 0) {
+    throw new Error('--thread-tail must be a non-negative number');
+  }
+  opts.threadTail = Math.min(50, Math.floor(opts.threadTail));
 }
 
 function sha256(value) {
@@ -139,13 +146,35 @@ function truncate(value, max) {
   return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
 }
 
+function compactThreadPreflight(thread, previewChars = 180) {
+  if (!thread || thread.success !== true || !Array.isArray(thread.messages)) return thread || null;
+  return {
+    success: true,
+    thread_id: thread.thread_id,
+    count: thread.count,
+    next_cursor: thread.next_cursor,
+    previous_cursor: thread.previous_cursor,
+    has_more: thread.has_more,
+    order: thread.order,
+    messages: thread.messages.map((message) => ({
+      id: message.id,
+      from_agent: message.from_agent,
+      to_agent: message.to_agent || null,
+      role: message.role || null,
+      created_at: message.created_at,
+      content_digest: message.content_digest,
+      content_preview: truncate(message.content_preview || '', previewChars),
+    })),
+  };
+}
+
 function serializePreflight(preflight) {
   const full = JSON.stringify(preflight);
   if (full.length <= MAX_PREFLIGHT_CHARS) {
     return { text: full, truncated: false, original_chars: full.length };
   }
   const digest = preflight?.hub_digest?.digest || {};
-  const stub = {
+  let stub = {
     truncated: true,
     original_chars: full.length,
     agent_id: preflight?.agent_id,
@@ -154,14 +183,47 @@ function serializePreflight(preflight) {
     signal_count: digest.signals?.count ?? digest.signals?.c ?? null,
     memory_count: digest.memory?.count ?? digest.memory?.c ?? null,
     event_cursor: digest.events?.cursor ?? digest.events?.c ?? null,
+    thread: compactThreadPreflight(preflight?.thread, 180),
   };
-  return { text: JSON.stringify(stub), truncated: true, original_chars: full.length };
+  let text = JSON.stringify(stub);
+  if (text.length > MAX_PREFLIGHT_CHARS && stub.thread?.messages) {
+    stub = {
+      ...stub,
+      thread: {
+        ...stub.thread,
+        messages: stub.thread.messages.slice(-Math.max(1, Math.min(3, stub.thread.messages.length))).map((message) => ({
+          ...message,
+          content_preview: truncate(message.content_preview, 120),
+        })),
+      },
+    };
+    text = JSON.stringify(stub);
+  }
+  if (text.length > MAX_PREFLIGHT_CHARS) {
+    stub = {
+      ...stub,
+      thread: stub.thread ? {
+        ...stub.thread,
+        messages: stub.thread.messages.map((message) => ({
+          id: message.id,
+          from_agent: message.from_agent,
+          role: message.role,
+          content_digest: message.content_digest,
+        })),
+      } : null,
+    };
+    text = JSON.stringify(stub);
+  }
+  return { text, truncated: true, original_chars: full.length };
 }
 
 function buildBackendPrompt(prompt, preflight) {
   const serialized = serializePreflight(preflight);
   const context = serialized.text;
-  return `Hub preflight context (bounded JSON; use if relevant, do not repeat verbatim):\n${context}\n\nUser task:\n${prompt}`;
+  const notice = serialized.truncated
+    ? `\nPreflight note: context was truncated from ${serialized.original_chars} chars; retained thread tail is prioritized when available.\n`
+    : '\n';
+  return `Hub preflight context (bounded JSON; use if relevant, do not repeat verbatim):\n${context}${notice}\nUser task:\n${prompt}`;
 }
 
 function parseCsv(value) {
@@ -653,10 +715,24 @@ async function main() {
       response_mode: 'tiny',
       limit_per_source: 5,
     }));
+    let threadTail = null;
+    if (opts.threadId && opts.threadTail > 0) {
+      threadTail = await measurePhase(phaseTimings, 'read_thread_preflight_ms', () => mcp.call('read_thread', {
+        agent_id: opts.agentId,
+        auth_token: authToken,
+        thread_id: opts.threadId,
+        response_mode: 'compact',
+        limit: opts.threadTail,
+      })).catch((error) => ({
+        success: false,
+        error: String(error?.message || error),
+      }));
+    }
     const preflight = {
       agent_id: opts.agentId,
       namespace: opts.namespace,
       hub_digest: hubDigest,
+      thread: threadTail,
     };
     const preflightSerialized = serializePreflight(preflight);
     const backendPrompt = buildBackendPrompt(prompt, preflight);

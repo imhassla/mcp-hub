@@ -24,19 +24,29 @@ function preview(value: string, max = 160): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}...`;
 }
 
+function parseMetadata(value: unknown): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(String(value || '{}'));
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
 function ackExists(agentId: string, source: SignalSource, entityId: string): boolean {
   const row = getDb().prepare('SELECT 1 FROM feed_acks WHERE agent_id = ? AND source = ? AND entity_id = ?')
     .get(agentId, source, entityId);
   return Boolean(row);
 }
 
-function readMessageSignals(agentId: string, limit: number) {
+function readMessageSignals(agentId: string, limit: number, includeSelf: boolean) {
   return getDb().prepare(`
     SELECT
       m.id,
       m.from_agent,
       m.to_agent,
       m.content,
+      m.metadata,
       m.created_at,
       m.trace_id,
       m.span_id
@@ -46,11 +56,12 @@ function readMessageSignals(agentId: string, limit: number) {
     LEFT JOIN feed_acks fa
       ON fa.agent_id = ? AND fa.source = 'messages' AND fa.entity_id = CAST(m.id AS TEXT)
     WHERE (m.to_agent = ? OR m.to_agent IS NULL)
+      AND (? = 1 OR m.from_agent != ?)
       AND mr.message_id IS NULL
       AND fa.entity_id IS NULL
     ORDER BY CASE WHEN m.to_agent = ? THEN 0 ELSE 1 END, m.created_at DESC, m.id DESC
     LIMIT ?
-  `).all(agentId, agentId, agentId, agentId, limit) as Array<Record<string, unknown>>;
+  `).all(agentId, agentId, agentId, includeSelf ? 1 : 0, agentId, agentId, limit) as Array<Record<string, unknown>>;
 }
 
 function readTaskSignals(agentId: string, limit: number) {
@@ -117,20 +128,27 @@ function formatSignal(source: SignalSource, row: Record<string, unknown>, mode: 
   const ts = Number(row.updated_at || row.created_at || 0);
   if (mode === 'nano') return [source, id, ts];
   if (mode === 'tiny') {
+    const metadata = source === 'messages' ? parseMetadata(row.metadata) : {};
     return {
       source,
       id,
       updated_at: ts,
       digest: sha256Hex(JSON.stringify(row)).slice(0, 12),
+      ...(source === 'messages' && row.trace_id ? { trace_id: row.trace_id, thread_id: metadata.thread_id || row.trace_id } : {}),
+      ...(source === 'messages' && metadata.thread_role ? { thread_role: metadata.thread_role } : {}),
     };
   }
   if (source === 'messages') {
     const content = String(row.content || '');
+    const metadata = parseMetadata(row.metadata);
     return {
       source,
       id,
       from_agent: row.from_agent,
       to_agent: row.to_agent,
+      trace_id: row.trace_id,
+      thread_id: metadata.thread_id || row.trace_id || null,
+      thread_role: metadata.thread_role || null,
       created_at: row.created_at,
       content_preview: preview(content),
       content_digest: sha256Hex(content).slice(0, 16),
@@ -175,14 +193,16 @@ export function handleReadSignalFeed(args: {
   sources?: SignalSource[];
   limit?: number;
   response_mode?: SignalMode;
+  include_self?: boolean;
 }) {
   heartbeat(args.agent_id);
   const sources = normalizeSources(args.sources);
   const mode = normalizeMode(args.response_mode);
   const limit = Math.max(1, Math.min(200, Math.floor(Number(args.limit ?? 50))));
   const perSourceLimit = Math.max(1, Math.min(200, limit));
+  const includeSelf = args.include_self === true;
   const rows: Array<{ source: SignalSource; row: Record<string, unknown> }> = [];
-  if (sources.includes('messages')) rows.push(...readMessageSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'messages' as const, row })));
+  if (sources.includes('messages')) rows.push(...readMessageSignals(args.agent_id, perSourceLimit, includeSelf).map((row) => ({ source: 'messages' as const, row })));
   if (sources.includes('tasks')) rows.push(...readTaskSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'tasks' as const, row })));
   if (sources.includes('artifacts')) rows.push(...readArtifactSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'artifacts' as const, row })));
   if (sources.includes('slo')) rows.push(...readSloSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'slo' as const, row })));
@@ -191,7 +211,7 @@ export function handleReadSignalFeed(args: {
     .sort((a, b) => Number(b.row.updated_at || b.row.created_at || 0) - Number(a.row.updated_at || a.row.created_at || 0))
     .slice(0, limit)
     .map(({ source, row }) => formatSignal(source, row, mode));
-  logActivity(args.agent_id, 'read_signal_feed', `sources=${sources.join(',')} items=${items.length} mode=${mode}`, { emit_stream_event: false });
+  logActivity(args.agent_id, 'read_signal_feed', `sources=${sources.join(',')} items=${items.length} mode=${mode} include_self=${includeSelf ? 1 : 0}`, { emit_stream_event: false });
   if (mode === 'nano') return { i: items, c: items.length };
   return { success: true, items, count: items.length, sources };
 }
@@ -237,6 +257,7 @@ export const signalTools = {
         sources: { type: 'array', items: { type: 'string', enum: [...SIGNAL_SOURCES] }, description: 'Optional feed sources; defaults to all' },
         limit: { type: 'number', description: 'Max items to return (default 50, max 200)' },
         response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'Response verbosity' },
+        include_self: { type: 'boolean', description: 'If true, include your own broadcast messages. Default false reduces self-noise.' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },
       },
       required: ['agent_id'],
