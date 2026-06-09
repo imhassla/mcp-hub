@@ -66,6 +66,7 @@ import {
   incrementArtifactAccess,
   logActivity,
   getStreamEventWatermark,
+  getMinStreamEventId,
   listStreamEventsAfter,
 } from './db.js';
 import {
@@ -760,6 +761,7 @@ function registerTools(server: McpServer) {
       response_mode: z.enum(['full', 'compact', 'tiny', 'nano']).optional().describe('compact returns previews; tiny returns digests/sizes; nano uses short keys for routing loops'),
       polling: z.boolean().optional().describe('Mark this call as polling-cycle read; full mode is forbidden when polling=true'),
       resolve_blob_refs: z.boolean().optional().describe('Resolve CAEP blob-ref envelopes into payloads'),
+      mark_read: z.boolean().optional().describe('If false, visible messages are not marked read. Default true.'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('read_messages', (args) => handleReadMessages(args as any))
@@ -1963,6 +1965,11 @@ app.get('/events', (req, res) => {
 
   const initialEventId = getStreamEventWatermark({ agent_id: agentId, streams });
   let sinceEventId = lastEventId ?? parsedStreamCursor ?? initialEventId;
+  const minEventId = getMinStreamEventId({ agent_id: agentId, streams });
+  const cursorStale = sinceEventId > 0 && minEventId > 0 && sinceEventId < minEventId;
+  if (cursorStale) {
+    sinceEventId = initialEventId;
+  }
   let lastHeartbeatAt = Date.now();
 
   const writeEvent = (eventName: string, payload: Record<string, unknown>, eventId?: number) => {
@@ -1985,6 +1992,10 @@ app.get('/events', (req, res) => {
     cursor: encodeStreamEventCursor(sinceEventId),
     event_id: sinceEventId,
     resume: lastEventId !== null ? 'last-event-id' : (parsedStreamCursor !== null ? 'cursor' : 'edge'),
+    cursor_stale: cursorStale || undefined,
+    resync_required: cursorStale || undefined,
+    resync_hint: cursorStale ? 'read_snapshot' : undefined,
+    min_event_id: cursorStale ? minEventId : undefined,
     warning: authWarning || undefined,
     warnings: [authWarning].filter(Boolean),
   }, sinceEventId);

@@ -311,7 +311,8 @@ export function handleReadMessages(args: {
   logActivity(
     args.agent_id,
     'read_messages',
-    `Read ${slicedMessages.length} messages (limit=${limit}, offset=${offset}, since_ts=${sinceTs ?? '-'}, cursor=${args.cursor || '-'}, resolve_blob_refs=${Boolean(args.resolve_blob_refs)})`
+    `Read ${slicedMessages.length} messages (limit=${limit}, offset=${offset}, since_ts=${sinceTs ?? '-'}, cursor=${args.cursor || '-'}, resolve_blob_refs=${Boolean(args.resolve_blob_refs)})`,
+    { emit_stream_event: !pollingCycle }
   );
   if (responseMode === 'nano') {
     const nano = resolvedMessages.map((message) => {
@@ -417,7 +418,7 @@ export const messageTools = {
     handler: handleSendBlobMessage,
   },
   read_messages: {
-    description: `Read incoming messages. Messages are marked as read after retrieval. Defaults to limit=${DEFAULT_READ_LIMIT}, max limit=${MAX_READ_LIMIT}. Use response_mode=compact|tiny|nano to reduce token output.`,
+    description: `Read incoming messages. Messages are marked as read after retrieval unless mark_read=false. Defaults to limit=${DEFAULT_READ_LIMIT}, max limit=${MAX_READ_LIMIT}. Use response_mode=compact|tiny|nano to reduce token output.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -431,6 +432,7 @@ export const messageTools = {
         response_mode: { type: 'string', enum: ['full', 'compact', 'tiny', 'nano'], description: 'compact returns previews; tiny returns digests/sizes; nano uses short keys for routing loops' },
         polling: { type: 'boolean', description: 'Mark this call as polling-cycle read; full mode is forbidden when polling=true' },
         resolve_blob_refs: { type: 'boolean', description: 'Resolve CAEP blob-ref envelopes into payloads from protocol blob store' },
+        mark_read: { type: 'boolean', description: 'If false, visible messages are not marked read. Default true.' },
       },
       required: ['agent_id'],
     },

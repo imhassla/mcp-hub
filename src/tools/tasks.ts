@@ -555,7 +555,8 @@ export function handleListTasks(args: {
   logActivity(
     args.agent_id || 'system',
     'list_tasks',
-    `Listed ${slicedTasks.length} tasks (ns=${args.namespace || '*'}, offset=${offset}, limit=${limit}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'})`
+    `Listed ${slicedTasks.length} tasks (ns=${args.namespace || '*'}, offset=${offset}, limit=${limit}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'})`,
+    { emit_stream_event: !pollingCycle }
   );
   if (responseMode === 'compact') {
     return { tasks: compactTasks, has_more: hasMore, next_cursor: nextCursor };

@@ -470,6 +470,10 @@ export function handleReadSnapshot(args: {
     agent_id: watcherAgentId,
     streams: ['messages', 'tasks', 'context', 'activity'],
   });
+  const lastReturnedEventId = eventChanges.length > 0
+    ? eventChanges[eventChanges.length - 1].id
+    : eventWatermark;
+  const eventsHasMore = lastReturnedEventId < eventWatermark;
   const changed = {
     messages: eventStreams.has('messages'),
     tasks: eventStreams.has('tasks'),
@@ -495,10 +499,10 @@ export function handleReadSnapshot(args: {
   logActivity(
     args.requesting_agent || watcherAgentId,
     'read_snapshot',
-    `messages=${messagesCount} tasks=${tasksCount} context=${contextCount} mode=${responseMode} cursor_in=${args.cursor || '-'} cursor_out=${encodeEventCursor(eventWatermark)}`,
+    `messages=${messagesCount} tasks=${tasksCount} context=${contextCount} mode=${responseMode} cursor_in=${args.cursor || '-'} cursor_out=${encodeEventCursor(lastReturnedEventId)} watermark=${eventWatermark} events_has_more=${eventsHasMore ? 1 : 0}`,
     { emit_stream_event: false }
   );
-  const cursor = encodeEventCursor(eventWatermark);
+  const cursor = encodeEventCursor(lastReturnedEventId);
 
   if (responseMode === 'nano') {
     return {
@@ -522,7 +526,9 @@ export function handleReadSnapshot(args: {
         t: (tasks as { n?: string | null }).n ?? null,
       },
       u: cursor,
-      ei: eventWatermark,
+      ei: lastReturnedEventId,
+      ew: eventWatermark,
+      eh: eventsHasMore ? 1 : 0,
     };
   }
 
@@ -531,7 +537,9 @@ export function handleReadSnapshot(args: {
     response_mode: responseMode,
     changed,
     cursor,
-    event_id: eventWatermark,
+    event_id: lastReturnedEventId,
+    event_watermark: eventWatermark,
+    events_has_more: eventsHasMore,
     events: eventChanges.map((event) => ({
       id: event.id,
       stream: event.stream,

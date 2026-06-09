@@ -249,6 +249,7 @@ export function handleGetContext(args: {
   const cursor = parseContextCursor(args.cursor);
   const updatedAfter = Number.isFinite(args.updated_after) ? Math.floor(Number(args.updated_after)) : undefined;
   const useDeltaOrdering = cursor !== null || updatedAfter !== undefined;
+  const pollingCycle = args.polling === true || useDeltaOrdering;
   const queryLimit = useDeltaOrdering ? Math.min(MAX_CONTEXT_LIMIT + 1, limit + 1) : limit;
   const offset = useDeltaOrdering ? 0 : Math.max(0, Math.floor(args.offset ?? 0));
   const contexts = getContext({
@@ -266,7 +267,8 @@ export function handleGetContext(args: {
   logActivity(
     args.requesting_agent || 'system',
     'get_context',
-    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'}) : ${slicedContexts.length} results`
+    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'}) : ${slicedContexts.length} results`,
+    { emit_stream_event: !pollingCycle }
   );
 
   const resolvedContexts: ResolvedContext[] = args.resolve_blob_refs
