@@ -44,7 +44,7 @@ type WaitStream = (typeof WAIT_STREAMS)[number];
 const EVENT_DELTA_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const;
 type EventDeltaStream = (typeof EVENT_DELTA_STREAMS)[number];
 const SNAPSHOT_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const satisfies readonly StreamEventName[];
-const LEGACY_WATERMARK_STREAMS = ['messages', 'tasks', 'context', 'activity'] as const;
+const TIMESTAMP_WATERMARK_STREAMS = ['messages', 'tasks', 'context', 'activity'] as const;
 const DEFAULT_WAIT_RESPONSE_MODE: WaitResponseMode = (() => {
   const configured = String(process.env.MCP_HUB_WAIT_DEFAULT_RESPONSE_MODE || '').toLowerCase().trim();
   if (configured === 'nano') return 'nano';
@@ -151,9 +151,9 @@ function changedStreamMap(streams: string[]) {
   };
 }
 
-function legacyWatermarkStreams(streams: readonly string[]) {
+function timestampWatermarkStreams(streams: readonly string[]) {
   return streams.filter((stream): stream is 'messages' | 'tasks' | 'context' | 'activity' => (
-    (LEGACY_WATERMARK_STREAMS as readonly string[]).includes(stream)
+    (TIMESTAMP_WATERMARK_STREAMS as readonly string[]).includes(stream)
   ));
 }
 
@@ -709,7 +709,7 @@ export async function handleWaitForUpdates(args: {
         cursor,
         event_id: nextEventId,
         changed_streams: changed,
-        watermark: getUpdateWatermark(watcherAgentId, { streams: legacyWatermarkStreams(watchedStreams) }),
+        watermark: getUpdateWatermark(watcherAgentId, { streams: timestampWatermarkStreams(watchedStreams) }),
         events,
       };
     }
@@ -778,7 +778,7 @@ export async function handleWaitForUpdates(args: {
     cursor,
     event_id: watermarkEventId,
     changed_streams: changedStreamMap([]),
-    watermark: getUpdateWatermark(watcherAgentId, { streams: legacyWatermarkStreams(watchedStreams) }),
+    watermark: getUpdateWatermark(watcherAgentId, { streams: timestampWatermarkStreams(watchedStreams) }),
   };
 }
 

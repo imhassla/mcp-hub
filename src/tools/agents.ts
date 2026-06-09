@@ -466,7 +466,7 @@ function buildRuntimeGuidance(runtimeProfile: AgentRuntimeProfile) {
   if (runtimeProfile.mode === 'repo') {
     return {
       mode: 'repo',
-      strategy: 'direct_repo_execution',
+      strategy: 'repo_workspace_execution',
       recommendations: [
         'Claim tasks requiring execution_mode=repo or any',
         'Use get_task_handoff(response_mode=tiny) for fast dependency/evidence scan',

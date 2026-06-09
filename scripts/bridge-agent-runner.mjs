@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const DEFAULT_ENDPOINT = process.env.ENDPOINT || process.env.MCP_ENDPOINT || 'http://localhost:3000/mcp';
+const DEFAULT_ENDPOINT = process.env.ENDPOINT || process.env.MCP_ENDPOINT || 'http://127.0.0.1:3000/mcp';
 const MAX_CONTEXT_CHARS = Number(process.env.BRIDGE_CONTEXT_MAX_CHARS || 1900);
 const MAX_MESSAGE_CHARS = Number(process.env.BRIDGE_MESSAGE_MAX_CHARS || 900);
 const MAX_PREFLIGHT_CHARS = Number(process.env.BRIDGE_PREFLIGHT_MAX_CHARS || 3000);
@@ -22,6 +22,10 @@ function parseArgs(argv) {
     endpoint: DEFAULT_ENDPOINT,
     backend: 'codex',
     agentId: '',
+    agentName: '',
+    lifecycle: process.env.BRIDGE_AGENT_LIFECYCLE || 'ephemeral',
+    onboardingMode: process.env.BRIDGE_ONBOARDING_MODE || 'none',
+    capabilities: process.env.BRIDGE_AGENT_CAPABILITIES || '',
     namespace: `BRIDGE-${Date.now()}`,
     key: '',
     taskId: 0,
@@ -54,6 +58,10 @@ function parseArgs(argv) {
     if (arg === '--endpoint') out.endpoint = next();
     else if (arg === '--backend') out.backend = next();
     else if (arg === '--agent-id') out.agentId = next();
+    else if (arg === '--agent-name') out.agentName = next();
+    else if (arg === '--lifecycle') out.lifecycle = next();
+    else if (arg === '--onboarding-mode') out.onboardingMode = next();
+    else if (arg === '--capabilities') out.capabilities = next();
     else if (arg === '--namespace') out.namespace = next();
     else if (arg === '--key') out.key = next();
     else if (arg === '--task-id') out.taskId = Number(next());
@@ -81,6 +89,10 @@ function parseArgs(argv) {
 Options:
   --endpoint URL       MCP Streamable HTTP endpoint (default ${DEFAULT_ENDPOINT})
   --agent-id ID        Bridge agent id (default bridge-<backend>-<ts>)
+  --agent-name NAME    Registered hub display name (default agent id)
+  --lifecycle MODE     Agent lifecycle: ephemeral|persistent (default ephemeral)
+  --onboarding-mode M  register_agent onboarding: none|compact|full (default none)
+  --capabilities CSV   Extra registered capabilities
   --namespace NAME     Context namespace
   --key KEY            Context key
   --task-id ID         Claim and release a hub task around backend execution
@@ -107,6 +119,15 @@ Custom backend env:
     }
   }
   return out;
+}
+
+function validateBridgeOptions(opts) {
+  if (!['ephemeral', 'persistent'].includes(opts.lifecycle)) {
+    throw new Error('--lifecycle must be ephemeral|persistent');
+  }
+  if (!['none', 'compact', 'full'].includes(opts.onboardingMode)) {
+    throw new Error('--onboarding-mode must be none|compact|full');
+  }
 }
 
 function sha256(value) {
@@ -332,7 +353,7 @@ function runProcess(command, args, options) {
     const startedAt = Date.now();
     const child = spawn(command, args, {
       cwd: options.cwd || process.cwd(),
-      env: { ...process.env, ...(options.env || {}) },
+      env: options.env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const stdout = [];
@@ -368,6 +389,18 @@ function runProcess(command, args, options) {
   });
 }
 
+function buildBackendEnv(extra = {}) {
+  const blockedEnvPatterns = [/^MCP_HUB_/, /^BRIDGE_/, /^WORKER_.*MCP_/, /^CODEX_.*MCP_/];
+  const blockedKeys = new Set(['ENDPOINT', 'MCP_ENDPOINT', 'HUB_ENDPOINT', 'MCP_CONFIG_FILE']);
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (blockedKeys.has(key)) continue;
+    if (blockedEnvPatterns.some((pattern) => pattern.test(key))) continue;
+    env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
 function parseCustomArgs() {
   const raw = process.env.BRIDGE_CUSTOM_ARGS_JSON;
   if (!raw) return [];
@@ -379,10 +412,10 @@ function parseCustomArgs() {
 }
 
 async function runCodex(opts, prompt) {
-  const args = ['exec', '--skip-git-repo-check', '--sandbox', opts.codexSandbox];
+  const args = ['exec', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', opts.codexSandbox];
   if (opts.codexModel) args.push('--model', opts.codexModel);
   args.push(prompt);
-  const result = await runProcess(opts.codexBin, args, { timeoutMs: opts.timeoutMs });
+  const result = await runProcess(opts.codexBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv() });
   return {
     backend: 'codex',
     ok: result.exitCode === 0 && !result.timedOut,
@@ -395,10 +428,10 @@ async function runCodex(opts, prompt) {
 }
 
 async function runClaude(opts, prompt) {
-  const args = ['-p'];
+  const args = ['-p', '--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config'];
   if (opts.claudeModel) args.push('--model', opts.claudeModel);
   args.push(prompt);
-  const result = await runProcess(opts.claudeBin, args, { timeoutMs: opts.timeoutMs });
+  const result = await runProcess(opts.claudeBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv() });
   return {
     backend: 'claude',
     ok: result.exitCode === 0 && !result.timedOut,
@@ -435,7 +468,7 @@ async function runCustom(opts, prompt) {
   }
   const result = await runProcess(command, customArgs, {
     timeoutMs: opts.timeoutMs,
-    env: { BRIDGE_PROMPT: prompt },
+    env: buildBackendEnv({ BRIDGE_PROMPT: prompt }),
   });
   return {
     backend: 'custom',
@@ -582,8 +615,10 @@ async function measurePhase(timings, name, fn) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  validateBridgeOptions(opts);
   const prompt = await readPrompt(opts);
   opts.agentId ||= `bridge-${opts.backend}-${Date.now()}`;
+  opts.agentName ||= opts.agentId;
   opts.key ||= `bridge-result-${opts.backend}`;
   await fs.mkdir(opts.outDir, { recursive: true });
   const phaseTimings = {};
@@ -593,11 +628,11 @@ async function main() {
   try {
     const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', {
       id: opts.agentId,
-      name: opts.agentId,
+      name: opts.agentName,
       type: `bridge:${opts.backend}`,
-      capabilities: `bridge,external-runtime,${opts.backend}`,
-      lifecycle: 'ephemeral',
-      onboarding_mode: 'none',
+      capabilities: ['bridge', 'external-runtime', opts.backend, ...parseCsv(opts.capabilities)].join(','),
+      lifecycle: opts.lifecycle,
+      onboarding_mode: opts.onboardingMode,
       runtime_profile: runtimeProfile,
       client_capabilities: {
         response_modes: ['tiny', 'compact'],
@@ -624,7 +659,7 @@ async function main() {
       hub_digest: hubDigest,
     };
     const preflightSerialized = serializePreflight(preflight);
-    const backendPrompt = `Hub preflight context (bounded JSON; use if relevant, do not repeat verbatim):\n${preflightSerialized.text}\n\nUser task:\n${prompt}`;
+    const backendPrompt = buildBackendPrompt(prompt, preflight);
 
     let claim = null;
     let claimRenewal = null;

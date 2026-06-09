@@ -105,7 +105,7 @@ describe('agent tools', () => {
     expect(result.runtime_profile.mode).toBe('repo');
     expect(result.runtime_profile.has_git).toBe(true);
     expect(result.runtime_guidance.mode).toBe('repo');
-    expect(result.runtime_guidance.strategy).toBe('direct_repo_execution');
+    expect(result.runtime_guidance.strategy).toBe('repo_workspace_execution');
   });
 
   it('update_runtime_profile should fail when agent does not exist', () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENDPOINT="${ENDPOINT:-http://localhost:3000/mcp}"
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:3000/mcp}"
 WORKERS="${WORKERS:-10}"
 OUT_DIR="${OUT_DIR:-/tmp/exp5}"
 USE_AUTH_TOKEN="${USE_AUTH_TOKEN:-auto}" # auto | true | false
@@ -338,12 +338,12 @@ run_variant() {
 
   sid=$(mcp_init)
   orchestrator="orch-${tag}"
-  worker_prefix="w-${tag}-"
+  worker_prefix="synthetic-${tag}-"
 
   declare -a task_ids
   declare -a worker_tokens
 
-  mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$orchestrator" '{id:$id,name:"Orchestrator",type:"codex",capabilities:"orchestration,kpi",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+  mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$orchestrator" '{id:$id,name:"KPI Synthetic Orchestrator",type:"synthetic:kpi",capabilities:"synthetic-http-benchmark,orchestration,kpi",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
   assert_success "$TOOL_RESULT" "register_orchestrator"
   orchestrator_token=$(printf '%s' "$TOOL_RESULT" | jq -r '.auth.token // empty')
   if [ "$USE_AUTH_TOKEN" = "true" ] && [ -z "$orchestrator_token" ]; then
@@ -355,7 +355,7 @@ run_variant() {
     local wid tc
     wid="${worker_prefix}${i}"
 
-    mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$wid" --arg n "Worker-$i" --arg m "$mode" '{id:$id,name:$n,type:"claude",capabilities:("round,"+$m),onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+    mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$wid" --arg n "Synthetic Worker-$i" --arg m "$mode" '{id:$id,name:$n,type:"synthetic:kpi",capabilities:("synthetic-http-benchmark,round,"+$m),onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
     assert_success "$TOOL_RESULT" "register_worker_$i"
 
     tc=$(printf '%s' "$TOOL_RESULT" | jq '.onboarding.tool_count // 0')
@@ -518,6 +518,7 @@ run_variant() {
       mode:$mode,
       tag:$tag,
       namespace:$namespace,
+      runtime_path:"synthetic_http_benchmark",
       workers:$workers,
       auth_token_mode:$auth_token_mode,
       blob_compression_mode:$blob_compression_mode,
