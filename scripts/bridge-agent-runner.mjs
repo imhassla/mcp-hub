@@ -14,6 +14,9 @@ const BRIDGE_HTTP_RETRIES = Number.isFinite(Number(process.env.BRIDGE_HTTP_RETRI
 const BRIDGE_HTTP_RETRY_DELAY_MS = Number.isFinite(Number(process.env.BRIDGE_HTTP_RETRY_DELAY_MS))
   ? Math.max(25, Math.min(5_000, Math.floor(Number(process.env.BRIDGE_HTTP_RETRY_DELAY_MS))))
   : 250;
+const BRIDGE_HTTP_TIMEOUT_MS = Number.isFinite(Number(process.env.BRIDGE_HTTP_TIMEOUT_MS))
+  ? Math.max(250, Math.min(120_000, Math.floor(Number(process.env.BRIDGE_HTTP_TIMEOUT_MS))))
+  : 15_000;
 
 let rpcRetries = 0;
 
@@ -343,9 +346,12 @@ function extractMcpJson(text) {
 async function postRpc(endpoint, body, sessionId) {
   let lastError;
   for (let attempt = 0; attempt <= BRIDGE_HTTP_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), BRIDGE_HTTP_TIMEOUT_MS);
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'content-type': 'application/json',
           accept: 'application/json, text/event-stream',
@@ -365,8 +371,12 @@ async function postRpc(endpoint, body, sessionId) {
         return { res, json: text.trim() ? extractMcpJson(text) : null, text };
       }
     } catch (error) {
-      lastError = error;
-      if (attempt >= BRIDGE_HTTP_RETRIES) throw error;
+      lastError = controller.signal.aborted
+        ? new Error(`MCP HTTP request timed out after ${BRIDGE_HTTP_TIMEOUT_MS}ms`)
+        : error;
+      if (attempt >= BRIDGE_HTTP_RETRIES) throw lastError;
+    } finally {
+      clearTimeout(timer);
     }
     rpcRetries += 1;
     await sleep(BRIDGE_HTTP_RETRY_DELAY_MS + Math.floor(Math.random() * BRIDGE_HTTP_RETRY_DELAY_MS));
@@ -408,7 +418,13 @@ async function createMcpClient(endpoint) {
       return parseMcpPayload(json);
     },
     async close() {
-      await fetch(endpoint, { method: 'DELETE', headers: { 'mcp-session-id': sessionId } }).catch(() => {});
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), BRIDGE_HTTP_TIMEOUT_MS);
+      await fetch(endpoint, {
+        method: 'DELETE',
+        signal: controller.signal,
+        headers: { 'mcp-session-id': sessionId },
+      }).catch(() => {}).finally(() => clearTimeout(timer));
     },
   };
 }
