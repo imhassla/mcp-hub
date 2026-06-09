@@ -178,6 +178,9 @@ const NAMESPACE_QUOTA_RPS = Number(process.env.MCP_HUB_NAMESPACE_QUOTA_RPS || 0)
 const NAMESPACE_QUOTA_BURST = Number(process.env.MCP_HUB_NAMESPACE_QUOTA_BURST || 0);
 const NAMESPACE_TOKEN_BUDGET_PER_MIN = Number(process.env.MCP_HUB_NAMESPACE_TOKEN_BUDGET_PER_MIN || 0);
 const NAMESPACE_QUOTA_FALLBACK = (process.env.MCP_HUB_NAMESPACE_QUOTA_FALLBACK || 'default').trim() || 'default';
+const RATE_LIMIT_BUCKET_IDLE_TTL_MS = Number.isFinite(Number(process.env.MCP_HUB_RATE_LIMIT_BUCKET_IDLE_TTL_MS))
+  ? Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_RATE_LIMIT_BUCKET_IDLE_TTL_MS))))
+  : 10 * 60 * 1000;
 const REQUIRE_AUTH = String(process.env.MCP_HUB_REQUIRE_AUTH || '').toLowerCase() === 'true';
 const AUTH_MODE = (() => {
   const configured = String(process.env.MCP_HUB_AUTH_MODE || '').toLowerCase().trim();
@@ -292,6 +295,35 @@ function consumeNamespaceTokenBudget(namespace: string, tokenCost: number, now =
   existing.tokensUsed += tokenCost;
   namespaceTokenBudgetWindows.set(key, existing);
   return true;
+}
+
+function cleanupRateLimitState(now = Date.now()): number {
+  let cleaned = 0;
+  const cleanupBuckets = (buckets: Map<string, TokenBucket>, burst: number, rps: number) => {
+    for (const [key, bucket] of buckets.entries()) {
+      if ((now - bucket.lastRefillAt) < RATE_LIMIT_BUCKET_IDLE_TTL_MS) continue;
+      const elapsedMs = Math.max(0, now - bucket.lastRefillAt);
+      const effectiveTokens = Math.min(burst, bucket.tokens + (elapsedMs / 1000) * rps);
+      if (effectiveTokens < burst) continue;
+      buckets.delete(key);
+      cleaned += 1;
+    }
+  };
+
+  if (Number.isFinite(RATE_LIMIT_RPS) && RATE_LIMIT_RPS > 0 && Number.isFinite(RATE_LIMIT_BURST) && RATE_LIMIT_BURST > 0) {
+    cleanupBuckets(rateLimitBuckets, RATE_LIMIT_BURST, RATE_LIMIT_RPS);
+  }
+  if (Number.isFinite(NAMESPACE_QUOTA_RPS) && NAMESPACE_QUOTA_RPS > 0 && Number.isFinite(NAMESPACE_QUOTA_BURST) && NAMESPACE_QUOTA_BURST > 0) {
+    cleanupBuckets(namespaceRateBuckets, NAMESPACE_QUOTA_BURST, NAMESPACE_QUOTA_RPS);
+  }
+
+  for (const [key, window] of namespaceTokenBudgetWindows.entries()) {
+    if ((now - window.windowStartAt) < Math.max(2 * 60_000, RATE_LIMIT_BUCKET_IDLE_TTL_MS)) continue;
+    namespaceTokenBudgetWindows.delete(key);
+    cleaned += 1;
+  }
+
+  return cleaned;
 }
 
 function lookupNamespaceByTaskId(taskId: number): string | null {
@@ -2119,10 +2151,11 @@ app.get('/health', (_req, res) => {
 setInterval(() => {
   try {
     const expiredTickets = cleanupExpiredArtifactTickets();
+    const rateLimitStateCleaned = cleanupRateLimitState();
     const maintenance = runMaintenance();
-    if (expiredTickets > 0 || maintenance.slo.triggered > 0 || maintenance.slo.resolved > 0) {
+    if (expiredTickets > 0 || rateLimitStateCleaned > 0 || maintenance.slo.triggered > 0 || maintenance.slo.resolved > 0) {
       console.log(
-        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} stream_events=${maintenance.stream_events_cleaned} tickets_expired=${expiredTickets} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
+        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} stream_events=${maintenance.stream_events_cleaned} tickets_expired=${expiredTickets} rate_limit_state=${rateLimitStateCleaned} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
       );
     }
   } catch (error) {
