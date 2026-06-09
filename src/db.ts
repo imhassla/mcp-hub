@@ -420,7 +420,9 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_to_agent_created_at ON messages(to_agent, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_from_agent ON messages(from_agent);
     CREATE INDEX IF NOT EXISTS idx_messages_trace_created_at ON messages(trace_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_trace_id ON messages(trace_id, id);
     CREATE INDEX IF NOT EXISTS idx_message_reads_agent_id_read_at ON message_reads(agent_id, read_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_message_reads_message_agent ON message_reads(message_id, agent_id);
     CREATE INDEX IF NOT EXISTS idx_context_updated_at ON context(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_namespace_updated_at ON context(namespace, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_trace_updated_at ON context(trace_id, updated_at DESC);
@@ -428,6 +430,7 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_stream_events_stream_id ON stream_events(stream, id);
     CREATE INDEX IF NOT EXISTS idx_stream_events_target_stream_id ON stream_events(target_agent_id, stream, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_stream_target_id ON stream_events(stream, target_agent_id, id);
     CREATE INDEX IF NOT EXISTS idx_stream_events_created_at ON stream_events(created_at);
     CREATE INDEX IF NOT EXISTS idx_protocol_blobs_updated_at ON protocol_blobs(updated_at);
     CREATE INDEX IF NOT EXISTS idx_consensus_decisions_proposal_created_at ON consensus_decisions(proposal_id, created_at DESC);

@@ -33,12 +33,6 @@ function parseMetadata(value: unknown): Record<string, unknown> {
   }
 }
 
-function ackExists(agentId: string, source: SignalSource, entityId: string): boolean {
-  const row = getDb().prepare('SELECT 1 FROM feed_acks WHERE agent_id = ? AND source = ? AND entity_id = ?')
-    .get(agentId, source, entityId);
-  return Boolean(row);
-}
-
 function readMessageSignals(agentId: string, limit: number, includeSelf: boolean) {
   return getDb().prepare(`
     SELECT
@@ -207,7 +201,6 @@ export function handleReadSignalFeed(args: {
   if (sources.includes('artifacts')) rows.push(...readArtifactSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'artifacts' as const, row })));
   if (sources.includes('slo')) rows.push(...readSloSignals(args.agent_id, perSourceLimit).map((row) => ({ source: 'slo' as const, row })));
   const items = rows
-    .filter(({ source, row }) => !ackExists(args.agent_id, source, String(row.id)))
     .sort((a, b) => Number(b.row.updated_at || b.row.created_at || 0) - Number(a.row.updated_at || a.row.created_at || 0))
     .slice(0, limit)
     .map(({ source, row }) => formatSignal(source, row, mode));
