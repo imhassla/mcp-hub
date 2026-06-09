@@ -1971,12 +1971,15 @@ app.get('/events', (req, res) => {
   const authValid = hasToken ? validateAgentToken(agentId, authToken) : false;
   const authStatus = authValid ? 'valid' : (hasToken ? 'invalid' : 'missing');
   recordAuthEvent(agentId, 'events_stream', authStatus);
-  if (AUTH_MODE === 'enforce' && !authValid) {
+  if (!authValid) {
     res.status(401).json({
       success: false,
       error_code: hasToken ? 'AUTH_TOKEN_INVALID' : 'AUTH_TOKEN_REQUIRED',
-      error: hasToken ? 'Invalid auth_token for this agent' : 'auth_token is required in enforce mode',
+      error: hasToken
+        ? 'Invalid Authorization bearer token for this agent'
+        : 'Authorization: Bearer <auth.token> is required for /events',
       auth_mode: AUTH_MODE,
+      auth_scope: 'events_stream',
     });
     return;
   }
@@ -2006,11 +2009,6 @@ app.get('/events', (req, res) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
 
-  const authWarning = (AUTH_MODE === 'warn' && !authValid)
-    ? (hasToken
-      ? 'Auth token is invalid (warn mode). This will fail once auth_mode=enforce.'
-      : 'Auth token missing (warn mode). This will fail once auth_mode=enforce.')
-    : null;
   writeEvent('hello', {
     success: true,
     mode: responseMode === 'nano' ? 'nano' : 'compact',
@@ -2022,8 +2020,6 @@ app.get('/events', (req, res) => {
     resync_required: cursorStale || undefined,
     resync_hint: cursorStale ? 'read_snapshot' : undefined,
     min_event_id: cursorStale ? minEventId : undefined,
-    warning: authWarning || undefined,
-    warnings: [authWarning].filter(Boolean),
   }, sinceEventId);
 
   const emitAvailableEvents = () => {
