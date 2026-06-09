@@ -717,6 +717,7 @@ export const agentTools = {
         id: { type: 'string', description: 'Unique agent identifier' },
         name: { type: 'string', description: 'Human-readable agent name' },
         type: { type: 'string', description: 'Agent type (e.g. claude, codex, custom)' },
+        register_token: { type: 'string', description: 'Registration secret required when MCP_HUB_REGISTER_TOKEN is configured' },
         capabilities: { type: 'string', description: 'Comma-separated list of capabilities' },
         client_capabilities: {
           type: 'object',

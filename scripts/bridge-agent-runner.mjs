@@ -25,6 +25,7 @@ function parseArgs(argv) {
     agentName: '',
     lifecycle: process.env.BRIDGE_AGENT_LIFECYCLE || 'ephemeral',
     onboardingMode: process.env.BRIDGE_ONBOARDING_MODE || 'none',
+    registerToken: process.env.BRIDGE_REGISTER_TOKEN || process.env.MCP_HUB_REGISTER_TOKEN || '',
     capabilities: process.env.BRIDGE_AGENT_CAPABILITIES || '',
     namespace: `BRIDGE-${Date.now()}`,
     key: '',
@@ -62,6 +63,7 @@ function parseArgs(argv) {
     else if (arg === '--agent-name') out.agentName = next();
     else if (arg === '--lifecycle') out.lifecycle = next();
     else if (arg === '--onboarding-mode') out.onboardingMode = next();
+    else if (arg === '--register-token') out.registerToken = next();
     else if (arg === '--capabilities') out.capabilities = next();
     else if (arg === '--namespace') out.namespace = next();
     else if (arg === '--key') out.key = next();
@@ -94,6 +96,7 @@ Options:
   --agent-name NAME    Registered hub display name (default agent id)
   --lifecycle MODE     Agent lifecycle: ephemeral|persistent (default ephemeral)
   --onboarding-mode M  register_agent onboarding: none|compact|full (default none)
+  --register-token T   Registration secret when MCP_HUB_REGISTER_TOKEN is configured
   --capabilities CSV   Extra registered capabilities
   --namespace NAME     Context namespace
   --key KEY            Context key
@@ -688,10 +691,11 @@ async function main() {
 
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
   try {
-    const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', {
+    const registerArgs = {
       id: opts.agentId,
       name: opts.agentName,
       type: `bridge:${opts.backend}`,
+      register_token: opts.registerToken || undefined,
       capabilities: ['bridge', 'external-runtime', opts.backend, ...parseCsv(opts.capabilities)].join(','),
       lifecycle: opts.lifecycle,
       onboarding_mode: opts.onboardingMode,
@@ -703,9 +707,14 @@ async function main() {
         snapshot_reads: true,
         push_transports: ['wait_for_updates'],
       },
-    }));
+    };
+    const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', registerArgs));
     const authToken = registration?.auth?.token;
-    if (!authToken) throw new Error('register_agent did not return auth token');
+    if (!authToken) {
+      const errorCode = registration?.error_code ? ` error_code=${registration.error_code}` : '';
+      const registerError = registration?.error ? ` error=${truncate(registration.error, 240)}` : '';
+      throw new Error(`register_agent did not return auth token.${errorCode}${registerError}`);
+    }
 
     const hubDigest = await measurePhase(phaseTimings, 'get_hub_digest_ms', () => mcp.call('get_hub_digest', {
       agent_id: opts.agentId,

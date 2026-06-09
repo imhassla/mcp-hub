@@ -14,6 +14,7 @@ DRY_RUN=0
 EXTRA_NOTE=""
 RUNTIME_MODE_OVERRIDE=""
 LIFECYCLE_OVERRIDE=""
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 
 usage() {
   cat <<USAGE
@@ -28,6 +29,7 @@ Options:
   --namespace <tag>
   --onboarding <full|compact|none>
   --lifecycle <persistent|ephemeral>
+  --register-token <token>
   --runtime-mode <repo|isolated|unknown>
   --thread-id <id>       Publish result as a discussion thread reply
   --repo-runtime         Shortcut for --runtime-mode repo
@@ -173,6 +175,10 @@ while [ $# -gt 0 ]; do
       LIFECYCLE_OVERRIDE="${2:-}"
       shift 2
       ;;
+    --register-token)
+      REGISTER_TOKEN="${2:-}"
+      shift 2
+      ;;
     --repo-runtime)
       RUNTIME_MODE_OVERRIDE="repo"
       shift
@@ -316,6 +322,10 @@ BRIDGE_ARGS=(
 
 if [ -n "${THREAD_ID:-}" ]; then
   BRIDGE_ARGS+=(--thread-id "$THREAD_ID" --thread-role "$ROLE")
+fi
+
+if [ -n "${REGISTER_TOKEN:-}" ]; then
+  BRIDGE_ARGS+=(--register-token "$REGISTER_TOKEN")
 fi
 
 node "${BRIDGE_ARGS[@]}"

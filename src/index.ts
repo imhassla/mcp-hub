@@ -86,6 +86,7 @@ import { digestTools, handleGetHubDigest } from './tools/digest.js';
 import { memoryTools, handleWriteMemory, handleSearchMemory, handleGetMemoryDigest } from './tools/memory.js';
 import { traceTools, handleGetTraceTimeline } from './tools/traces.js';
 import { threadTools, handleStartThread, handleReplyThread, handleReadThread } from './tools/threads.js';
+import { validateRegisterToken } from './auth.js';
 
 function createServer() {
   return new McpServer({
@@ -183,6 +184,7 @@ const AUTH_MODE = (() => {
   if (configured === 'observe' || configured === 'warn' || configured === 'enforce') return configured;
   return REQUIRE_AUTH ? 'enforce' : 'observe';
 })();
+const REGISTER_TOKEN = String(process.env.MCP_HUB_REGISTER_TOKEN || '').trim();
 const MAINTENANCE_INTERVAL_MS = Number(process.env.MCP_HUB_MAINTENANCE_INTERVAL_MS || 30_000);
 const SESSION_IDLE_TIMEOUT_MS = (() => {
   const raw = Number(process.env.MCP_HUB_SESSION_IDLE_TIMEOUT_MS);
@@ -547,7 +549,26 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
   }
 
   if (shouldBypassAuth(toolName)) {
-    recordAuthEvent(agentId, toolName, 'skipped');
+    const registerAgentId = typeof args.id === 'string' && args.id.trim().length > 0 ? args.id.trim() : agentId;
+    if (REGISTER_TOKEN) {
+      const registerAuth = validateRegisterToken(REGISTER_TOKEN, args);
+      if (!registerAuth.ok) {
+        const status = registerAuth.status === 'invalid' ? 'invalid' : 'missing';
+        recordAuthEvent(registerAgentId, toolName, status);
+        return {
+          allowed: false,
+          response: {
+            success: false,
+            error_code: registerAuth.error_code,
+            error: registerAuth.error,
+            register_auth: 'required',
+          },
+        };
+      }
+      recordAuthEvent(registerAgentId, toolName, 'valid');
+    } else {
+      recordAuthEvent(registerAgentId, toolName, 'skipped');
+    }
     return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
   }
 
@@ -638,6 +659,7 @@ function registerTools(server: McpServer) {
       id: z.string().describe('Unique agent identifier'),
       name: z.string().describe('Human-readable agent name'),
       type: z.string().describe('Agent type (e.g. claude, codex, custom)'),
+      register_token: z.string().optional().describe('Registration secret required when MCP_HUB_REGISTER_TOKEN is configured'),
       capabilities: z.string().optional().describe('Comma-separated list of capabilities'),
       client_capabilities: z.object({
         response_modes: z.array(z.enum(['full', 'compact', 'tiny', 'nano'])).optional(),
