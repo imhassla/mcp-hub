@@ -39,6 +39,7 @@ function parseArgs(argv) {
     rememberTags: '',
     threadId: '',
     threadRole: 'bridge-result',
+    runtimeMode: process.env.BRIDGE_RUNTIME_MODE || 'auto',
     timeoutMs: Number(process.env.BRIDGE_TIMEOUT_MS || 180000),
     publishMessage: true,
     expectJson: false,
@@ -70,6 +71,7 @@ function parseArgs(argv) {
     else if (arg === '--remember-tags') out.rememberTags = next();
     else if (arg === '--thread-id') out.threadId = next();
     else if (arg === '--thread-role') out.threadRole = next();
+    else if (arg === '--runtime-mode') out.runtimeMode = next();
     else if (arg === '--timeout-ms') out.timeoutMs = Number(next());
     else if (arg === '--expect-json') out.expectJson = true;
     else if (arg === '--no-message') out.publishMessage = false;
@@ -93,6 +95,7 @@ Options:
   --remember-tags CSV  Tags for --remember-key memory
   --thread-id ID       Publish compact result as a discussion thread reply
   --thread-role ROLE   Thread reply role (default bridge-result)
+  --runtime-mode MODE  Runtime profile override: auto|repo|isolated|unknown
   --timeout-ms MS      Backend timeout
 
 Custom backend env:
@@ -156,6 +159,79 @@ async function readPrompt(opts) {
     return Buffer.concat(chunks).toString('utf8');
   }
   throw new Error('Provide --prompt, --prompt-file, or stdin');
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findGitDir(startDir) {
+  let current = path.resolve(startDir);
+  while (true) {
+    if (await pathExists(path.join(current, '.git'))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+async function countFiles(dir, limit = 10_000) {
+  let count = 0;
+  async function walk(current) {
+    if (count >= limit) return;
+    let entries;
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (count >= limit) return;
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        count += 1;
+      }
+    }
+  }
+  await walk(dir);
+  return count;
+}
+
+async function detectRuntimeProfile(opts) {
+  const cwd = process.cwd();
+  const gitRoot = await findGitDir(cwd);
+  const fileCount = await countFiles(cwd);
+  const emptyDir = fileCount === 0;
+  let mode;
+  if (opts.runtimeMode && opts.runtimeMode !== 'auto') {
+    if (!['repo', 'isolated', 'unknown'].includes(opts.runtimeMode)) {
+      throw new Error('--runtime-mode must be auto|repo|isolated|unknown');
+    }
+    mode = opts.runtimeMode;
+  } else if (gitRoot) {
+    mode = 'repo';
+  } else if (emptyDir) {
+    mode = 'isolated';
+  } else {
+    mode = 'unknown';
+  }
+  return {
+    mode,
+    cwd,
+    has_git: Boolean(gitRoot),
+    file_count: fileCount,
+    empty_dir: emptyDir,
+    source: 'client_auto',
+    notes: `bridge backend=${opts.backend}${gitRoot ? ` git_root=${gitRoot}` : ''}`,
+  };
 }
 
 function sleep(ms) {
@@ -511,6 +587,7 @@ async function main() {
   opts.key ||= `bridge-result-${opts.backend}`;
   await fs.mkdir(opts.outDir, { recursive: true });
   const phaseTimings = {};
+  const runtimeProfile = await measurePhase(phaseTimings, 'detect_runtime_profile_ms', () => detectRuntimeProfile(opts));
 
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
   try {
@@ -521,15 +598,7 @@ async function main() {
       capabilities: `bridge,external-runtime,${opts.backend}`,
       lifecycle: 'ephemeral',
       onboarding_mode: 'none',
-      runtime_profile: {
-        mode: 'isolated',
-        cwd: process.cwd(),
-        has_git: false,
-        file_count: 0,
-        empty_dir: false,
-        source: 'client_declared',
-        notes: `bridge backend=${opts.backend}`,
-      },
+      runtime_profile: runtimeProfile,
       client_capabilities: {
         response_modes: ['tiny', 'compact'],
         blob_resolve: true,
@@ -565,6 +634,7 @@ async function main() {
         agent_id: opts.agentId,
         auth_token: authToken,
         lease_seconds: opts.leaseSeconds,
+        namespace: opts.namespace || undefined,
         idempotency_key: `${opts.agentId}:claim:${opts.taskId}`,
       }));
       if (claim.success !== true) {

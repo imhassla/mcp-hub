@@ -530,7 +530,7 @@ export function listStreamEventsAfter(options: {
   const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(1000, Math.floor(Number(options.limit)))) : 100;
   const streams = options.streams && options.streams.length > 0
     ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
-    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
   const placeholders = streams.map(() => '?').join(', ');
   let query = `
     SELECT *
@@ -554,7 +554,7 @@ export function getStreamEventWatermark(options: {
 } = {}): number {
   const streams = options.streams && options.streams.length > 0
     ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
-    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
   const placeholders = streams.map(() => '?').join(', ');
   let query = `SELECT COALESCE(MAX(id), 0) AS id FROM stream_events WHERE stream IN (${placeholders})`;
   const params: unknown[] = [...streams];
@@ -572,7 +572,7 @@ export function getMinStreamEventId(options: {
 } = {}): number {
   const streams = options.streams && options.streams.length > 0
     ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
-    : ['messages', 'tasks', 'context', 'activity'] as StreamEventName[];
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
   const placeholders = streams.map(() => '?').join(', ');
   let query = `SELECT COALESCE(MIN(id), 0) AS id FROM stream_events WHERE stream IN (${placeholders})`;
   const params: unknown[] = [...streams];

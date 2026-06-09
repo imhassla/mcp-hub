@@ -39,10 +39,12 @@ const WAIT_RESPONSE_MODES = ['nano', 'micro', 'tiny', 'compact', 'full'] as cons
 type WaitResponseMode = (typeof WAIT_RESPONSE_MODES)[number];
 const WAIT_TIMEOUT_RESPONSE_MODES = ['default', 'minimal'] as const;
 type WaitTimeoutResponseMode = (typeof WAIT_TIMEOUT_RESPONSE_MODES)[number];
-const WAIT_STREAMS = ['messages', 'tasks', 'context', 'activity'] as const;
+const WAIT_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const;
 type WaitStream = (typeof WAIT_STREAMS)[number];
 const EVENT_DELTA_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const;
 type EventDeltaStream = (typeof EVENT_DELTA_STREAMS)[number];
+const SNAPSHOT_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const satisfies readonly StreamEventName[];
+const LEGACY_WATERMARK_STREAMS = ['messages', 'tasks', 'context', 'activity'] as const;
 const DEFAULT_WAIT_RESPONSE_MODE: WaitResponseMode = (() => {
   const configured = String(process.env.MCP_HUB_WAIT_DEFAULT_RESPONSE_MODE || '').toLowerCase().trim();
   if (configured === 'nano') return 'nano';
@@ -136,6 +138,23 @@ function normalizeEventDeltaStreams(input?: unknown): { ok: true; streams: Event
     return { ok: false, invalid };
   }
   return { ok: true, streams: normalized as EventDeltaStream[] };
+}
+
+function changedStreamMap(streams: string[]) {
+  return {
+    messages: streams.includes('messages'),
+    tasks: streams.includes('tasks'),
+    context: streams.includes('context'),
+    activity: streams.includes('activity'),
+    artifacts: streams.includes('artifacts'),
+    consensus: streams.includes('consensus'),
+  };
+}
+
+function legacyWatermarkStreams(streams: readonly string[]) {
+  return streams.filter((stream): stream is 'messages' | 'tasks' | 'context' | 'activity' => (
+    (LEGACY_WATERMARK_STREAMS as readonly string[]).includes(stream)
+  ));
 }
 
 function encodeEventCursor(eventId: number): string {
@@ -382,7 +401,7 @@ export function handleReadSnapshot(args: {
     ? listStreamEventsAfter({
       agent_id: watcherAgentId,
       after_id: parsedEventCursor,
-      streams: ['messages', 'tasks', 'context', 'activity'],
+      streams: [...SNAPSHOT_STREAMS],
       limit: 1000,
     })
     : [];
@@ -468,18 +487,13 @@ export function handleReadSnapshot(args: {
 
   const eventWatermark = getStreamEventWatermark({
     agent_id: watcherAgentId,
-    streams: ['messages', 'tasks', 'context', 'activity'],
+    streams: [...SNAPSHOT_STREAMS],
   });
   const lastReturnedEventId = eventChanges.length > 0
     ? eventChanges[eventChanges.length - 1].id
     : eventWatermark;
   const eventsHasMore = lastReturnedEventId < eventWatermark;
-  const changed = {
-    messages: eventStreams.has('messages'),
-    tasks: eventStreams.has('tasks'),
-    context: eventStreams.has('context'),
-    activity: eventStreams.has('activity'),
-  };
+  const changed = changedStreamMap([...eventStreams]);
   const messagesCount = Array.isArray((messages as { m?: unknown[] }).m)
     ? (messages as { m: unknown[] }).m.length
     : Array.isArray((messages as { messages?: unknown[] }).messages)
@@ -520,6 +534,8 @@ export function handleReadSnapshot(args: {
         t: changed.tasks ? 1 : 0,
         c: changed.context ? 1 : 0,
         a: changed.activity ? 1 : 0,
+        r: changed.artifacts ? 1 : 0,
+        q: changed.consensus ? 1 : 0,
       },
       n: {
         m: (messages as { n?: string | null }).n ?? null,
@@ -650,12 +666,7 @@ export async function handleWaitForUpdates(args: {
       const nextEventId = events[events.length - 1].id;
       const cursor = encodeEventCursor(nextEventId);
       const changedStreams = [...new Set(events.map((event) => event.stream))];
-      const changed = {
-        messages: changedStreams.includes('messages'),
-        tasks: changedStreams.includes('tasks'),
-        context: changedStreams.includes('context'),
-        activity: changedStreams.includes('activity'),
-      };
+      const changed = changedStreamMap(changedStreams);
       if (WAIT_LOG_HITS) {
         logActivity(watcherAgentId, 'wait_for_updates_hit', `event_cursor=${afterId} changed=${JSON.stringify(changed)}`, { emit_stream_event: false });
       }
@@ -698,7 +709,7 @@ export async function handleWaitForUpdates(args: {
         cursor,
         event_id: nextEventId,
         changed_streams: changed,
-        watermark: getUpdateWatermark(watcherAgentId, { streams: watchedStreams }),
+        watermark: getUpdateWatermark(watcherAgentId, { streams: legacyWatermarkStreams(watchedStreams) }),
         events,
       };
     }
@@ -766,8 +777,8 @@ export async function handleWaitForUpdates(args: {
     elapsed_ms: Date.now() - startedAt,
     cursor,
     event_id: watermarkEventId,
-    changed_streams: { messages: false, tasks: false, context: false, activity: false },
-    watermark: getUpdateWatermark(watcherAgentId, { streams: watchedStreams }),
+    changed_streams: changedStreamMap([]),
+    watermark: getUpdateWatermark(watcherAgentId, { streams: legacyWatermarkStreams(watchedStreams) }),
   };
 }
 
