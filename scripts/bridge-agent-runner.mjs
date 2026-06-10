@@ -17,6 +17,9 @@ const BRIDGE_HTTP_RETRY_DELAY_MS = Number.isFinite(Number(process.env.BRIDGE_HTT
 const BRIDGE_HTTP_TIMEOUT_MS = Number.isFinite(Number(process.env.BRIDGE_HTTP_TIMEOUT_MS))
   ? Math.max(250, Math.min(120_000, Math.floor(Number(process.env.BRIDGE_HTTP_TIMEOUT_MS))))
   : 15_000;
+const BRIDGE_STATUS_HEARTBEAT_MS = Number.isFinite(Number(process.env.BRIDGE_STATUS_HEARTBEAT_MS))
+  ? Math.max(5_000, Math.min(10 * 60_000, Math.floor(Number(process.env.BRIDGE_STATUS_HEARTBEAT_MS))))
+  : 60_000;
 
 let rpcRetries = 0;
 
@@ -613,15 +616,29 @@ function startClaimRenewal(mcp, opts, authToken, claim) {
 function compactResult(opts, prompt, backendResult) {
   const output = backendResult.output || '';
   const errors = [backendResult.error, backendResult.stderr].filter(Boolean).join('\n');
+  const status = backendResult.status || (backendResult.ok ? 'pass' : (backendResult.timed_out ? 'timeout' : 'degraded'));
   return {
     schema: 'bridge-result-v1',
-    status: backendResult.ok ? 'pass' : 'degraded',
+    status,
+    run_id: backendResult.run_id,
     backend: opts.backend,
     agent_id: opts.agentId,
     namespace: opts.namespace,
+    started_at: backendResult.started_at,
+    finished_at: backendResult.finished_at,
+    error_digest: backendResult.error_digest,
     prompt_digest: sha256(prompt).slice(0, 16),
     output_digest: sha256(output).slice(0, 16),
     output_preview: truncate(output || errors, 1200),
+    kpi: {
+      status,
+      duration_ms: backendResult.duration_ms_total ?? backendResult.duration_ms,
+      rpc_retries: backendResult.rpc_retries ?? 0,
+      phase_count: backendResult.phase_timings_ms ? Object.keys(backendResult.phase_timings_ms).length : 0,
+      heartbeat_count: backendResult.heartbeat_count ?? 0,
+      publish_attempts: backendResult.publish_attempts ?? 0,
+      publish_failures: backendResult.publish_failures ?? 0,
+    },
     backend_result: {
       ok: backendResult.ok,
       duration_ms: backendResult.duration_ms,
@@ -645,6 +662,74 @@ function compactResult(opts, prompt, backendResult) {
       blocked_release: backendResult.blocked_release,
       claim_renewals: backendResult.claim_renewals,
       claim_renewal_error: backendResult.claim_renewal_error,
+    },
+  };
+}
+
+function errorDigest(error) {
+  const text = String(error?.stack || error?.message || error || '');
+  return sha256(text).slice(0, 16);
+}
+
+function buildRunStatus(opts, prompt, state) {
+  const now = Date.now();
+  return {
+    schema: 'bridge-run-status-v1',
+    run_id: state.runId,
+    status: state.status,
+    phase: state.phase,
+    backend: opts.backend,
+    agent_id: opts.agentId,
+    namespace: opts.namespace,
+    prompt_digest: sha256(prompt).slice(0, 16),
+    started_at: state.startedAt,
+    updated_at: now,
+    duration_ms: now - state.startedAt,
+    phase_timings_ms: state.phaseTimings,
+    rpc_retries: rpcRetries,
+    heartbeat_count: state.heartbeatCount,
+    error_digest: state.errorDigest,
+    error_class: state.errorClass,
+    error_preview: state.errorPreview,
+  };
+}
+
+async function publishRunStatus(mcp, opts, authToken, prompt, state) {
+  if (!mcp || !authToken) return false;
+  state.publishAttempts += 1;
+  const payload = JSON.stringify(buildRunStatus(opts, prompt, state));
+  try {
+    const result = await mcp.call('share_context', {
+      agent_id: opts.agentId,
+      auth_token: authToken,
+      key: `${opts.key}:run`,
+      namespace: opts.namespace,
+      value: payload.length <= MAX_CONTEXT_CHARS ? payload : JSON.stringify({
+        ...buildRunStatus(opts, prompt, state),
+        error_preview: truncate(state.errorPreview || '', 300),
+      }),
+    });
+    if (result?.success !== true) {
+      state.publishFailures += 1;
+      return false;
+    }
+    return true;
+  } catch {
+    state.publishFailures += 1;
+    return false;
+  }
+}
+
+function startRunHeartbeat(mcp, opts, authToken, prompt, state) {
+  if (!authToken || BRIDGE_STATUS_HEARTBEAT_MS <= 0) return null;
+  const timer = setInterval(() => {
+    state.heartbeatCount += 1;
+    publishRunStatus(mcp, opts, authToken, prompt, state).catch(() => undefined);
+  }, BRIDGE_STATUS_HEARTBEAT_MS);
+  timer.unref?.();
+  return {
+    stop() {
+      clearInterval(timer);
     },
   };
 }
@@ -703,10 +788,29 @@ async function main() {
   opts.key ||= `bridge-result-${opts.backend}`;
   await fs.mkdir(opts.outDir, { recursive: true });
   const phaseTimings = {};
+  const startedAt = Date.now();
+  const runId = `${opts.agentId}:${startedAt}`;
+  const runState = {
+    runId,
+    status: 'starting',
+    phase: 'starting',
+    startedAt,
+    phaseTimings,
+    heartbeatCount: 0,
+    publishAttempts: 0,
+    publishFailures: 0,
+    errorDigest: null,
+    errorClass: null,
+    errorPreview: null,
+  };
+  const reportPath = path.join(opts.outDir, `${opts.agentId}.json`);
   const runtimeProfile = await measurePhase(phaseTimings, 'detect_runtime_profile_ms', () => detectRuntimeProfile(opts));
 
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
+  let authToken = '';
+  let heartbeat = null;
   try {
+    runState.phase = 'registering';
     const registerArgs = {
       id: opts.agentId,
       name: opts.agentName,
@@ -725,13 +829,17 @@ async function main() {
       },
     };
     const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', registerArgs));
-    const authToken = registration?.auth?.token;
+    authToken = registration?.auth?.token || '';
     if (!authToken) {
       const errorCode = registration?.error_code ? ` error_code=${registration.error_code}` : '';
       const registerError = registration?.error ? ` error=${truncate(registration.error, 240)}` : '';
       throw new Error(`register_agent did not return auth token.${errorCode}${registerError}`);
     }
+    runState.phase = 'registered';
+    runState.status = 'running';
+    await publishRunStatus(mcp, opts, authToken, prompt, runState);
 
+    runState.phase = 'preflight';
     const hubDigest = await measurePhase(phaseTimings, 'get_hub_digest_ms', () => mcp.call('get_hub_digest', {
       agent_id: opts.agentId,
       auth_token: authToken,
@@ -765,6 +873,8 @@ async function main() {
     let claim = null;
     let claimRenewal = null;
     if (Number.isInteger(opts.taskId) && opts.taskId > 0) {
+      runState.phase = 'claiming';
+      await publishRunStatus(mcp, opts, authToken, prompt, runState);
       claim = await measurePhase(phaseTimings, 'claim_task_ms', () => mcp.call('claim_task', {
         task_id: opts.taskId,
         agent_id: opts.agentId,
@@ -782,12 +892,24 @@ async function main() {
     let backendResult;
     let renewalSummary = null;
     try {
+      runState.phase = 'backend_running';
+      await publishRunStatus(mcp, opts, authToken, prompt, runState);
+      heartbeat = startRunHeartbeat(mcp, opts, authToken, prompt, runState);
       backendResult = await measurePhase(phaseTimings, 'backend_ms', () => runBackend(opts, backendPrompt));
     } finally {
+      heartbeat?.stop();
+      heartbeat = null;
       if (claimRenewal) renewalSummary = await measurePhase(phaseTimings, 'claim_renewal_stop_ms', () => claimRenewal.stop());
     }
+    backendResult.run_id = runId;
+    backendResult.started_at = startedAt;
+    backendResult.finished_at = Date.now();
+    backendResult.duration_ms_total = backendResult.finished_at - startedAt;
     backendResult.phase_timings_ms = phaseTimings;
     backendResult.rpc_retries = rpcRetries;
+    backendResult.heartbeat_count = runState.heartbeatCount;
+    backendResult.publish_attempts = runState.publishAttempts;
+    backendResult.publish_failures = runState.publishFailures;
     backendResult.preflight_truncated = preflightSerialized.truncated;
     backendResult.preflight_original_chars = preflightSerialized.original_chars;
     if (renewalSummary) {
@@ -806,6 +928,9 @@ async function main() {
         backendResult.ok = false;
         backendResult.error = backendResult.error || 'expected_json_not_returned';
       }
+    }
+    if (backendResult.error || backendResult.stderr) {
+      backendResult.error_digest = errorDigest(backendResult.error || backendResult.stderr);
     }
     if (opts.rememberKey && backendResult.ok && backendResult.output) {
       const memory = await measurePhase(phaseTimings, 'write_memory_ms', () => mcp.call('write_memory', {
@@ -833,9 +958,10 @@ async function main() {
       raw_error: backendResult.error,
       parsed_json: backendResult.parsed_json,
     };
-    const reportPath = path.join(opts.outDir, `${opts.agentId}.json`);
     await measurePhase(phaseTimings, 'write_report_initial_ms', () => fs.writeFile(reportPath, `${JSON.stringify(fullReport, null, 2)}\n`));
 
+    runState.phase = 'publishing';
+    await publishRunStatus(mcp, opts, authToken, prompt, runState);
     let payload = JSON.stringify(compactResult(opts, prompt, backendResult));
     if (payload.length > MAX_CONTEXT_CHARS) {
       payload = JSON.stringify({
@@ -910,6 +1036,8 @@ async function main() {
     }
     let release = null;
     if (claim && Number.isInteger(opts.taskId) && opts.taskId > 0) {
+      runState.phase = 'releasing';
+      await publishRunStatus(mcp, opts, authToken, prompt, runState);
       const contextId = context.context?.id;
       const messageId = message?.message?.id;
       const threadMessageId = threadReply?.message?.id;
@@ -957,6 +1085,11 @@ async function main() {
       }
     }
     backendResult.rpc_retries = rpcRetries;
+    backendResult.finished_at = Date.now();
+    backendResult.duration_ms_total = backendResult.finished_at - startedAt;
+    backendResult.heartbeat_count = runState.heartbeatCount;
+    backendResult.publish_attempts = runState.publishAttempts;
+    backendResult.publish_failures = runState.publishFailures;
     fullReport = {
       ...compactResult(opts, prompt, backendResult),
       output: backendResult.output,
@@ -965,6 +1098,9 @@ async function main() {
       parsed_json: backendResult.parsed_json,
     };
     await measurePhase(phaseTimings, 'write_report_final_ms', () => fs.writeFile(reportPath, `${JSON.stringify(fullReport, null, 2)}\n`));
+    runState.phase = 'final';
+    runState.status = backendResult.ok ? 'pass' : (backendResult.timed_out ? 'timeout' : 'degraded');
+    await publishRunStatus(mcp, opts, authToken, prompt, runState);
     console.log(JSON.stringify({
       ok: backendResult.ok,
       backend: opts.backend,
@@ -983,7 +1119,35 @@ async function main() {
       error: backendResult.error || null,
     }));
     process.exitCode = backendResult.ok ? 0 : 2;
+  } catch (error) {
+    heartbeat?.stop();
+    runState.phase = runState.phase || 'failed';
+    runState.status = 'failed';
+    runState.errorDigest = errorDigest(error);
+    runState.errorClass = error?.name || 'Error';
+    runState.errorPreview = truncate(error?.message || String(error), 500);
+    await publishRunStatus(mcp, opts, authToken, prompt, runState);
+    const failureReport = {
+      schema: 'bridge-result-v1',
+      status: 'failed',
+      run_id: runId,
+      backend: opts.backend,
+      agent_id: opts.agentId,
+      namespace: opts.namespace,
+      started_at: startedAt,
+      finished_at: Date.now(),
+      error_digest: runState.errorDigest,
+      error: runState.errorPreview,
+      phase: runState.phase,
+      phase_timings_ms: phaseTimings,
+      rpc_retries: rpcRetries,
+      publish_attempts: runState.publishAttempts,
+      publish_failures: runState.publishFailures,
+    };
+    await fs.writeFile(reportPath, `${JSON.stringify(failureReport, null, 2)}\n`).catch(() => undefined);
+    throw error;
   } finally {
+    heartbeat?.stop();
     await measurePhase(phaseTimings, 'mcp_close_ms', () => mcp.close());
   }
 }
