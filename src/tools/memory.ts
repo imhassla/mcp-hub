@@ -48,6 +48,16 @@ function normalizeKey(key?: string): string {
   return cleaned || `note-${Date.now().toString(36)}`;
 }
 
+function normalizeOptionalKeyPrefix(keyPrefix?: string): string | null {
+  const cleaned = String(keyPrefix || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._:@/-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, MAX_MEMORY_KEY_CHARS);
+  return cleaned || null;
+}
+
 function contextKey(memoryKey: string): string {
   return `${MEMORY_KEY_PREFIX}${memoryKey}`;
 }
@@ -233,12 +243,18 @@ export function handleSearchMemory(args: {
 export function handleGetMemoryDigest(args: {
   agent_id: string;
   namespace?: string;
+  tags?: string[];
+  key_prefix?: string;
+  updated_by?: string;
   limit?: number;
   response_mode?: MemoryMode;
 }) {
   heartbeat(args.agent_id);
   const mode = normalizeMode(args.response_mode);
   const namespace = args.namespace?.trim();
+  const tags = normalizeTags(args.tags);
+  const keyPrefix = normalizeOptionalKeyPrefix(args.key_prefix);
+  const updatedBy = String(args.updated_by || '').trim();
   const limit = Math.max(1, Math.min(MAX_MEMORY_LIMIT, Math.floor(Number(args.limit ?? 10))));
   const params: unknown[] = [];
   let query = `
@@ -250,8 +266,20 @@ export function handleGetMemoryDigest(args: {
     query += ' AND namespace = ?';
     params.push(namespace);
   }
+  if (keyPrefix) {
+    query += ` AND LOWER(key) LIKE ? ESCAPE '\\'`;
+    params.push(`${MEMORY_KEY_PREFIX}${escapeLike(keyPrefix)}%`);
+  }
+  if (updatedBy) {
+    query += ' AND LOWER(agent_id) = ?';
+    params.push(updatedBy.toLowerCase());
+  }
+  for (const tag of tags) {
+    query += ` AND LOWER(value) LIKE ? ESCAPE '\\'`;
+    params.push(`%"${escapeLike(tag)}"%`);
+  }
   query += ' ORDER BY updated_at DESC, id DESC LIMIT ?';
-  params.push(limit * 3);
+  params.push(limit * 5);
   const rows = (getDb().prepare(query).all(...params) as MemoryRow[])
     .sort((a, b) => {
       const pa = parsePayload(a);
@@ -259,12 +287,17 @@ export function handleGetMemoryDigest(args: {
       return (pb.importance - pa.importance) || (b.updated_at - a.updated_at) || (b.id - a.id);
     })
     .slice(0, limit);
-  logActivity(args.agent_id, 'get_memory_digest', `ns=${namespace || '*'} count=${rows.length} mode=${mode}`, { emit_stream_event: false });
+  logActivity(args.agent_id, 'get_memory_digest', `ns=${namespace || '*'} tags=${tags.join(',')} key_prefix=${keyPrefix || '*'} updated_by=${updatedBy || '*'} count=${rows.length} mode=${mode}`, { emit_stream_event: false });
   if (mode === 'nano') return { m: formatMemory(rows, mode), c: rows.length };
   return {
     success: true,
     count: rows.length,
     namespace: namespace || null,
+    filters: {
+      tags,
+      key_prefix: keyPrefix,
+      updated_by: updatedBy || null,
+    },
     memories: formatMemory(rows, mode),
   };
 }
@@ -312,6 +345,9 @@ export const memoryTools = {
       properties: {
         agent_id: { type: 'string', description: 'Your agent ID' },
         namespace: { type: 'string', description: 'Optional namespace filter' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Optional tag filters' },
+        key_prefix: { type: 'string', description: 'Optional memory key prefix filter' },
+        updated_by: { type: 'string', description: 'Optional source agent filter' },
         limit: { type: 'number', description: `Max memories (default 10, max ${MAX_MEMORY_LIMIT})` },
         response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'Response verbosity' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },

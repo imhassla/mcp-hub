@@ -1179,6 +1179,9 @@ function registerTools(server: McpServer) {
     {
       agent_id: z.string().describe('Your agent ID'),
       namespace: z.string().optional().describe('Optional namespace filter'),
+      tags: z.array(z.string()).optional().describe('Optional tag filters'),
+      key_prefix: z.string().optional().describe('Optional memory key prefix filter'),
+      updated_by: z.string().optional().describe('Optional source agent filter'),
       limit: z.number().optional().describe('Max memories'),
       response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('Response verbosity'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
