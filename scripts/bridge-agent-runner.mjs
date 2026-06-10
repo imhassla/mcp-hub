@@ -177,6 +177,24 @@ function compactThreadPreflight(thread, previewChars = 180) {
   };
 }
 
+function compactTaskRoutingPreflight(taskRouting, agentId) {
+  if (!taskRouting || taskRouting.success === false) return taskRouting || null;
+  const suggestions = Array.isArray(taskRouting.suggestions) ? taskRouting.suggestions : [];
+  const selfIndex = suggestions.findIndex((suggestion) => {
+    if (Array.isArray(suggestion)) return suggestion[0] === agentId;
+    return suggestion?.id === agentId || suggestion?.agent?.id === agentId;
+  });
+  const top = suggestions[0] || null;
+  return {
+    task: taskRouting.task || null,
+    inferred: taskRouting.inferred || null,
+    total: taskRouting.total ?? suggestions.length,
+    self_rank: selfIndex >= 0 ? selfIndex + 1 : null,
+    top_agent: Array.isArray(top) ? top[0] : (top?.id || top?.agent?.id || null),
+    top_score: Array.isArray(top) ? top[1] : (top?.score ?? null),
+  };
+}
+
 function selectNegotiatedReadMode(registration) {
   const negotiated = registration?.capability_negotiation?.negotiated
     || registration?.registration?.contract_profile
@@ -250,6 +268,7 @@ function serializePreflight(preflight) {
     memory_count: digest.memory?.count ?? digest.memory?.c ?? null,
     event_cursor: digest.events?.cursor ?? digest.events?.c ?? null,
     thread: compactThreadPreflight(preflight?.thread, 180),
+    task_routing: compactTaskRoutingPreflight(preflight?.task_routing, preflight?.agent_id),
   };
   let text = JSON.stringify(stub);
   if (text.length > MAX_PREFLIGHT_CHARS && stub.thread?.messages) {
@@ -723,6 +742,9 @@ function compactResult(opts, prompt, backendResult) {
       memory_error: backendResult.memory_error,
       thread_message_id: backendResult.thread_message_id,
       thread_error: backendResult.thread_error,
+      task_routing_self_rank: backendResult.task_routing_self_rank,
+      task_routing_top_agent: backendResult.task_routing_top_agent,
+      task_routing_error: backendResult.task_routing_error,
       release_error: backendResult.release_error,
       blocked_release: backendResult.blocked_release,
       claim_renewals: backendResult.claim_renewals,
@@ -929,11 +951,26 @@ async function main() {
         error: String(error?.message || error),
       }));
     }
+    let taskRouting = null;
+    if (Number.isInteger(opts.taskId) && opts.taskId > 0) {
+      taskRouting = await measurePhase(phaseTimings, 'suggest_task_agents_preflight_ms', () => mcp.call('suggest_task_agents', {
+        requesting_agent: opts.agentId,
+        auth_token: authToken,
+        task_id: opts.taskId,
+        include_requesting_agent: true,
+        response_mode: 'tiny',
+        limit: 10,
+      })).catch((error) => ({
+        success: false,
+        error: String(error?.message || error),
+      }));
+    }
     const preflight = {
       agent_id: opts.agentId,
       namespace: opts.namespace,
       hub_digest: hubDigest,
       thread: threadTail,
+      task_routing: taskRouting,
     };
     const preflightSerialized = serializePreflight(preflight);
     const backendPrompt = buildBackendPrompt(prompt, preflight);
@@ -983,6 +1020,10 @@ async function main() {
     backendResult.preflight_thread_mode = opts.threadId && opts.threadTail > 0 ? 'compact' : null;
     backendResult.preflight_truncated = preflightSerialized.truncated;
     backendResult.preflight_original_chars = preflightSerialized.original_chars;
+    const compactTaskRouting = compactTaskRoutingPreflight(taskRouting, opts.agentId);
+    backendResult.task_routing_self_rank = compactTaskRouting?.self_rank ?? null;
+    backendResult.task_routing_top_agent = compactTaskRouting?.top_agent ?? null;
+    backendResult.task_routing_error = taskRouting?.success === false ? (taskRouting.error || taskRouting.error_code || 'suggest_task_agents_failed') : undefined;
     if (renewalSummary) {
       backendResult.claim_renewals = renewalSummary.renewals;
       backendResult.claim_renewal_error = renewalSummary.last_error || undefined;
