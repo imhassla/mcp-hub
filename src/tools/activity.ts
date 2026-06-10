@@ -397,6 +397,56 @@ export function handleReadSnapshot(args: {
   const messageLimit = normalizeSnapshotLimit(args.message_limit);
   const taskLimit = normalizeSnapshotLimit(args.task_limit);
   const contextLimit = normalizeSnapshotLimit(args.context_limit);
+  const initialEventWatermark = getStreamEventWatermark({
+    agent_id: watcherAgentId,
+    streams: [...SNAPSHOT_STREAMS],
+  });
+  if (parsedEventCursor !== null) {
+    const cursorState = getCursorStaleness(watcherAgentId, parsedEventCursor, [...SNAPSHOT_STREAMS]);
+    if (cursorState.stale) {
+      const cursor = encodeEventCursor(initialEventWatermark);
+      logActivity(
+        args.requesting_agent || watcherAgentId,
+        'read_snapshot_cursor_stale',
+        `cursor_in=${args.cursor || '-'} min_event_id=${cursorState.min_event_id} event_cursor=${initialEventWatermark}`,
+        { emit_stream_event: false }
+      );
+      if (responseMode === 'nano') {
+        return {
+          s: { m: [], t: [], c: [] },
+          h: { m: 0, t: 0 },
+          ch: { m: 0, t: 0, c: 0, a: 0, r: 0, q: 0 },
+          n: { m: null, t: null },
+          u: cursor,
+          ei: initialEventWatermark,
+          ew: initialEventWatermark,
+          eh: 0,
+          x: 1,
+          m: cursorState.min_event_id,
+        };
+      }
+      return {
+        success: true,
+        response_mode: responseMode,
+        changed: changedStreamMap([]),
+        cursor,
+        event_id: initialEventWatermark,
+        event_watermark: initialEventWatermark,
+        events_has_more: false,
+        events: [],
+        snapshot: {
+          messages: { messages: [], has_more: false, next_cursor: null },
+          tasks: { tasks: [], has_more: false, next_cursor: null },
+          context: { contexts: [], has_more: false, next_cursor: null },
+        },
+        counts: { messages: 0, tasks: 0, context: 0 },
+        cursor_stale: true,
+        resync_required: true,
+        resync_hint: cursorState.resync_hint,
+        min_event_id: cursorState.min_event_id,
+      };
+    }
+  }
   const eventChanges = parsedEventCursor !== null
     ? listStreamEventsAfter({
       agent_id: watcherAgentId,
@@ -485,10 +535,12 @@ export function handleReadSnapshot(args: {
     };
   }
 
-  const eventWatermark = getStreamEventWatermark({
-    agent_id: watcherAgentId,
-    streams: [...SNAPSHOT_STREAMS],
-  });
+  const eventWatermark = parsedEventCursor === null
+    ? initialEventWatermark
+    : getStreamEventWatermark({
+      agent_id: watcherAgentId,
+      streams: [...SNAPSHOT_STREAMS],
+    });
   const lastReturnedEventId = eventChanges.length > 0
     ? eventChanges[eventChanges.length - 1].id
     : eventWatermark;
