@@ -190,13 +190,14 @@ function serializePreflight(preflight) {
   if (full.length <= MAX_PREFLIGHT_CHARS) {
     return { text: full, truncated: false, original_chars: full.length };
   }
-  const digest = preflight?.hub_digest?.digest || {};
+  const digest = preflight?.hub_digest?.digest || preflight?.hub_digest?.d || {};
+  const digestSections = preflight?.hub_digest?.sections || preflight?.hub_digest?.s || Object.keys(digest);
   let stub = {
     truncated: true,
     original_chars: full.length,
     agent_id: preflight?.agent_id,
     namespace: preflight?.namespace,
-    digest_sections: Object.keys(digest),
+    digest_sections: digestSections,
     signal_count: digest.signals?.count ?? digest.signals?.c ?? null,
     memory_count: digest.memory?.count ?? digest.memory?.c ?? null,
     event_cursor: digest.events?.cursor ?? digest.events?.c ?? null,
@@ -468,10 +469,11 @@ function runProcess(command, args, options) {
         stderr: String(error?.stack || error),
       });
     });
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
       resolve({
-        exitCode: code ?? 0,
+        exitCode: code,
+        signal: signal || null,
         timedOut,
         durationMs: Date.now() - startedAt,
         stdout: Buffer.concat(stdout).toString('utf8'),
@@ -514,6 +516,7 @@ async function runCodex(opts, prompt) {
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
+    exit_signal: result.signal,
     timed_out: result.timedOut,
     duration_ms: result.durationMs,
   };
@@ -530,6 +533,7 @@ async function runClaude(opts, prompt) {
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
+    exit_signal: result.signal,
     timed_out: result.timedOut,
     duration_ms: result.durationMs,
   };
@@ -568,6 +572,7 @@ async function runCustom(opts, prompt) {
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
+    exit_signal: result.signal,
     timed_out: result.timedOut,
     duration_ms: result.durationMs,
   };
@@ -651,6 +656,7 @@ function compactResult(opts, prompt, backendResult) {
       ok: backendResult.ok,
       duration_ms: backendResult.duration_ms,
       exit_code: backendResult.exit_code,
+      exit_signal: backendResult.exit_signal,
       timed_out: backendResult.timed_out,
       model: backendResult.model,
       error: backendResult.error,
