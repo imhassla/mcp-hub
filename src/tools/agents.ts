@@ -140,6 +140,7 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'create_task', purpose: 'Create tasks with optional dependencies and idempotency' },
       { name: 'update_task', purpose: 'Update task fields with done-gate confidence + evidence checks' },
       { name: 'list_tasks', purpose: 'List tasks with ready_only and compact/tiny/nano output' },
+      { name: 'suggest_task_agents', purpose: 'Rank candidate agents for an existing task before explicit assignment' },
       { name: 'poll_and_claim', purpose: 'Claim next dependency-ready task with adaptive backoff' },
       { name: 'claim_task', purpose: 'Claim specific task with lease semantics' },
       { name: 'renew_task_claim', purpose: 'Renew task lease (stale-write guarded)' },

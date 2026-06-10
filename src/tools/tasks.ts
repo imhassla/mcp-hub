@@ -28,6 +28,7 @@ import {
   logActivity,
 } from '../db.js';
 import { withIdempotency } from '../utils.js';
+import { handleSuggestAgents } from './agents.js';
 import { buildTaskArtifactDownloads } from './artifacts.js';
 
 const pollMissStreak = new Map<string, number>();
@@ -288,6 +289,47 @@ function buildTaskArtifactHints(taskId: number, agentId: string) {
   }));
 }
 
+function inferTaskRoutingCriteria(task: {
+  title: string;
+  description?: string;
+  execution_mode?: string;
+}): { task_type: string | null; required_strengths: string[]; reason: string } {
+  const text = `${task.title || ''} ${task.description || ''}`.toLowerCase();
+  const requiredStrengths = new Set<string>();
+  const repoTask = task.execution_mode === 'repo' || /\b(repo|codebase|patch|test|build|commit|runtime|код|репо)\b/i.test(text);
+  let taskType: string | null = null;
+  let reason = 'no_heuristic_match';
+
+  if (/(review|audit|ревью|провер|code review)/i.test(text)) {
+    taskType = 'review';
+    requiredStrengths.add('code_review');
+    reason = 'matched_review_terms';
+  } else if (/(research|исслед|ресерч|market|paper|compare|анализ)/i.test(text)) {
+    taskType = 'research';
+    requiredStrengths.add('research');
+    reason = 'matched_research_terms';
+  } else if (/(plan|roadmap|design|architecture|архитект|план|стратег)/i.test(text)) {
+    taskType = 'planning';
+    requiredStrengths.add('analysis');
+    reason = 'matched_planning_terms';
+  } else if (/(debug|bug|fix|regression|ошиб|баг|чин)/i.test(text)) {
+    taskType = 'debugging';
+    requiredStrengths.add('debugging');
+    reason = 'matched_debugging_terms';
+  } else if (/(implement|code|patch|test|build|код|реализ|добав|внедр)/i.test(text)) {
+    taskType = 'coding';
+    requiredStrengths.add('coding');
+    reason = 'matched_coding_terms';
+  } else if (/(summary|summarize|digest|synthesis|сводк|итог|синтез)/i.test(text)) {
+    taskType = 'synthesis';
+    requiredStrengths.add('synthesis');
+    reason = 'matched_synthesis_terms';
+  }
+
+  if (repoTask) requiredStrengths.add('repo_reasoning');
+  return { task_type: taskType, required_strengths: [...requiredStrengths], reason };
+}
+
 export function handleCreateTask(args: {
   title: string;
   description?: string;
@@ -340,6 +382,82 @@ export function handleCreateTask(args: {
       namespace_policy: namespacePolicy.warning ? { mode: NAMESPACE_GOVERNANCE, warning: namespacePolicy.warning } : { mode: NAMESPACE_GOVERNANCE },
     };
   });
+}
+
+export function handleSuggestTaskAgents(args: {
+  requesting_agent: string;
+  task_id: number;
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  cost_tier?: 'low' | 'medium' | 'high' | 'unknown';
+  latency_tier?: 'low' | 'medium' | 'high' | 'unknown';
+  require_online?: boolean;
+  include_requesting_agent?: boolean;
+  exclude_agent_ids?: string[];
+  limit?: number;
+  response_mode?: 'compact' | 'tiny' | 'nano';
+}) {
+  const taskId = Number.isFinite(args.task_id) ? Math.floor(Number(args.task_id)) : 0;
+  const task = taskId > 0 ? getTaskById(taskId) : null;
+  if (!task) {
+    return {
+      success: false,
+      error_code: 'TASK_NOT_FOUND',
+      error: 'Task not found',
+    };
+  }
+
+  const inferred = inferTaskRoutingCriteria(task);
+  const requiredStrengths = Array.isArray(args.required_strengths) && args.required_strengths.length > 0
+    ? args.required_strengths
+    : inferred.required_strengths;
+  const taskType = args.task_type || inferred.task_type || undefined;
+  const suggestions = handleSuggestAgents({
+    requesting_agent: args.requesting_agent,
+    task_type: taskType,
+    required_strengths: requiredStrengths,
+    preferred_provider: args.preferred_provider,
+    preferred_family: args.preferred_family,
+    execution_mode: task.execution_mode,
+    cost_tier: args.cost_tier,
+    latency_tier: args.latency_tier,
+    require_online: args.require_online,
+    include_requesting_agent: args.include_requesting_agent,
+    exclude_agent_ids: args.exclude_agent_ids,
+    limit: args.limit,
+    response_mode: args.response_mode,
+  });
+  logActivity(
+    args.requesting_agent,
+    'suggest_task_agents',
+    `task_id=${task.id} inferred_task_type=${inferred.task_type || '-'} execution_mode=${task.execution_mode} response_mode=${args.response_mode || 'compact'}`
+  );
+
+  if (args.response_mode === 'nano') {
+    return {
+      task: [task.id, task.execution_mode, task.priority],
+      inferred: [inferred.task_type, inferred.required_strengths, inferred.reason],
+      ...suggestions,
+    };
+  }
+
+  return {
+    success: true,
+    task: {
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      assigned_to: task.assigned_to,
+      priority: task.priority,
+      namespace: task.namespace,
+      execution_mode: task.execution_mode,
+      consistency_mode: task.consistency_mode,
+    },
+    inferred,
+    ...suggestions,
+  };
 }
 
 export function handleUpdateTask(args: {
@@ -1175,6 +1293,37 @@ export const taskTools = {
       },
     },
     handler: handleListTasks,
+  },
+  suggest_task_agents: {
+    description: 'Rank candidate agents for an existing task using the task execution_mode plus explicit or inferred model-routing criteria. Does not assign the task.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat/activity/auth)' },
+        task_id: { type: 'number', description: 'Task ID to route' },
+        task_type: { type: 'string', description: 'Optional explicit task type override' },
+        required_strengths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional explicit strengths override',
+        },
+        preferred_provider: { type: 'string', description: 'Preferred model provider/runtime' },
+        preferred_family: { type: 'string', description: 'Preferred model family' },
+        cost_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model cost tier' },
+        latency_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model latency tier' },
+        require_online: { type: 'boolean', description: 'Only include agents seen online in the last 5 minutes (default true)' },
+        include_requesting_agent: { type: 'boolean', description: 'Allow the requesting agent to be returned (default false)' },
+        exclude_agent_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Additional agent IDs to exclude from suggestions',
+        },
+        limit: { type: 'number', description: 'Max suggestions to return (default 10, max 50)' },
+        response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'compact includes task and reasons; tiny/nano reduce tokens' },
+      },
+      required: ['requesting_agent', 'task_id'],
+    },
+    handler: handleSuggestTaskAgents,
   },
   poll_and_claim: {
     description: 'Atomically find a dependency-ready pending task and claim it. Prioritizes criticality and downstream unblocking impact; returns retry_after_ms when queue is empty.',

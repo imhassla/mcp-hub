@@ -17,6 +17,7 @@ import {
   handleCreateTask,
   handleUpdateTask,
   handleListTasks,
+  handleSuggestTaskAgents,
   handlePollAndClaim,
   handleClaimTask,
   handleRenewTaskClaim,
@@ -569,7 +570,10 @@ function shouldBypassAuth(toolName: string): boolean {
 }
 
 function canOmitResponseForQuota(toolName: string): boolean {
-  return /^(get|read|list|search|fetch)_/.test(toolName) || toolName === 'wait_for_updates' || toolName === 'suggest_agents';
+  return /^(get|read|list|search|fetch)_/.test(toolName)
+    || toolName === 'wait_for_updates'
+    || toolName === 'suggest_agents'
+    || toolName === 'suggest_task_agents';
 }
 
 const runtimeModelProfileSchema = z.object({
@@ -1272,6 +1276,28 @@ function registerTools(server: McpServer) {
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('list_tasks', (args) => handleListTasks(args as any))
+  );
+
+  server.tool(
+    'suggest_task_agents',
+    taskTools.suggest_task_agents.description,
+    {
+      requesting_agent: z.string().describe('Your agent ID (for heartbeat/activity/auth)'),
+      task_id: z.number().describe('Task ID to route'),
+      task_type: z.string().optional().describe('Optional explicit task type override'),
+      required_strengths: z.array(z.string()).optional().describe('Optional explicit strengths override'),
+      preferred_provider: z.string().optional().describe('Preferred model provider/runtime'),
+      preferred_family: z.string().optional().describe('Preferred model family'),
+      cost_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional().describe('Preferred model cost tier'),
+      latency_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional().describe('Preferred model latency tier'),
+      require_online: z.boolean().optional().describe('Only include agents seen online in the last 5 minutes (default true)'),
+      include_requesting_agent: z.boolean().optional().describe('Allow the requesting agent to be returned (default false)'),
+      exclude_agent_ids: z.array(z.string()).optional().describe('Additional agent IDs to exclude from suggestions'),
+      limit: z.number().optional().describe('Max suggestions to return (default 10, max 50)'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('compact includes task and reasons; tiny/nano reduce tokens'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('suggest_task_agents', (args) => handleSuggestTaskAgents(args as any))
   );
 
   server.tool(
