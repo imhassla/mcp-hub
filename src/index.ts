@@ -282,14 +282,26 @@ function consumeNamespaceRateLimit(namespace: string, now = Date.now()): boolean
   return true;
 }
 
-function estimateTokensFromPayload(args: Record<string, unknown>): number {
+function estimateTokensFromValue(value: unknown): number {
   try {
-    const raw = JSON.stringify(args);
+    const raw = JSON.stringify(value);
     if (!raw) return 1;
     return Math.max(1, Math.ceil(raw.length / 4));
   } catch {
     return 1;
   }
+}
+
+function namespaceQuotaError(namespace: string, details: Record<string, unknown> = {}) {
+  return {
+    success: false,
+    error_code: 'NAMESPACE_QUOTA_EXCEEDED',
+    error: `Namespace quota exceeded for "${namespace}"`,
+    namespace,
+    quota_mode: NAMESPACE_QUOTA_MODE,
+    retry_after_ms: 1000,
+    ...details,
+  };
 }
 
 function consumeNamespaceTokenBudget(namespace: string, tokenCost: number, now = Date.now()): boolean {
@@ -549,17 +561,29 @@ function cleanupExpiredArtifactTickets(now = Date.now()): number {
 }
 
 type ToolGuardResult =
-  | { allowed: true; warnings?: string[] }
+  | { allowed: true; warnings?: string[]; namespace?: string; request_tokens_est?: number }
   | { allowed: false; response: Record<string, unknown> };
 
 function shouldBypassAuth(toolName: string): boolean {
   return toolName === 'register_agent';
 }
 
+function canOmitResponseForQuota(toolName: string): boolean {
+  return /^(get|read|list|search|fetch)_/.test(toolName) || toolName === 'wait_for_updates';
+}
+
 function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGuardResult {
   const { agentId, authToken } = extractAgentAuthPayload(args);
   const now = Date.now();
   const warnings: string[] = [];
+  let quotaNamespace: string | undefined;
+  let requestTokensEst: number | undefined;
+  const allow = (): ToolGuardResult => ({
+    allowed: true,
+    warnings: warnings.length > 0 ? warnings : undefined,
+    namespace: quotaNamespace,
+    request_tokens_est: requestTokensEst,
+  });
 
   if (agentId && !consumeRateLimit(agentId, now)) {
     return {
@@ -575,18 +599,16 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
 
   if (NAMESPACE_QUOTA_MODE !== 'off') {
     const namespace = extractNamespace(toolName, args);
+    quotaNamespace = namespace;
     const namespaceRpsOk = consumeNamespaceRateLimit(namespace, now);
-    const tokenCost = estimateTokensFromPayload(args);
+    const tokenCost = estimateTokensFromValue(args);
+    requestTokensEst = tokenCost;
     const namespaceTokenOk = consumeNamespaceTokenBudget(namespace, tokenCost, now);
     if (!namespaceRpsOk || !namespaceTokenOk) {
-      const quotaError = {
-        success: false,
-        error_code: 'NAMESPACE_QUOTA_EXCEEDED',
-        error: `Namespace quota exceeded for "${namespace}"`,
-        namespace,
-        quota_mode: NAMESPACE_QUOTA_MODE,
-        retry_after_ms: 1000,
-      };
+      const quotaError = namespaceQuotaError(namespace, {
+        request_tokens_est: tokenCost,
+        quota_scope: !namespaceRpsOk ? 'request_rate' : 'request_tokens',
+      });
       if (NAMESPACE_QUOTA_MODE === 'enforce') {
         return { allowed: false, response: quotaError };
       }
@@ -615,7 +637,7 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     } else {
       recordAuthEvent(registerAgentId, toolName, 'skipped');
     }
-    return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
+    return allow();
   }
 
   if (!agentId) {
@@ -634,9 +656,9 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     }
     if (AUTH_MODE === 'warn') {
       warnings.push(warning);
-      return { allowed: true, warnings };
+      return allow();
     }
-    return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
+    return allow();
   }
 
   const hasToken = typeof authToken === 'string' && authToken.length > 0;
@@ -663,10 +685,40 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
       ? 'Auth token is invalid (warn mode). This will fail once auth_mode=enforce.'
       : 'Auth token missing (warn mode). This will fail once auth_mode=enforce.';
     warnings.push(warning);
-    return { allowed: true, warnings };
+    return allow();
   }
 
-  return warnings.length > 0 ? { allowed: true, warnings } : { allowed: true };
+  return allow();
+}
+
+function mergeResponseMetadata(
+  result: unknown,
+  warnings: string[],
+  metadata: Record<string, unknown>,
+) {
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const responseObject = result as Record<string, unknown>;
+    const existingWarnings = Array.isArray(responseObject.warnings)
+      ? responseObject.warnings as unknown[]
+      : (typeof responseObject.warning === 'string' ? [responseObject.warning] : []);
+    const merged: Record<string, unknown> = {
+      ...responseObject,
+      ...metadata,
+    };
+    if (warnings.length > 0) {
+      merged.warnings = [...existingWarnings, ...warnings];
+    }
+    return merged;
+  }
+  if (warnings.length > 0 || Object.keys(metadata).length > 0) {
+    return {
+      success: true,
+      result,
+      ...metadata,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
+  }
+  return result;
 }
 
 function registerTools(server: McpServer) {
@@ -681,18 +733,41 @@ function registerTools(server: McpServer) {
         return mcpTextResponse(guard.response);
       }
       const result = await handler(args || {});
-      if (guard.warnings && guard.warnings.length > 0 && result && typeof result === 'object' && !Array.isArray(result)) {
-        const responseObject = result as Record<string, unknown>;
-        const existingWarnings = Array.isArray(responseObject.warnings)
-          ? responseObject.warnings as unknown[]
-          : (typeof responseObject.warning === 'string' ? [responseObject.warning] : []);
-        return mcpTextResponse({
-          ...responseObject,
-          warnings: [...existingWarnings, ...guard.warnings],
-          auth_mode: AUTH_MODE,
-        });
+      const warnings = [...(guard.warnings || [])];
+      const metadata: Record<string, unknown> = {};
+
+      if (NAMESPACE_QUOTA_MODE !== 'off' && guard.namespace) {
+        const responseTokensEst = estimateTokensFromValue(result);
+        const responseTokenOk = consumeNamespaceTokenBudget(guard.namespace, responseTokensEst, Date.now());
+        metadata.token_accounting = {
+          namespace: guard.namespace,
+          quota_mode: NAMESPACE_QUOTA_MODE,
+          request_tokens_est: guard.request_tokens_est,
+          response_tokens_est: responseTokensEst,
+        };
+        if (!responseTokenOk) {
+          const quotaError = namespaceQuotaError(guard.namespace, {
+            quota_scope: 'response_tokens',
+            request_tokens_est: guard.request_tokens_est,
+            response_tokens_est: responseTokensEst,
+            response_omitted: NAMESPACE_QUOTA_MODE === 'enforce',
+            tool: toolName,
+          });
+          if (NAMESPACE_QUOTA_MODE === 'enforce' && canOmitResponseForQuota(toolName)) {
+            return mcpTextResponse(quotaError);
+          }
+          const quotaWarning = NAMESPACE_QUOTA_MODE === 'enforce'
+            ? 'namespace_quota_enforce_deferred'
+            : 'namespace_quota_warn';
+          warnings.push(`[${quotaWarning}] ${quotaError.error} response_tokens_est=${responseTokensEst}`);
+        }
       }
-      return mcpTextResponse(result);
+
+      if (warnings.length > 0) {
+        metadata.auth_mode = AUTH_MODE;
+      }
+
+      return mcpTextResponse(mergeResponseMetadata(result, warnings, metadata));
     };
   };
 
