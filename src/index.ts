@@ -214,6 +214,18 @@ const EVENT_STREAM_DEFAULT_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_
 const EVENT_STREAM_HEARTBEAT_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))
   ? Math.max(2_000, Math.min(60_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))))
   : 15_000;
+const EVENT_STREAM_MAX_CONNECTIONS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_CONNECTIONS))
+  ? Math.max(1, Math.min(10_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_CONNECTIONS))))
+  : 200;
+const EVENT_STREAM_MAX_PER_AGENT = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_PER_AGENT))
+  ? Math.max(1, Math.min(EVENT_STREAM_MAX_CONNECTIONS, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_PER_AGENT))))
+  : 10;
+const EVENT_STREAM_MAX_BUFFER_BYTES = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_BUFFER_BYTES))
+  ? Math.max(16 * 1024, Math.min(16 * 1024 * 1024, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_MAX_BUFFER_BYTES))))
+  : 1024 * 1024;
+const EVENT_STREAM_DRAIN_TIMEOUT_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_DRAIN_TIMEOUT_MS))
+  ? Math.max(500, Math.min(60_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_DRAIN_TIMEOUT_MS))))
+  : 5_000;
 const ORIGIN_MODE = (() => {
   const configured = String(process.env.MCP_HUB_ORIGIN_MODE || 'warn').toLowerCase().trim();
   return configured === 'enforce' ? 'enforce' : 'warn';
@@ -230,6 +242,8 @@ type ArtifactTicket = {
 };
 
 const artifactTickets = new Map<string, ArtifactTicket>();
+const eventStreamCountsByAgent = new Map<string, number>();
+let activeEventStreamCount = 0;
 
 function consumeRateLimit(agentId: string, now = Date.now()): boolean {
   if (!Number.isFinite(RATE_LIMIT_RPS) || RATE_LIMIT_RPS <= 0 || !Number.isFinite(RATE_LIMIT_BURST) || RATE_LIMIT_BURST <= 0) {
@@ -2016,6 +2030,27 @@ app.get('/events', (req, res) => {
     return;
   }
 
+  const agentEventStreams = eventStreamCountsByAgent.get(agentId) || 0;
+  if (activeEventStreamCount >= EVENT_STREAM_MAX_CONNECTIONS || agentEventStreams >= EVENT_STREAM_MAX_PER_AGENT) {
+    const retryAfterMs = Math.max(1_000, pollMs);
+    res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+    res.status(429).json({
+      success: false,
+      error_code: 'EVENT_STREAM_LIMIT_EXCEEDED',
+      error: activeEventStreamCount >= EVENT_STREAM_MAX_CONNECTIONS
+        ? 'Global /events connection limit exceeded'
+        : 'Per-agent /events connection limit exceeded',
+      retry_after_ms: retryAfterMs,
+      active_connections: activeEventStreamCount,
+      active_agent_connections: agentEventStreams,
+      max_connections: EVENT_STREAM_MAX_CONNECTIONS,
+      max_per_agent: EVENT_STREAM_MAX_PER_AGENT,
+    });
+    return;
+  }
+
+  activeEventStreamCount += 1;
+  eventStreamCountsByAgent.set(agentId, agentEventStreams + 1);
   logActivity(agentId, 'events_subscribe', `streams=${streams.join(',')} mode=${responseMode} poll_ms=${pollMs}`, { emit_stream_event: false });
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -2032,16 +2067,67 @@ app.get('/events', (req, res) => {
     sinceEventId = initialEventId;
   }
   let lastHeartbeatAt = Date.now();
+  let streamClosed = false;
+  let draining = false;
+  let drainTimer: NodeJS.Timeout | null = null;
+  let timer: NodeJS.Timeout | null = null;
 
-  const writeEvent = (eventName: string, payload: Record<string, unknown>, eventId?: number) => {
-    if (Number.isFinite(eventId)) {
-      res.write(`id: ${Math.floor(Number(eventId))}\n`);
+  const cleanup = () => {
+    if (streamClosed) return;
+    streamClosed = true;
+    if (timer) clearInterval(timer);
+    if (drainTimer) clearTimeout(drainTimer);
+    activeEventStreamCount = Math.max(0, activeEventStreamCount - 1);
+    const currentAgentStreams = eventStreamCountsByAgent.get(agentId) || 0;
+    if (currentAgentStreams <= 1) {
+      eventStreamCountsByAgent.delete(agentId);
+    } else {
+      eventStreamCountsByAgent.set(agentId, currentAgentStreams - 1);
     }
-    res.write(`event: ${eventName}\n`);
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    logActivity(agentId, 'events_unsubscribe', `streams=${streams.join(',')}`, { emit_stream_event: false });
   };
 
-  writeEvent('hello', {
+  const closeStream = (reason: string) => {
+    if (streamClosed) return;
+    logActivity(agentId, 'events_close', `${reason} streams=${streams.join(',')}`, { emit_stream_event: false });
+    cleanup();
+    if (!res.destroyed && !res.writableEnded) {
+      res.end();
+    }
+  };
+
+  const writeEvent = (eventName: string, payload: Record<string, unknown>, eventId?: number): boolean => {
+    if (streamClosed || res.destroyed || res.writableEnded) {
+      closeStream('write_after_close');
+      return false;
+    }
+    if (res.writableLength > EVENT_STREAM_MAX_BUFFER_BYTES) {
+      closeStream(`buffer_limit_exceeded bytes=${res.writableLength}`);
+      return false;
+    }
+    const frame = `${Number.isFinite(eventId) ? `id: ${Math.floor(Number(eventId))}\n` : ''}event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
+    try {
+      const canContinue = res.write(frame);
+      if (!canContinue && !draining) {
+        draining = true;
+        drainTimer = setTimeout(() => {
+          closeStream('drain_timeout');
+        }, EVENT_STREAM_DRAIN_TIMEOUT_MS);
+        drainTimer.unref();
+        res.once('drain', () => {
+          draining = false;
+          if (drainTimer) clearTimeout(drainTimer);
+          drainTimer = null;
+        });
+      }
+      return canContinue;
+    } catch (error) {
+      closeStream('write_error');
+      return false;
+    }
+  };
+
+  const helloWritten = writeEvent('hello', {
     success: true,
     mode: responseMode === 'nano' ? 'nano' : 'compact',
     streams,
@@ -2053,8 +2139,10 @@ app.get('/events', (req, res) => {
     resync_hint: cursorStale ? 'read_snapshot' : undefined,
     min_event_id: cursorStale ? minEventId : undefined,
   }, sinceEventId);
+  if (!helloWritten && streamClosed) return;
 
   const emitAvailableEvents = () => {
+    if (streamClosed || draining || res.destroyed || res.writableEnded) return false;
     try {
       const events = listStreamEventsAfter({
         agent_id: agentId,
@@ -2067,14 +2155,14 @@ app.get('/events', (req, res) => {
         const changedStreams = [...new Set(events.map((event) => event.stream))];
         const cursor = encodeStreamEventCursor(eventId);
         if (responseMode === 'nano') {
-          writeEvent('update', {
+          if (!writeEvent('update', {
             c: 1,
             s: changedStreams,
             u: cursor,
             i: eventId,
-          }, eventId);
+          }, eventId)) return false;
         } else {
-          writeEvent('update', {
+          if (!writeEvent('update', {
             changed: true,
             streams: changedStreams,
             cursor,
@@ -2086,7 +2174,7 @@ app.get('/events', (req, res) => {
               entity_id: event.entity_id,
               created_at: event.created_at,
             })),
-          }, eventId);
+          }, eventId)) return false;
         }
         sinceEventId = eventId;
         lastHeartbeatAt = Date.now();
@@ -2098,30 +2186,30 @@ app.get('/events', (req, res) => {
         const eventId = Math.max(sinceEventId, getStreamEventWatermark({ agent_id: agentId, streams }));
         const cursor = encodeStreamEventCursor(eventId);
         if (responseMode === 'nano') {
-          writeEvent('heartbeat', { c: 0, u: cursor, i: eventId });
+          if (!writeEvent('heartbeat', { c: 0, u: cursor, i: eventId })) return false;
         } else {
-          writeEvent('heartbeat', { changed: false, cursor, event_id: eventId });
+          if (!writeEvent('heartbeat', { changed: false, cursor, event_id: eventId })) return false;
         }
         lastHeartbeatAt = now;
       }
     } catch (error) {
       writeEvent('error', { success: false, error: 'event_stream_internal_error' });
+      closeStream('event_stream_internal_error');
     }
     return false;
   };
 
   emitAvailableEvents();
 
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     emitAvailableEvents();
   }, pollMs);
+  timer.unref();
 
-  const cleanup = () => {
-    clearInterval(timer);
-    logActivity(agentId, 'events_unsubscribe', `streams=${streams.join(',')}`, { emit_stream_event: false });
-  };
   req.on('close', cleanup);
   req.on('end', cleanup);
+  res.on('close', cleanup);
+  res.on('error', () => closeStream('response_error'));
 });
 
 app.get('/health', (_req, res) => {
@@ -2139,6 +2227,12 @@ app.get('/health', (_req, res) => {
       endpoint: '/events',
       default_interval_ms: EVENT_STREAM_DEFAULT_INTERVAL_MS,
       heartbeat_ms: EVENT_STREAM_HEARTBEAT_MS,
+      active_connections: activeEventStreamCount,
+      tracked_agents: eventStreamCountsByAgent.size,
+      max_connections: EVENT_STREAM_MAX_CONNECTIONS,
+      max_per_agent: EVENT_STREAM_MAX_PER_AGENT,
+      max_buffer_bytes: EVENT_STREAM_MAX_BUFFER_BYTES,
+      drain_timeout_ms: EVENT_STREAM_DRAIN_TIMEOUT_MS,
     },
     artifact_tickets: artifactTickets.size,
     session_idle_timeout_ms: SESSION_IDLE_TIMEOUT_MS,
