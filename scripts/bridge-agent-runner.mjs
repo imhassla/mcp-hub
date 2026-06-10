@@ -185,6 +185,54 @@ function selectNegotiatedReadMode(registration) {
   return ['nano', 'tiny', 'compact'].includes(mode) ? mode : 'tiny';
 }
 
+function modelFamily(modelId, fallback) {
+  const normalized = String(modelId || fallback || 'unknown').toLowerCase();
+  if (normalized.includes('claude')) return 'claude';
+  if (normalized.includes('gpt') || normalized.includes('codex')) return 'openai';
+  if (normalized.includes('qwen')) return 'qwen';
+  if (normalized.includes('llama')) return 'llama';
+  return fallback || 'unknown';
+}
+
+function buildModelProfile(opts) {
+  const modelId = opts.backend === 'codex'
+    ? (opts.codexModel || process.env.CODEX_MODEL || 'codex-default')
+    : opts.backend === 'claude'
+      ? (opts.claudeModel || process.env.CLAUDE_MODEL || 'claude-default')
+      : (process.env.BRIDGE_MODEL_ID || 'custom-default');
+  if (opts.backend === 'codex') {
+    return {
+      provider: 'codex',
+      id: modelId,
+      family: modelFamily(modelId, 'openai'),
+      strengths: ['coding', 'code_review', 'repo_reasoning', 'tool_use'],
+      task_types: ['coding', 'review', 'debugging', 'research'],
+      cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
+      latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
+    };
+  }
+  if (opts.backend === 'claude') {
+    return {
+      provider: 'claude',
+      id: modelId,
+      family: modelFamily(modelId, 'claude'),
+      strengths: ['analysis', 'writing', 'research', 'review'],
+      task_types: ['research', 'review', 'planning', 'synthesis'],
+      cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
+      latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
+    };
+  }
+  return {
+    provider: 'custom',
+    id: modelId,
+    family: modelFamily(modelId, 'custom'),
+    strengths: parseCsv(process.env.BRIDGE_MODEL_STRENGTHS || 'custom,tool_use'),
+    task_types: parseCsv(process.env.BRIDGE_MODEL_TASK_TYPES || 'custom'),
+    cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
+    latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
+  };
+}
+
 function serializePreflight(preflight) {
   const full = JSON.stringify(preflight);
   if (full.length <= MAX_PREFLIGHT_CHARS) {
@@ -822,6 +870,7 @@ async function main() {
   };
   const reportPath = path.join(opts.outDir, `${opts.agentId}.json`);
   const runtimeProfile = await measurePhase(phaseTimings, 'detect_runtime_profile_ms', () => detectRuntimeProfile(opts));
+  runtimeProfile.model = buildModelProfile(opts);
 
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
   let authToken = '';

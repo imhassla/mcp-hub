@@ -572,6 +572,18 @@ function canOmitResponseForQuota(toolName: string): boolean {
   return /^(get|read|list|search|fetch)_/.test(toolName) || toolName === 'wait_for_updates';
 }
 
+const runtimeModelProfileSchema = z.object({
+  provider: z.string().optional(),
+  id: z.string().optional(),
+  family: z.string().optional(),
+  context_window: z.number().optional(),
+  max_output_tokens: z.number().optional(),
+  strengths: z.array(z.string()).optional(),
+  task_types: z.array(z.string()).optional(),
+  cost_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional(),
+  latency_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional(),
+}).optional();
+
 function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGuardResult {
   const { agentId, authToken } = extractAgentAuthPayload(args);
   const now = Date.now();
@@ -801,6 +813,7 @@ function registerTools(server: McpServer) {
         source: z.enum(['client_auto', 'client_declared', 'server_inferred']).optional(),
         detected_at: z.number().optional(),
         notes: z.string().optional(),
+        model: runtimeModelProfileSchema.describe('Optional model identity/capability profile for model-aware orchestration'),
       }).optional().describe('Optional runtime profile used for execution-mode task routing'),
     },
     guardedTool('register_agent', (args) => handleRegisterAgent(args as any))
@@ -820,6 +833,7 @@ function registerTools(server: McpServer) {
         source: z.enum(['client_auto', 'client_declared', 'server_inferred']).optional(),
         detected_at: z.number().optional(),
         notes: z.string().optional(),
+        model: runtimeModelProfileSchema.describe('Optional model identity/capability profile for model-aware orchestration'),
       }).describe('Current runtime profile'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },

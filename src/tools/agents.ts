@@ -517,6 +517,9 @@ function parseRuntimeProfileJson(raw: string | undefined): AgentRuntimeProfile {
   if (!raw) return { mode: 'unknown', source: 'server_inferred' };
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const model = parsed.model && typeof parsed.model === 'object'
+      ? parsed.model as AgentRuntimeProfile['model']
+      : undefined;
     return {
       mode: normalizeWorkspaceMode(typeof parsed.mode === 'string' ? parsed.mode : undefined),
       cwd: typeof parsed.cwd === 'string' ? parsed.cwd : undefined,
@@ -526,6 +529,7 @@ function parseRuntimeProfileJson(raw: string | undefined): AgentRuntimeProfile {
       source: typeof parsed.source === 'string' ? parsed.source as AgentRuntimeProfile['source'] : 'server_inferred',
       detected_at: Number.isFinite(parsed.detected_at) ? Number(parsed.detected_at) : undefined,
       notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+      model,
     };
   } catch {
     return { mode: 'unknown', source: 'server_inferred' };
@@ -700,6 +704,7 @@ export function handleListAgents(args: {
         type: agent.type,
         lifecycle: agent.lifecycle,
         runtime_mode: agent.runtime_mode,
+        model: parseRuntimeProfileJson(agent.runtime_profile_json).model || null,
         status: agent.status,
         last_seen: agent.last_seen,
       })),

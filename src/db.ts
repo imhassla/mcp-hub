@@ -5,6 +5,7 @@ import { randomUUID } from 'crypto';
 import type {
   Agent,
   AgentLifecycle,
+  AgentModelProfile,
   AgentRuntimeProfile,
   AgentWorkspaceMode,
   Message,
@@ -660,6 +661,49 @@ function inferWorkspaceMode(profile: Partial<AgentRuntimeProfile>): AgentWorkspa
   return 'unknown';
 }
 
+function normalizeProfileString(value: unknown, max = 120): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim().slice(0, max)
+    : undefined;
+}
+
+function normalizeProfileStringList(value: unknown, maxItems = 12): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cleaned = [...new Set(value
+    .map((item) => normalizeProfileString(item, 48))
+    .filter((item): item is string => Boolean(item)))].slice(0, maxItems);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function normalizeTier(value: unknown): AgentModelProfile['cost_tier'] {
+  return value === 'low' || value === 'medium' || value === 'high' || value === 'unknown'
+    ? value
+    : undefined;
+}
+
+function normalizePositiveInt(value: unknown, max: number): number | undefined {
+  return Number.isFinite(Number(value))
+    ? Math.max(1, Math.min(max, Math.floor(Number(value))))
+    : undefined;
+}
+
+function normalizeModelProfile(model?: AgentModelProfile): AgentModelProfile | undefined {
+  if (!model || typeof model !== 'object') return undefined;
+  const normalized: AgentModelProfile = {
+    provider: normalizeProfileString(model.provider, 64),
+    id: normalizeProfileString(model.id, 120),
+    family: normalizeProfileString(model.family, 80),
+    context_window: normalizePositiveInt(model.context_window, 10_000_000),
+    max_output_tokens: normalizePositiveInt(model.max_output_tokens, 1_000_000),
+    strengths: normalizeProfileStringList(model.strengths),
+    task_types: normalizeProfileStringList(model.task_types),
+    cost_tier: normalizeTier(model.cost_tier),
+    latency_tier: normalizeTier(model.latency_tier),
+  };
+  const compact = Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== undefined)) as AgentModelProfile;
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
 function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWorkspaceMode; json: string } {
   const normalizedInput: AgentRuntimeProfile = profile && typeof profile === 'object'
     ? {
@@ -671,6 +715,7 @@ function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWo
       source: profile.source,
       detected_at: Number.isFinite(profile.detected_at) ? Math.floor(Number(profile.detected_at)) : undefined,
       notes: typeof profile.notes === 'string' ? profile.notes.slice(0, 512) : undefined,
+      model: normalizeModelProfile(profile.model),
     }
     : { mode: 'unknown' };
 
@@ -680,6 +725,7 @@ function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWo
     mode: inferred,
     source: normalizedInput.source || 'server_inferred',
     detected_at: normalizedInput.detected_at || Date.now(),
+    model: normalizedInput.model,
   };
   return {
     mode: normalized.mode,
@@ -856,6 +902,7 @@ export function getAgentRuntimeProfile(agentId: string): AgentRuntimeProfile {
     source: typeof parsed.source === 'string' ? parsed.source as AgentRuntimeProfile['source'] : 'server_inferred',
     detected_at: Number.isFinite(parsed.detected_at) ? Number(parsed.detected_at) : undefined,
     notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+    model: normalizeModelProfile(parsed.model),
   };
 }
 
