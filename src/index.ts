@@ -10,7 +10,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { z } from 'zod';
 import { getDb } from './db.js';
-import { agentTools, handleRegisterAgent, handleListAgents, handleGetOnboarding, handleUpdateRuntimeProfile } from './tools/agents.js';
+import { agentTools, handleRegisterAgent, handleListAgents, handleSuggestAgents, handleGetOnboarding, handleUpdateRuntimeProfile } from './tools/agents.js';
 import { messageTools, handleSendMessage, handleSendBlobMessage, handleReadMessages } from './tools/messages.js';
 import {
   taskTools,
@@ -569,7 +569,7 @@ function shouldBypassAuth(toolName: string): boolean {
 }
 
 function canOmitResponseForQuota(toolName: string): boolean {
-  return /^(get|read|list|search|fetch)_/.test(toolName) || toolName === 'wait_for_updates';
+  return /^(get|read|list|search|fetch)_/.test(toolName) || toolName === 'wait_for_updates' || toolName === 'suggest_agents';
 }
 
 const runtimeModelProfileSchema = z.object({
@@ -851,6 +851,28 @@ function registerTools(server: McpServer) {
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('list_agents', (args) => handleListAgents(args as any))
+  );
+
+  server.tool(
+    'suggest_agents',
+    agentTools.suggest_agents.description,
+    {
+      requesting_agent: z.string().optional().describe('Your agent ID (for heartbeat/activity)'),
+      task_type: z.string().optional().describe('Desired task type, e.g. coding, review, research, planning, synthesis'),
+      required_strengths: z.array(z.string()).optional().describe('Model strengths required or preferred for this task'),
+      preferred_provider: z.string().optional().describe('Preferred model provider/runtime, e.g. codex, claude, custom'),
+      preferred_family: z.string().optional().describe('Preferred model family'),
+      execution_mode: z.enum(['any', 'repo', 'isolated']).optional().describe('Required workspace execution profile'),
+      cost_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional().describe('Preferred model cost tier'),
+      latency_tier: z.enum(['low', 'medium', 'high', 'unknown']).optional().describe('Preferred model latency tier'),
+      require_online: z.boolean().optional().describe('Only include agents seen online in the last 5 minutes (default true)'),
+      include_requesting_agent: z.boolean().optional().describe('Allow the requesting agent to be returned (default false)'),
+      exclude_agent_ids: z.array(z.string()).optional().describe('Additional agent IDs to exclude from suggestions'),
+      limit: z.number().optional().describe('Max suggestions to return (default 10, max 50)'),
+      response_mode: z.enum(['compact', 'tiny', 'nano']).optional().describe('compact includes reasons; tiny/nano reduce tokens'),
+      auth_token: z.string().optional().describe('Optional auth token from register_agent'),
+    },
+    guardedTool('suggest_agents', (args) => handleSuggestAgents(args as any))
   );
 
   server.tool(

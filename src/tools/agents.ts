@@ -1,5 +1,5 @@
-import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, updateAgentRuntimeProfile } from '../db.js';
-import type { AgentLifecycle, AgentRuntimeProfile, AgentWorkspaceMode } from '../types.js';
+import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
+import type { Agent, AgentLifecycle, AgentModelProfile, AgentRuntimeProfile, AgentWorkspaceMode, TaskExecutionMode } from '../types.js';
 
 type OnboardingMode = 'full' | 'compact' | 'none';
 type AgentRole = 'orchestrator' | 'reviewer' | 'assistant' | 'worker';
@@ -110,6 +110,7 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'register_agent', purpose: 'Register and receive protocol onboarding' },
       { name: 'update_runtime_profile', purpose: 'Update runtime profile (repo/isolated/unknown) after registration' },
       { name: 'list_agents', purpose: 'View online/offline agent roster' },
+      { name: 'suggest_agents', purpose: 'Rank agents by model profile, runtime compatibility, online status, and quality metrics' },
       { name: 'get_onboarding', purpose: 'Re-fetch protocol guide and capabilities' },
     ],
     messaging: [
@@ -713,6 +714,299 @@ export function handleListAgents(args: {
   return { agents };
 }
 
+type SuggestAgentsResponseMode = 'compact' | 'tiny' | 'nano';
+type ModelTier = 'low' | 'medium' | 'high' | 'unknown';
+
+interface AgentSuggestion {
+  agent: Agent;
+  runtime_profile: AgentRuntimeProfile;
+  model: AgentModelProfile | null;
+  score: number;
+  reasons: string[];
+  matched: {
+    task_type?: string;
+    strengths: string[];
+    provider?: string;
+    family?: string;
+    cost_tier?: ModelTier;
+    latency_tier?: ModelTier;
+  };
+  quality: ReturnType<typeof getAgentQuality>;
+  online: boolean;
+}
+
+function normalizeToken(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeTokenList(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeToken).filter(Boolean))];
+}
+
+function splitCapabilities(capabilities: string): Set<string> {
+  return new Set(
+    String(capabilities || '')
+      .split(/[\s,;|/]+/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function normalizeExecutionMode(mode?: string): TaskExecutionMode {
+  if (mode === 'repo' || mode === 'isolated' || mode === 'any') return mode;
+  return 'any';
+}
+
+function normalizeTier(tier?: string): ModelTier | undefined {
+  if (tier === 'low' || tier === 'medium' || tier === 'high' || tier === 'unknown') return tier;
+  return undefined;
+}
+
+function modelListHas(values: string[] | undefined, token: string): boolean {
+  return normalizeTokenList(values).includes(token);
+}
+
+function buildAgentSuggestion(agent: Agent, args: {
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  execution_mode?: TaskExecutionMode;
+  cost_tier?: ModelTier;
+  latency_tier?: ModelTier;
+}): AgentSuggestion | null {
+  const runtimeProfile = parseRuntimeProfileJson(agent.runtime_profile_json);
+  const executionMode = args.execution_mode || 'any';
+  if (executionMode !== 'any' && agent.runtime_mode !== executionMode) return null;
+
+  const model = runtimeProfile.model || null;
+  const caps = splitCapabilities(agent.capabilities);
+  const now = Date.now();
+  const online = agent.status === 'online' && agent.last_seen >= now - (5 * 60 * 1000);
+  const reasons: string[] = [];
+  const matchedStrengths: string[] = [];
+  let score = 0;
+
+  if (online) {
+    score += 12;
+    reasons.push('online_5m');
+  } else {
+    score -= 12;
+    reasons.push('not_seen_5m');
+  }
+
+  if (executionMode !== 'any') {
+    score += 12;
+    reasons.push(`runtime:${executionMode}`);
+  } else if (agent.runtime_mode === 'repo') {
+    score += 4;
+    reasons.push('runtime:repo');
+  }
+
+  const taskType = normalizeToken(args.task_type);
+  if (taskType) {
+    if (modelListHas(model?.task_types, taskType)) {
+      score += 30;
+      reasons.push(`task_type:${taskType}`);
+    } else if (caps.has(taskType)) {
+      score += 12;
+      reasons.push(`capability:${taskType}`);
+    } else if (normalizeToken(model?.id).includes(taskType) || normalizeToken(model?.family).includes(taskType)) {
+      score += 5;
+      reasons.push(`model_hint:${taskType}`);
+    }
+  }
+
+  for (const strength of normalizeTokenList(args.required_strengths)) {
+    if (modelListHas(model?.strengths, strength)) {
+      score += 18;
+      matchedStrengths.push(strength);
+      reasons.push(`strength:${strength}`);
+    } else if (caps.has(strength)) {
+      score += 8;
+      matchedStrengths.push(strength);
+      reasons.push(`capability:${strength}`);
+    } else {
+      score -= 4;
+      reasons.push(`missing_strength:${strength}`);
+    }
+  }
+
+  const provider = normalizeToken(args.preferred_provider);
+  const family = normalizeToken(args.preferred_family);
+  if (provider && normalizeToken(model?.provider) === provider) {
+    score += 10;
+    reasons.push(`provider:${provider}`);
+  }
+  if (family && normalizeToken(model?.family) === family) {
+    score += 8;
+    reasons.push(`family:${family}`);
+  }
+
+  const costTier = args.cost_tier;
+  const latencyTier = args.latency_tier;
+  if (costTier && model?.cost_tier === costTier) {
+    score += 6;
+    reasons.push(`cost:${costTier}`);
+  }
+  if (latencyTier && model?.latency_tier === latencyTier) {
+    score += 6;
+    reasons.push(`latency:${latencyTier}`);
+  }
+
+  const quality = getAgentQuality(agent.id);
+  const completed = Math.max(0, quality.completed_count || 0);
+  const rollbacks = Math.max(0, quality.rollback_count || 0);
+  if (completed > 0) {
+    score += Math.min(10, completed * 2);
+    reasons.push(`completed:${completed}`);
+  }
+  if (rollbacks > 0) {
+    score -= Math.min(20, rollbacks * 5);
+    reasons.push(`rollbacks:${rollbacks}`);
+  }
+
+  if (!model) {
+    score -= 3;
+    reasons.push('model_profile_missing');
+  }
+
+  return {
+    agent,
+    runtime_profile: runtimeProfile,
+    model,
+    score,
+    reasons,
+    matched: {
+      task_type: taskType || undefined,
+      strengths: matchedStrengths,
+      provider: provider || undefined,
+      family: family || undefined,
+      cost_tier: costTier,
+      latency_tier: latencyTier,
+    },
+    quality,
+    online,
+  };
+}
+
+export function handleSuggestAgents(args: {
+  requesting_agent?: string;
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  execution_mode?: TaskExecutionMode;
+  cost_tier?: ModelTier;
+  latency_tier?: ModelTier;
+  require_online?: boolean;
+  include_requesting_agent?: boolean;
+  exclude_agent_ids?: string[];
+  limit?: number;
+  response_mode?: SuggestAgentsResponseMode;
+}) {
+  if (args.requesting_agent) heartbeat(args.requesting_agent);
+  const limit = Number.isFinite(args.limit) ? Math.min(50, Math.max(1, Math.floor(Number(args.limit)))) : 10;
+  const executionMode = normalizeExecutionMode(args.execution_mode);
+  const costTier = normalizeTier(args.cost_tier);
+  const latencyTier = normalizeTier(args.latency_tier);
+  const requireOnline = args.require_online !== false;
+  const includeRequestingAgent = args.include_requesting_agent === true;
+  const excludedAgentIds = new Set(normalizeTokenList(args.exclude_agent_ids));
+  if (args.requesting_agent && !includeRequestingAgent) {
+    excludedAgentIds.add(normalizeToken(args.requesting_agent));
+  }
+  const responseMode = args.response_mode || 'compact';
+  const agents = listAgents({ limit: 500, offset: 0 });
+  const suggestions = agents
+    .filter((agent) => !excludedAgentIds.has(normalizeToken(agent.id)))
+    .map((agent) => buildAgentSuggestion(agent, {
+      task_type: args.task_type,
+      required_strengths: args.required_strengths,
+      preferred_provider: args.preferred_provider,
+      preferred_family: args.preferred_family,
+      execution_mode: executionMode,
+      cost_tier: costTier,
+      latency_tier: latencyTier,
+    }))
+    .filter((suggestion): suggestion is AgentSuggestion => Boolean(suggestion))
+    .filter((suggestion) => !requireOnline || suggestion.online)
+    .sort((a, b) => b.score - a.score || b.agent.last_seen - a.agent.last_seen || a.agent.id.localeCompare(b.agent.id))
+    .slice(0, limit);
+
+  logActivity(
+    args.requesting_agent || 'system',
+    'suggest_agents',
+    `Suggested ${suggestions.length} agents task_type=${normalizeToken(args.task_type) || 'none'} execution_mode=${executionMode} require_online=${requireOnline ? 1 : 0} excluded=${excludedAgentIds.size}`
+  );
+
+  if (responseMode === 'nano') {
+    return {
+      suggestions: suggestions.map((suggestion) => [
+        suggestion.agent.id,
+        suggestion.score,
+        suggestion.model?.id || null,
+        suggestion.agent.runtime_mode,
+      ]),
+      total: suggestions.length,
+    };
+  }
+
+  if (responseMode === 'tiny') {
+    return {
+      suggestions: suggestions.map((suggestion) => ({
+        id: suggestion.agent.id,
+        score: suggestion.score,
+        type: suggestion.agent.type,
+        runtime_mode: suggestion.agent.runtime_mode,
+        model: suggestion.model ? {
+          provider: suggestion.model.provider,
+          id: suggestion.model.id,
+          family: suggestion.model.family,
+        } : null,
+        online: suggestion.online,
+      })),
+      total: suggestions.length,
+    };
+  }
+
+  return {
+    suggestions: suggestions.map((suggestion) => ({
+      agent: {
+        id: suggestion.agent.id,
+        name: suggestion.agent.name,
+        type: suggestion.agent.type,
+        lifecycle: suggestion.agent.lifecycle,
+        runtime_mode: suggestion.agent.runtime_mode,
+        status: suggestion.agent.status,
+        last_seen: suggestion.agent.last_seen,
+      },
+      score: suggestion.score,
+      reasons: suggestion.reasons,
+      matched: suggestion.matched,
+      model: suggestion.model,
+      quality: {
+        completed_count: suggestion.quality.completed_count,
+        rollback_count: suggestion.quality.rollback_count,
+      },
+    })),
+    total: suggestions.length,
+    criteria: {
+      task_type: normalizeToken(args.task_type) || null,
+      required_strengths: normalizeTokenList(args.required_strengths),
+      preferred_provider: normalizeToken(args.preferred_provider) || null,
+      preferred_family: normalizeToken(args.preferred_family) || null,
+      execution_mode: executionMode,
+      cost_tier: costTier || null,
+      latency_tier: latencyTier || null,
+      require_online: requireOnline,
+      include_requesting_agent: includeRequestingAgent,
+      exclude_agent_ids: [...excludedAgentIds],
+    },
+  };
+}
+
 export const agentTools = {
   register_agent: {
     description: 'Register an agent with the hub. Call this first before using other tools.',
@@ -758,6 +1052,10 @@ export const agentTools = {
             source: { type: 'string', enum: ['client_auto', 'client_declared', 'server_inferred'] },
             detected_at: { type: 'number' },
             notes: { type: 'string' },
+            model: {
+              type: 'object',
+              description: 'Optional model identity/capability profile for model-aware orchestration',
+            },
           },
         },
       },
@@ -783,6 +1081,10 @@ export const agentTools = {
             source: { type: 'string', enum: ['client_auto', 'client_declared', 'server_inferred'] },
             detected_at: { type: 'number' },
             notes: { type: 'string' },
+            model: {
+              type: 'object',
+              description: 'Optional model identity/capability profile for model-aware orchestration',
+            },
           },
         },
       },
@@ -802,6 +1104,36 @@ export const agentTools = {
       },
     },
     handler: handleListAgents,
+  },
+  suggest_agents: {
+    description: 'Rank registered agents for a task by model profile, runtime compatibility, online status, and quality metrics.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat/activity)' },
+        task_type: { type: 'string', description: 'Desired task type, e.g. coding, review, research, planning, synthesis' },
+        required_strengths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Model strengths required or preferred for this task',
+        },
+        preferred_provider: { type: 'string', description: 'Preferred model provider/runtime, e.g. codex, claude, custom' },
+        preferred_family: { type: 'string', description: 'Preferred model family' },
+        execution_mode: { type: 'string', enum: ['any', 'repo', 'isolated'], description: 'Required workspace execution profile' },
+        cost_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model cost tier' },
+        latency_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model latency tier' },
+        require_online: { type: 'boolean', description: 'Only include agents seen online in the last 5 minutes (default true)' },
+        include_requesting_agent: { type: 'boolean', description: 'Allow the requesting agent to be returned (default false)' },
+        exclude_agent_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Additional agent IDs to exclude from suggestions',
+        },
+        limit: { type: 'number', description: 'Max suggestions to return (default 10, max 50)' },
+        response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'compact includes reasons; tiny/nano reduce tokens' },
+      },
+    },
+    handler: handleSuggestAgents,
   },
   get_onboarding: {
     description: 'Get protocol onboarding and feature guide after registration.',
