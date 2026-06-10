@@ -5,6 +5,7 @@ import {
   getStreamEventWatermark,
   heartbeat,
   listArtifacts,
+  listAgents,
   listSloAlerts,
   listStreamEventsAfter,
   listTasks,
@@ -14,7 +15,7 @@ import { sha256Hex } from '../utils.js';
 import { handleGetMemoryDigest } from './memory.js';
 import { handleReadSignalFeed } from './signals.js';
 
-const DIGEST_SECTIONS = ['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory'] as const;
+const DIGEST_SECTIONS = ['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory', 'agents'] as const;
 const EVENT_STREAMS = ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as const;
 
 type DigestSection = (typeof DIGEST_SECTIONS)[number];
@@ -28,7 +29,7 @@ function normalizeMode(mode?: string): DigestMode {
 }
 
 function normalizeSections(input?: unknown): DigestSection[] {
-  if (!Array.isArray(input) || input.length === 0) return ['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory'];
+  if (!Array.isArray(input) || input.length === 0) return ['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory', 'agents'];
   const sections = [...new Set(input
     .map((value) => String(value || '').toLowerCase().trim())
     .filter((value): value is DigestSection => DIGEST_SECTIONS.includes(value as DigestSection)))];
@@ -67,6 +68,98 @@ function preview(value: unknown, max = 120): string {
 
 function tinyDigest(row: unknown, size = 12): string {
   return sha256Hex(JSON.stringify(row)).slice(0, size);
+}
+
+function normalizeToken(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function countTopValues(values: Array<string | undefined | null>, limit = 10): Array<{ value: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const normalized = normalizeToken(value);
+    if (!normalized) continue;
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function parseAgentModel(raw: string | undefined): Record<string, any> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, any>;
+    return parsed && typeof parsed.model === 'object' ? parsed.model : null;
+  } catch {
+    return null;
+  }
+}
+
+function summarizeAgents(limit: number, mode: DigestMode) {
+  const agents = listAgents({ limit });
+  const now = Date.now();
+  const onlineCutoff = now - (5 * 60 * 1000);
+  const models = agents.map((agent) => parseAgentModel(agent.runtime_profile_json));
+  const summary = {
+    total: agents.length,
+    online_5m: agents.filter((agent) => agent.status === 'online' && agent.last_seen >= onlineCutoff).length,
+    runtime_repo: agents.filter((agent) => agent.runtime_mode === 'repo').length,
+    runtime_isolated: agents.filter((agent) => agent.runtime_mode === 'isolated').length,
+    runtime_unknown: agents.filter((agent) => agent.runtime_mode === 'unknown').length,
+    model_profiles: models.filter(Boolean).length,
+    providers: countTopValues(models.map((model) => model?.provider)),
+    families: countTopValues(models.map((model) => model?.family)),
+  };
+  if (mode === 'nano') {
+    return {
+      c: {
+        t: summary.total,
+        o: summary.online_5m,
+        r: summary.runtime_repo,
+        i: summary.runtime_isolated,
+        u: summary.runtime_unknown,
+        m: summary.model_profiles,
+      },
+      p: summary.providers.map((row) => [row.value, row.count]),
+      a: agents.map((agent, index) => [agent.id, agent.runtime_mode, models[index]?.provider || null, models[index]?.id || null]),
+    };
+  }
+  if (mode === 'tiny') {
+    return {
+      summary,
+      agents: agents.map((agent, index) => ({
+        id: agent.id,
+        type: agent.type,
+        runtime_mode: agent.runtime_mode,
+        model: models[index] ? {
+          provider: models[index]?.provider,
+          id: models[index]?.id,
+          family: models[index]?.family,
+        } : null,
+      })),
+    };
+  }
+  return {
+    summary,
+    agents: agents.map((agent, index) => ({
+      id: agent.id,
+      name: agent.name,
+      type: agent.type,
+      lifecycle: agent.lifecycle,
+      runtime_mode: agent.runtime_mode,
+      status: agent.status,
+      last_seen: agent.last_seen,
+      model: models[index] ? {
+        provider: models[index]?.provider,
+        id: models[index]?.id,
+        family: models[index]?.family,
+        strengths: Array.isArray(models[index]?.strengths) ? models[index]?.strengths.slice(0, 8) : undefined,
+        task_types: Array.isArray(models[index]?.task_types) ? models[index]?.task_types.slice(0, 8) : undefined,
+      } : null,
+    })),
+  };
 }
 
 function summarizeTasks(agentId: string, namespace: string | undefined, limit: number, mode: DigestMode) {
@@ -250,6 +343,7 @@ export function handleGetHubDigest(args: {
       ? { c: memoryDigest.c || 0, m: memoryDigest.m || [] }
       : { count: memoryDigest.count || 0, namespace: memoryDigest.namespace || null, memories: memoryDigest.memories || [] };
   }
+  if (sections.includes('agents')) result.agents = summarizeAgents(limit, mode);
 
   logActivity(args.agent_id, 'get_hub_digest', `sections=${sections.join(',')} limit=${limit} mode=${mode}`, { emit_stream_event: false });
   if (mode === 'nano') return { s: sections, d: result };
@@ -258,7 +352,7 @@ export function handleGetHubDigest(args: {
 
 export const digestTools = {
   get_hub_digest: {
-    description: 'Get a bounded cross-source hub summary for low-token agent loops: signals, event deltas, assigned tasks, context, memory, activity, artifacts, and SLOs.',
+    description: 'Get a bounded cross-source hub summary for low-token agent loops: signals, event deltas, assigned tasks, context, memory, activity, artifacts, agents, and SLOs.',
     inputSchema: {
       type: 'object' as const,
       properties: {

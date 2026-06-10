@@ -1133,7 +1133,7 @@ function registerTools(server: McpServer) {
     digestTools.get_hub_digest.description,
     {
       agent_id: z.string().describe('Your agent ID'),
-      sections: z.array(z.enum(['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory'])).optional().describe('Optional digest sections; defaults to all'),
+      sections: z.array(z.enum(['signals', 'events', 'tasks', 'context', 'activity', 'artifacts', 'slo', 'memory', 'agents'])).optional().describe('Optional digest sections; defaults to all'),
       streams: z.array(z.enum(['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'])).optional().describe('Event streams used by the events section'),
       cursor: z.string().optional().describe('Event cursor for the events section ("e:<id>"). Omit to start at current edge.'),
       namespace: z.string().optional().describe('Optional namespace for tasks/context/artifacts sections'),
