@@ -683,10 +683,15 @@ export function handleListAgents(args: {
   if (args.response_mode === 'summary') {
     const now = Date.now();
     const onlineCutoff = now - (5 * 60 * 1000);
+    const runtimeProfiles = agents.map((agent) => parseRuntimeProfileJson(agent.runtime_profile_json));
+    const modelProfiles = runtimeProfiles
+      .map((profile) => profile.model)
+      .filter((model): model is AgentModelProfile => Boolean(model));
     return {
       agents: [],
       summary: {
         total: agents.length,
+        sample_size: agents.length,
         online: agents.filter((agent) => agent.status === 'online').length,
         offline: agents.filter((agent) => agent.status !== 'online').length,
         online_5m: agents.filter((agent) => agent.last_seen >= onlineCutoff).length,
@@ -695,6 +700,13 @@ export function handleListAgents(args: {
         runtime_repo: agents.filter((agent) => agent.runtime_mode === 'repo').length,
         runtime_isolated: agents.filter((agent) => agent.runtime_mode === 'isolated').length,
         runtime_unknown: agents.filter((agent) => agent.runtime_mode === 'unknown').length,
+        model_profiles: modelProfiles.length,
+        model_providers: countTopValues(modelProfiles.map((model) => model.provider)),
+        model_families: countTopValues(modelProfiles.map((model) => model.family)),
+        model_cost_tiers: countTopValues(modelProfiles.map((model) => model.cost_tier)),
+        model_latency_tiers: countTopValues(modelProfiles.map((model) => model.latency_tier)),
+        model_strengths: countTopListValues(modelProfiles.map((model) => model.strengths)),
+        model_task_types: countTopListValues(modelProfiles.map((model) => model.task_types)),
       },
     };
   }
@@ -743,6 +755,25 @@ function normalizeToken(value: unknown): string {
 function normalizeTokenList(values: unknown): string[] {
   if (!Array.isArray(values)) return [];
   return [...new Set(values.map(normalizeToken).filter(Boolean))];
+}
+
+function countTopValues(values: Array<string | undefined | null>, limit = 12): Array<{ value: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const normalized = normalizeToken(value);
+    if (!normalized) continue;
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function countTopListValues(values: Array<string[] | undefined>, limit = 12): Array<{ value: string; count: number }> {
+  const flattened: string[] = [];
+  for (const list of values) flattened.push(...normalizeTokenList(list));
+  return countTopValues(flattened, limit);
 }
 
 function splitCapabilities(capabilities: string): Set<string> {
@@ -1101,7 +1132,7 @@ export const agentTools = {
         agent_id: { type: 'string', description: 'Your agent ID (for heartbeat)' },
         limit: { type: 'number', description: 'Max rows to return (default 100)' },
         offset: { type: 'number', description: 'Row offset for pagination (default 0)' },
-        response_mode: { type: 'string', enum: ['full', 'compact', 'summary'], description: 'compact trims agent fields; summary returns counts only' },
+        response_mode: { type: 'string', enum: ['full', 'compact', 'summary'], description: 'compact trims fields; summary returns runtime/model aggregate counts' },
       },
     },
     handler: handleListAgents,

@@ -851,7 +851,7 @@ function registerTools(server: McpServer) {
       agent_id: z.string().optional().describe('Your agent ID (for heartbeat)'),
       limit: z.number().optional().describe('Max rows to return (default 100)'),
       offset: z.number().optional().describe('Row offset for pagination (default 0)'),
-      response_mode: z.enum(['full', 'compact', 'summary']).optional().describe('compact trims fields, summary returns counts only'),
+      response_mode: z.enum(['full', 'compact', 'summary']).optional().describe('compact trims fields, summary returns runtime/model aggregate counts'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('list_agents', (args) => handleListAgents(args as any))
