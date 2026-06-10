@@ -177,6 +177,14 @@ function compactThreadPreflight(thread, previewChars = 180) {
   };
 }
 
+function selectNegotiatedReadMode(registration) {
+  const negotiated = registration?.capability_negotiation?.negotiated
+    || registration?.registration?.contract_profile
+    || {};
+  const mode = negotiated.preferred_read_mode;
+  return ['nano', 'tiny', 'compact'].includes(mode) ? mode : 'tiny';
+}
+
 function serializePreflight(preflight) {
   const full = JSON.stringify(preflight);
   if (full.length <= MAX_PREFLIGHT_CHARS) {
@@ -649,6 +657,9 @@ function compactResult(opts, prompt, backendResult) {
       json_valid: backendResult.json_valid,
       phase_timings_ms: backendResult.phase_timings_ms,
       rpc_retries: backendResult.rpc_retries,
+      negotiated_read_mode: backendResult.negotiated_read_mode,
+      preflight_digest_mode: backendResult.preflight_digest_mode,
+      preflight_thread_mode: backendResult.preflight_thread_mode,
       preflight_truncated: backendResult.preflight_truncated,
       preflight_original_chars: backendResult.preflight_original_chars,
       context_error: backendResult.context_error,
@@ -821,7 +832,7 @@ async function main() {
       onboarding_mode: opts.onboardingMode,
       runtime_profile: runtimeProfile,
       client_capabilities: {
-        response_modes: ['tiny', 'compact'],
+        response_modes: ['nano', 'tiny', 'compact'],
         blob_resolve: true,
         artifact_tickets: false,
         snapshot_reads: true,
@@ -830,6 +841,7 @@ async function main() {
     };
     const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', registerArgs));
     authToken = registration?.auth?.token || '';
+    const negotiatedReadMode = selectNegotiatedReadMode(registration);
     if (!authToken) {
       const errorCode = registration?.error_code ? ` error_code=${registration.error_code}` : '';
       const registerError = registration?.error ? ` error=${truncate(registration.error, 240)}` : '';
@@ -845,7 +857,7 @@ async function main() {
       auth_token: authToken,
       sections: ['signals', 'events', 'memory'],
       memory_namespace: opts.memoryNamespace || undefined,
-      response_mode: 'tiny',
+      response_mode: negotiatedReadMode,
       limit_per_source: 5,
     }));
     let threadTail = null;
@@ -854,6 +866,7 @@ async function main() {
         agent_id: opts.agentId,
         auth_token: authToken,
         thread_id: opts.threadId,
+        // Keep compact here: compactThreadPreflight depends on content_preview.
         response_mode: 'compact',
         limit: opts.threadTail,
       })).catch((error) => ({
@@ -910,6 +923,9 @@ async function main() {
     backendResult.heartbeat_count = runState.heartbeatCount;
     backendResult.publish_attempts = runState.publishAttempts;
     backendResult.publish_failures = runState.publishFailures;
+    backendResult.negotiated_read_mode = negotiatedReadMode;
+    backendResult.preflight_digest_mode = negotiatedReadMode;
+    backendResult.preflight_thread_mode = opts.threadId && opts.threadTail > 0 ? 'compact' : null;
     backendResult.preflight_truncated = preflightSerialized.truncated;
     backendResult.preflight_original_chars = preflightSerialized.original_chars;
     if (renewalSummary) {
