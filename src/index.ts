@@ -1427,6 +1427,8 @@ function registerTools(server: McpServer) {
       include_downloads: z.boolean().optional().describe('Include one-time artifact download tickets in handoff response'),
       download_ttl_sec: z.number().optional().describe('Optional ticket TTL in seconds when include_downloads=true'),
       only_ready_downloads: z.boolean().optional().describe('If true (default), include tickets only for uploaded artifacts'),
+      include_routing_suggestions: z.boolean().optional().describe('If true, include tiny suggest_task_agents output for this task'),
+      routing_limit: z.number().optional().describe('Max routing suggestions to include (default 5, max 20)'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('get_task_handoff', (args) => handleGetTaskHandoff(args as any))

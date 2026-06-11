@@ -1081,6 +1081,8 @@ export function handleGetTaskHandoff(args: {
   include_downloads?: boolean;
   download_ttl_sec?: number;
   only_ready_downloads?: boolean;
+  include_routing_suggestions?: boolean;
+  routing_limit?: number;
 }) {
   heartbeat(args.agent_id);
   const task = getTaskWithDependencies(args.task_id);
@@ -1117,14 +1119,23 @@ export function handleGetTaskHandoff(args: {
       limit: artifactLimit,
     })
     : null;
+  const routingSuggestions = args.include_routing_suggestions
+    ? handleSuggestTaskAgents({
+      requesting_agent: args.agent_id,
+      task_id: task.id,
+      limit: Number.isFinite(args.routing_limit) ? Math.max(1, Math.min(20, Math.floor(Number(args.routing_limit)))) : 5,
+      response_mode: 'tiny',
+    })
+    : null;
   const evidenceRefs = evidence.map((row) => row.evidence_ref);
   const downloadMeta = downloads
     ? (downloads.success ? `downloads=${downloads.downloads.length}` : `downloads_error=${downloads.error_code}`)
     : 'downloads=off';
+  const routingMeta = routingSuggestions ? `routing=${(routingSuggestions as any).total ?? 0}` : 'routing=off';
   logActivity(
     args.agent_id,
     'get_task_handoff',
-    `task_id=${task.id} mode=${args.response_mode || 'full'} deps=${task.depends_on.length} evidence=${evidenceRefs.length} artifacts=${artifacts.length} ${downloadMeta}`
+    `task_id=${task.id} mode=${args.response_mode || 'full'} deps=${task.depends_on.length} evidence=${evidenceRefs.length} artifacts=${artifacts.length} ${downloadMeta} ${routingMeta}`
   );
 
   if (args.response_mode === 'tiny') {
@@ -1160,6 +1171,11 @@ export function handleGetTaskHandoff(args: {
       artifact_downloads_error: downloads && !downloads.success ? {
         error_code: downloads.error_code,
         error: downloads.error,
+      } : undefined,
+      routing_suggestions: routingSuggestions ? {
+        inferred: (routingSuggestions as any).inferred,
+        suggestions: (routingSuggestions as any).suggestions || [],
+        total: (routingSuggestions as any).total || 0,
       } : undefined,
     };
   }
@@ -1202,6 +1218,11 @@ export function handleGetTaskHandoff(args: {
         error_code: downloads.error_code,
         error: downloads.error,
       } : undefined,
+      routing_suggestions: routingSuggestions ? {
+        inferred: (routingSuggestions as any).inferred,
+        suggestions: (routingSuggestions as any).suggestions || [],
+        total: (routingSuggestions as any).total || 0,
+      } : undefined,
     };
   }
 
@@ -1218,6 +1239,7 @@ export function handleGetTaskHandoff(args: {
       error_code: downloads.error_code,
       error: downloads.error,
     } : undefined,
+    routing_suggestions: routingSuggestions,
   };
 }
 
@@ -1460,6 +1482,8 @@ export const taskTools = {
         include_downloads: { type: 'boolean', description: 'Include one-time artifact download tickets in handoff response (default false)' },
         download_ttl_sec: { type: 'number', description: 'Optional download ticket TTL in seconds' },
         only_ready_downloads: { type: 'boolean', description: 'If true (default), emit tickets only for ready/uploaded artifacts' },
+        include_routing_suggestions: { type: 'boolean', description: 'If true, include tiny suggest_task_agents output for this task' },
+        routing_limit: { type: 'number', description: 'Max routing suggestions to include (default 5, max 20)' },
       },
       required: ['task_id', 'agent_id'],
     },
