@@ -138,7 +138,7 @@ function jsonRpcErrorResponse(id: unknown, code: number, message: string, data?:
 
 function extractAgentAuthPayload(args: Record<string, unknown>): { agentId: string | null; authToken: string | null } {
   const candidateAgentKeys = ['agent_id', 'from_agent', 'created_by', 'requesting_agent'] as const;
-  const candidateTokenKeys = ['auth_token', 'token'] as const;
+  const candidateTokenKeys = ['auth_token'] as const;
   let agentId: string | null = null;
   let authToken: string | null = null;
 
@@ -511,6 +511,14 @@ function sanitizeArtifactId(value: string): string {
 function artifactPathForId(artifactId: string): string {
   const safeId = sanitizeArtifactId(artifactId);
   return path.join(ARTIFACTS_DIR, safeId);
+}
+
+function contentDispositionFilename(value: string, fallback: string): string {
+  const normalized = String(value || fallback || 'artifact.bin')
+    .replace(/[\r\n"]/g, '_')
+    .replace(/[\\/:*?<>|]/g, '_')
+    .trim();
+  return normalized.length > 0 ? normalized.slice(0, 180) : fallback;
 }
 
 function issueArtifactTicket(args: {
@@ -1903,11 +1911,17 @@ const artifactUploadRaw = express.raw({ type: '*/*', limit: ARTIFACT_MAX_BYTES }
 app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) => {
   try {
     const artifactId = sanitizeArtifactId(req.params.artifactId || '');
-    const tokenCandidate = typeof req.query.token === 'string'
-      ? req.query.token
-      : (typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '');
+    if (typeof req.query.token === 'string' && req.query.token.trim().length > 0) {
+      res.status(401).json({
+        success: false,
+        error_code: 'QUERY_ARTIFACT_TOKEN_DENIED',
+        error: 'artifact ticket query parameter is disabled; use X-Artifact-Token header',
+      });
+      return;
+    }
+    const tokenCandidate = typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '';
     if (!artifactId || !tokenCandidate) {
-      res.status(400).json({ success: false, error: 'artifactId and token are required' });
+      res.status(400).json({ success: false, error: 'artifactId and X-Artifact-Token are required' });
       return;
     }
     const ticket = consumeArtifactTicket(tokenCandidate, 'upload', artifactId);
@@ -1970,11 +1984,17 @@ app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) =>
 app.get('/artifacts/download/:artifactId', async (req, res) => {
   try {
     const artifactId = sanitizeArtifactId(req.params.artifactId || '');
-    const tokenCandidate = typeof req.query.token === 'string'
-      ? req.query.token
-      : (typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '');
+    if (typeof req.query.token === 'string' && req.query.token.trim().length > 0) {
+      res.status(401).json({
+        success: false,
+        error_code: 'QUERY_ARTIFACT_TOKEN_DENIED',
+        error: 'artifact ticket query parameter is disabled; use X-Artifact-Token header',
+      });
+      return;
+    }
+    const tokenCandidate = typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '';
     if (!artifactId || !tokenCandidate) {
-      res.status(400).json({ success: false, error: 'artifactId and token are required' });
+      res.status(400).json({ success: false, error: 'artifactId and X-Artifact-Token are required' });
       return;
     }
     const ticket = consumeArtifactTicket(tokenCandidate, 'download', artifactId);
@@ -1993,7 +2013,7 @@ app.get('/artifacts/download/:artifactId', async (req, res) => {
     logActivity(ticket.agent_id, 'artifact_download_http', `artifact_id=${artifactId} bytes=${content.length}`);
     res.setHeader('Content-Type', artifact.mime_type || 'application/octet-stream');
     res.setHeader('Content-Length', String(content.length));
-    res.setHeader('Content-Disposition', `attachment; filename=\"${artifact.name || `${artifactId}.bin`}\"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${contentDispositionFilename(artifact.name, `${artifactId}.bin`)}"`);
     res.send(content);
   } catch (error) {
     console.error('[artifacts/download] error', error);

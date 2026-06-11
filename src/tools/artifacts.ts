@@ -39,6 +39,7 @@ type TaskArtifactDownloadEntry = {
   download: {
     method: 'GET';
     url: string;
+    headers: Record<string, string>;
     expires_at: number;
   };
 };
@@ -112,12 +113,16 @@ function normalizeLimit(value: number | undefined): number | null {
   return Math.max(1, Math.min(500, Math.floor(Number(value))));
 }
 
-function buildUploadUrl(artifactId: string, token: string): string {
-  return `${DEFAULT_BASE_URL}/artifacts/upload/${artifactId}?token=${encodeURIComponent(token)}`;
+function buildUploadUrl(artifactId: string): string {
+  return `${DEFAULT_BASE_URL}/artifacts/upload/${artifactId}`;
 }
 
-function buildDownloadUrl(artifactId: string, token: string): string {
-  return `${DEFAULT_BASE_URL}/artifacts/download/${artifactId}?token=${encodeURIComponent(token)}`;
+function buildDownloadUrl(artifactId: string): string {
+  return `${DEFAULT_BASE_URL}/artifacts/download/${artifactId}`;
+}
+
+function artifactTicketHeaders(token: string): Record<string, string> {
+  return { 'X-Artifact-Token': token };
 }
 
 export function configureArtifactTicketIssuer(issuer: (args: IssueArtifactTicketArgs) => IssuedArtifactTicket) {
@@ -184,7 +189,8 @@ export function handleCreateArtifactUpload(args: {
       artifact,
       upload: {
         method: 'POST',
-        url: buildUploadUrl(artifactId, ticket.token),
+        url: buildUploadUrl(artifactId),
+        headers: artifactTicketHeaders(ticket.token),
         expires_at: ticket.expires_at,
         max_bytes: maxBytes,
       },
@@ -256,7 +262,8 @@ export function handleCreateArtifactDownload(args: {
       artifact,
       download: {
         method: 'GET',
-        url: buildDownloadUrl(artifactId, ticket.token),
+        url: buildDownloadUrl(artifactId),
+        headers: artifactTicketHeaders(ticket.token),
         expires_at: ticket.expires_at,
       },
     };
@@ -350,7 +357,8 @@ export function buildTaskArtifactDownloads(args: {
       ready,
       download: {
         method: 'GET',
-        url: buildDownloadUrl(row.artifact_id, ticket.token),
+        url: buildDownloadUrl(row.artifact_id),
+        headers: artifactTicketHeaders(ticket.token),
         expires_at: ticket.expires_at,
       },
     });

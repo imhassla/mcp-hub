@@ -148,7 +148,11 @@ export function handleSendMessage(args: {
     );
     const target = args.to_agent || 'broadcast';
     const savedChars = args.content.length - compressed.content.length;
-    logActivity(args.from_agent, 'send_message', `Message to ${target}: ${compressed.content.slice(0, 100)} (compressed=${compressed.compressed} saved_chars=${savedChars})`);
+    logActivity(
+      args.from_agent,
+      'send_message',
+      `Message to ${target}: chars=${compressed.content.length} digest=${sha256Hex(compressed.content).slice(0, 16)} compressed=${compressed.compressed} saved_chars=${savedChars}`
+    );
     return {
       success: true,
       message,
