@@ -104,6 +104,9 @@ function summarizeAgents(limit: number, mode: DigestMode) {
   const models = agents.map((agent) => parseAgentModel(agent.runtime_profile_json));
   const summary = {
     total: agents.length,
+    sample_size: agents.length,
+    limit,
+    truncated: agents.length >= limit,
     online_5m: agents.filter((agent) => agent.status === 'online' && agent.last_seen >= onlineCutoff).length,
     runtime_repo: agents.filter((agent) => agent.runtime_mode === 'repo').length,
     runtime_isolated: agents.filter((agent) => agent.runtime_mode === 'isolated').length,
@@ -116,6 +119,9 @@ function summarizeAgents(limit: number, mode: DigestMode) {
     return {
       c: {
         t: summary.total,
+        z: summary.sample_size,
+        l: summary.limit,
+        x: summary.truncated ? 1 : 0,
         o: summary.online_5m,
         r: summary.runtime_repo,
         i: summary.runtime_isolated,

@@ -1213,6 +1213,8 @@ export function updateTask(id: number, updates: {
   const tx = d.transaction(() => {
     if (fields.length > 0) {
       d.prepare(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+    } else if (hasDependencyUpdate) {
+      d.prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now, id);
     }
     if (hasDependencyUpdate) {
       const deps = normalizeDependencyIds(id, updates.depends_on);

@@ -692,6 +692,9 @@ export function handleListAgents(args: {
       summary: {
         total: agents.length,
         sample_size: agents.length,
+        limit,
+        offset,
+        truncated: agents.length >= limit,
         online: agents.filter((agent) => agent.status === 'online').length,
         offline: agents.filter((agent) => agent.status !== 'online').length,
         online_5m: agents.filter((agent) => agent.last_seen >= onlineCutoff).length,
