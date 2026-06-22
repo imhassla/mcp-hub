@@ -21,6 +21,10 @@ function parseArgs(argv) {
     timeoutMs: Number(process.env.HUB_EVENTS_TIMEOUT_MS || 0),
     maxUpdates: Number(process.env.HUB_EVENTS_MAX_UPDATES || 0),
     pollMs: Number(process.env.HUB_EVENTS_POLL_MS || 0),
+    reconnect: process.env.HUB_EVENTS_NO_RECONNECT ? false : true,
+    maxReconnects: Number(process.env.HUB_EVENTS_MAX_RECONNECTS || 0),
+    reconnectMinMs: Number(process.env.HUB_EVENTS_RECONNECT_MIN_MS || 500),
+    reconnectMaxMs: Number(process.env.HUB_EVENTS_RECONNECT_MAX_MS || 15000),
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -42,6 +46,8 @@ function parseArgs(argv) {
     else if (arg === '--max-updates') out.maxUpdates = Number(next());
     else if (arg === '--once') out.once = true;
     else if (arg === '--include-heartbeats') out.includeHeartbeats = true;
+    else if (arg === '--no-reconnect') out.reconnect = false;
+    else if (arg === '--max-reconnects') out.maxReconnects = Number(next());
     else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: hub-events-client.mjs --agent-id ID --auth-token TOKEN [options]
 
@@ -59,6 +65,8 @@ Options:
   --max-updates N      Exit after N update events
   --timeout-ms MS      Abort after timeout
   --include-heartbeats Print heartbeat events too
+  --no-reconnect       Exit on stream drop instead of auto-reconnecting (legacy single-shot)
+  --max-reconnects N   Stop after N reconnect attempts (0 = unlimited, default)
 
 Output: JSON Lines {event,id,cursor,data,received_at}`);
       process.exit(0);
@@ -87,6 +95,13 @@ function cursorFromPayload(payload, eventId) {
   }
   if (eventId !== null && eventId !== undefined && eventId !== '') return `e:${Number(eventId).toString(36)}`;
   return '';
+}
+
+function lastEventIdFromCursor(cursor) {
+  const match = String(cursor || '').trim().match(/^e:([0-9a-z]+)$/i);
+  if (!match) return '';
+  const id = Number.parseInt(match[1], 36);
+  return Number.isFinite(id) && id >= 0 ? String(id) : '';
 }
 
 async function readCursorFile(filePath) {
@@ -135,40 +150,50 @@ async function main() {
   if (!['nano', 'compact'].includes(opts.responseMode)) throw new Error('--response-mode must be nano|compact');
 
   const storedCursor = await readCursorFile(opts.cursorFile);
-  const cursor = opts.cursor || storedCursor;
-  const eventsUrl = toEventsUrl(opts.endpoint);
-  eventsUrl.searchParams.set('agent_id', opts.agentId);
-  eventsUrl.searchParams.set('streams', opts.streams);
-  eventsUrl.searchParams.set('response_mode', opts.responseMode);
-  if (cursor) eventsUrl.searchParams.set('cursor', cursor);
-  if (Number.isFinite(opts.pollMs) && opts.pollMs > 0) eventsUrl.searchParams.set('poll_ms', String(Math.floor(opts.pollMs)));
+  let latestCursor = opts.cursor || storedCursor || '';
+  const eventsBase = toEventsUrl(opts.endpoint);
 
-  const controller = new AbortController();
+  let updateCount = 0;
+  let terminal = false;            // once/max-updates/timeout/signal reached -> do not reconnect
+  let currentController = null;
+  const abortCurrent = () => { try { currentController?.abort(); } catch { /* noop */ } };
+  const stop = () => { terminal = true; abortCurrent(); };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
   const timeout = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
-    ? setTimeout(() => controller.abort(new Error(`timeout ${opts.timeoutMs}ms`)), opts.timeoutMs)
+    ? setTimeout(() => { terminal = true; abortCurrent(); }, opts.timeoutMs)
     : null;
   timeout?.unref();
 
-  let updateCount = 0;
-  const stop = () => controller.abort();
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  // One connection attempt. Returns 'terminal' (stop) or 'dropped' (reconnect).
+  const streamOnce = async () => {
+    const url = new URL(eventsBase);
+    url.searchParams.set('agent_id', opts.agentId);
+    url.searchParams.set('streams', opts.streams);
+    url.searchParams.set('response_mode', opts.responseMode);
+    if (latestCursor) url.searchParams.set('cursor', latestCursor); // resume without gaps
+    if (Number.isFinite(opts.pollMs) && opts.pollMs > 0) url.searchParams.set('poll_ms', String(Math.floor(opts.pollMs)));
 
-  const res = await fetch(eventsUrl, {
-    signal: controller.signal,
-    headers: {
-      accept: 'text/event-stream',
-      authorization: `Bearer ${opts.authToken}`,
-    },
-  });
-  if (!res.ok) {
-    throw new Error(`events HTTP ${res.status}: ${await res.text()}`);
-  }
-  if (!res.body) throw new Error('events response body is empty');
+    currentController = new AbortController();
+    const lastEventId = lastEventIdFromCursor(latestCursor);
+    const res = await fetch(url, {
+      signal: currentController.signal,
+      headers: {
+        accept: 'text/event-stream',
+        authorization: `Bearer ${opts.authToken}`,
+        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      const err = new Error(`events HTTP ${res.status}: ${body}`);
+      if (res.status !== 429 && res.status < 500) { terminal = true; } // 4xx (auth/bad-req) = fatal
+      throw err;
+    }
+    if (!res.body) throw new Error('events response body is empty');
 
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
+    const decoder = new TextDecoder();
+    let buffer = '';
     for await (const chunk of res.body) {
       buffer += decoder.decode(chunk, { stream: true });
       let boundary;
@@ -177,7 +202,7 @@ async function main() {
         buffer = buffer.slice(boundary + 2);
         const frame = parseSseFrame(rawFrame);
         const nextCursor = cursorFromPayload(frame.data, frame.id);
-        if (nextCursor) await writeCursorFile(opts.cursorFile, nextCursor);
+        if (nextCursor) { latestCursor = nextCursor; await writeCursorFile(opts.cursorFile, nextCursor); }
         if (frame.event === 'update') updateCount += 1;
         if (frame.event !== 'heartbeat' || opts.includeHeartbeats) {
           process.stdout.write(`${JSON.stringify({
@@ -189,13 +214,32 @@ async function main() {
           })}\n`);
         }
         if (frame.event === 'update' && (opts.once || (opts.maxUpdates > 0 && updateCount >= opts.maxUpdates))) {
-          controller.abort();
-          return;
+          terminal = true;
+          abortCurrent();
+          return 'terminal';
         }
       }
     }
-  } catch (error) {
-    if (!controller.signal.aborted) throw error;
+    return 'dropped'; // server closed the stream (drain/heartbeat/restart) without a terminal condition
+  };
+
+  let reconnects = 0;
+  try {
+    while (true) {
+      try {
+        const reason = await streamOnce();
+        if (reason === 'terminal' || terminal) break;
+      } catch (error) {
+        if (terminal) break;                 // timeout/signal/fatal status
+        if (!opts.reconnect) throw error;    // legacy single-shot
+        process.stderr.write(`[reconnect] ${String(error?.message || error)}\n`);
+      }
+      if (terminal || !opts.reconnect) break;
+      if (opts.maxReconnects > 0 && reconnects >= opts.maxReconnects) break;
+      reconnects += 1;
+      const backoff = Math.min(opts.reconnectMaxMs, opts.reconnectMinMs * 2 ** Math.min(reconnects, 6));
+      await new Promise((r) => { const t = setTimeout(r, backoff); t.unref?.(); });
+    }
   } finally {
     if (timeout) clearTimeout(timeout);
     process.off('SIGINT', stop);
