@@ -23,9 +23,9 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createMcpClient } from './lib/mcp-client.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const HTTP_TIMEOUT_MS = 15_000;
 
 function parseArgs(argv) {
   const o = {
@@ -111,66 +111,6 @@ async function writeCursorFile(filePath, cursor) {
   await fs.writeFile(filePath, `${cursor}\n`);
 }
 
-// ---- minimal MCP client with session-recovery (mirrors runner createMcpClient) ----
-async function postRpc(endpoint, body, sessionId) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...(sessionId ? { 'mcp-session-id': sessionId } : {}) },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    let json = null;
-    if (text.trim()) {
-      const last = text.trim().split('\n').map((l) => l.replace(/^data: /, '')).filter(Boolean).pop();
-      json = JSON.parse(last);
-    }
-    return { res, json };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function createMcpClient(endpoint) {
-  let nextId = 1;
-  let sessionId = '';
-  const initializeSession = async () => {
-    const init = await postRpc(endpoint, { jsonrpc: '2.0', id: nextId++, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'hub-wake-hydrate', version: '1.0.0' } } });
-    const sid = init.res.headers.get('mcp-session-id');
-    if (!sid) throw new Error('initialize did not return mcp-session-id');
-    await postRpc(endpoint, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, sid);
-    sessionId = sid;
-  };
-  await initializeSession();
-  const isReinit = (json) => {
-    const e = json?.error;
-    if (!e) return false;
-    const t = `${e.code ?? ''} ${e.message ?? ''} ${JSON.stringify(e.data ?? '')}`.toLowerCase();
-    return t.includes('reinitialize_required') || (t.includes('session') && (t.includes('expired') || t.includes('not found') || t.includes('invalid')));
-  };
-  return {
-    async call(name, args) {
-      const body = { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name, arguments: args } };
-      let { json } = await postRpc(endpoint, body, sessionId);
-      if (isReinit(json)) { await initializeSession(); ({ json } = await postRpc(endpoint, body, sessionId)); }
-      if (json?.error) throw new Error(`MCP error: ${JSON.stringify(json.error)}`);
-      const text = json?.result?.content?.[0]?.text;
-      if (typeof text !== 'string') throw new Error(`missing payload: ${JSON.stringify(json)}`);
-      return JSON.parse(text);
-    },
-    async close() {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
-        await fetch(endpoint, { method: 'DELETE', signal: controller.signal, headers: { 'mcp-session-id': sessionId } }).catch(() => {}).finally(() => clearTimeout(timer));
-      } catch { /* noop */ }
-    },
-  };
-}
-
 const STREAM_TO_REF = {
   activity: 'activity',
   artifacts: 'artifacts',
@@ -192,7 +132,11 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const streams = opts.streams.split(',').map((s) => s.trim()).filter(Boolean);
   const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
-  const mcp = await createMcpClient(opts.endpoint);
+  const mcp = await createMcpClient(opts.endpoint, {
+    clientName: 'hub-wake-hydrate',
+    clientVersion: '1.0.0',
+    protocolVersion: '2025-06-18',
+  });
 
   let hydratedCursor = opts.cursor || await readCursorFile(opts.cursorFile); // fully hydrated through
   let pending = false;         // a wake arrived; hydrate scheduled/needed

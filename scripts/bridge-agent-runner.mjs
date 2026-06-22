@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createMcpClient as createMcpHttpClient } from './lib/mcp-client.mjs';
 
 const DEFAULT_ENDPOINT = process.env.ENDPOINT || process.env.MCP_ENDPOINT || 'http://127.0.0.1:3000/mcp';
 const MAX_CONTEXT_CHARS = Number(process.env.BRIDGE_CONTEXT_MAX_CHARS || 1900);
@@ -496,144 +497,16 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function extractMcpJson(text) {
-  const raw = String(text || '').trim();
-  if (!raw) return null;
-  if (raw.startsWith('{') || raw.startsWith('[')) return JSON.parse(raw);
-  const dataFrames = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('data:'))
-    .map((line) => line.slice(5).trim())
-    .filter((line) => line && line !== '[DONE]');
-  if (dataFrames.length === 0) {
-    throw new Error(`MCP response is not JSON or SSE data: ${truncate(raw, 200)}`);
-  }
-  return JSON.parse(dataFrames[dataFrames.length - 1]);
-}
-
-async function postRpc(endpoint, body, sessionId) {
-  let lastError;
-  for (let attempt = 0; attempt <= BRIDGE_HTTP_RETRIES; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), BRIDGE_HTTP_TIMEOUT_MS);
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-          ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
-        },
-        body: JSON.stringify(body),
-      });
-      const text = await res.text();
-      if (!res.ok) {
-        const error = new Error(`MCP HTTP ${res.status}: ${text}`);
-        if (res.status >= 500 && attempt < BRIDGE_HTTP_RETRIES) {
-          lastError = error;
-        } else {
-          throw error;
-        }
-      } else {
-        return { res, json: text.trim() ? extractMcpJson(text) : null, text };
-      }
-    } catch (error) {
-      lastError = controller.signal.aborted
-        ? new Error(`MCP HTTP request timed out after ${BRIDGE_HTTP_TIMEOUT_MS}ms`)
-        : error;
-      if (attempt >= BRIDGE_HTTP_RETRIES) throw lastError;
-    } finally {
-      clearTimeout(timer);
-    }
-    rpcRetries += 1;
-    await sleep(BRIDGE_HTTP_RETRY_DELAY_MS + Math.floor(Math.random() * BRIDGE_HTTP_RETRY_DELAY_MS));
-  }
-  throw lastError || new Error('MCP RPC failed');
-}
-
-function parseMcpPayload(json) {
-  if (json?.error) throw new Error(`MCP error: ${JSON.stringify(json.error)}`);
-  const text = json?.result?.content?.[0]?.text;
-  if (typeof text !== 'string') throw new Error(`Missing MCP tool payload: ${JSON.stringify(json)}`);
-  return JSON.parse(text);
-}
-
-function isReinitializeRequired(json) {
-  const error = json?.error;
-  if (!error) return false;
-  const text = `${error.code ?? ''} ${error.message ?? ''} ${JSON.stringify(error.data ?? '')}`.toLowerCase();
-  return text.includes('reinitialize_required')
-    || (text.includes('session') && (text.includes('expired') || text.includes('invalid') || text.includes('not found')));
-}
-
-function isRetryableJsonRpcError(json) {
-  const error = json?.error;
-  if (!error) return false;
-  const text = `${error.message ?? ''} ${JSON.stringify(error.data ?? '')}`.toLowerCase();
-  return error.code === -32603 && (
-    text.includes('temporar')
-    || text.includes('timeout')
-    || text.includes('busy')
-    || text.includes('retry')
-    || text.includes('transient')
-  );
-}
-
 async function createMcpClient(endpoint) {
-  let nextId = 1;
-  let sessionId = '';
-  async function initializeSession() {
-    const init = await postRpc(endpoint, {
-      jsonrpc: '2.0',
-      id: nextId++,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2025-06-18',
-        capabilities: {},
-        clientInfo: { name: 'bridge-agent-runner', version: '1.0.0' },
-      },
-    });
-    const nextSessionId = init.res.headers.get('mcp-session-id');
-    if (!nextSessionId) throw new Error('MCP initialize did not return mcp-session-id');
-    await postRpc(endpoint, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, nextSessionId);
-    sessionId = nextSessionId;
-  }
-  await initializeSession();
-  return {
-    get sessionId() {
-      return sessionId;
-    },
-    async call(name, args) {
-      const body = {
-        jsonrpc: '2.0',
-        id: nextId++,
-        method: 'tools/call',
-        params: { name, arguments: args },
-      };
-      let { json } = await postRpc(endpoint, body, sessionId);
-      if (isReinitializeRequired(json)) {
-        rpcRetries += 1;
-        await initializeSession();
-        ({ json } = await postRpc(endpoint, body, sessionId));
-      } else if (isRetryableJsonRpcError(json)) {
-        rpcRetries += 1;
-        await sleep(BRIDGE_HTTP_RETRY_DELAY_MS);
-        ({ json } = await postRpc(endpoint, body, sessionId));
-      }
-      return parseMcpPayload(json);
-    },
-    async close() {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), BRIDGE_HTTP_TIMEOUT_MS);
-      await fetch(endpoint, {
-        method: 'DELETE',
-        signal: controller.signal,
-        headers: { 'mcp-session-id': sessionId },
-      }).catch(() => {}).finally(() => clearTimeout(timer));
-    },
-  };
+  return createMcpHttpClient(endpoint, {
+    clientName: 'bridge-agent-runner',
+    clientVersion: '1.0.0',
+    protocolVersion: '2025-06-18',
+    httpRetries: BRIDGE_HTTP_RETRIES,
+    retryDelayMs: BRIDGE_HTTP_RETRY_DELAY_MS,
+    timeoutMs: BRIDGE_HTTP_TIMEOUT_MS,
+    onRetry: () => { rpcRetries += 1; },
+  });
 }
 
 function runProcess(command, args, options) {
