@@ -44,6 +44,7 @@ function parseArgs(argv) {
     namespace: `BRIDGE-${Date.now()}`,
     key: '',
     taskId: 0,
+    requireClaim: false,
     leaseSeconds: 600,
     prompt: '',
     promptFile: '',
@@ -83,6 +84,7 @@ function parseArgs(argv) {
     else if (arg === '--namespace') out.namespace = next();
     else if (arg === '--key') out.key = next();
     else if (arg === '--task-id') out.taskId = Number(next());
+    else if (arg === '--require-claim') out.requireClaim = true;
     else if (arg === '--lease-seconds') out.leaseSeconds = Number(next());
     else if (arg === '--prompt') out.prompt = next();
     else if (arg === '--prompt-file') out.promptFile = next();
@@ -118,6 +120,7 @@ Options:
   --namespace NAME     Context namespace
   --key KEY            Context key
   --task-id ID         Claim and release a hub task around backend execution
+  --require-claim      Refuse to run backend unless --task-id is provided and claimed
   --prompt TEXT        Prompt for the backend
   --prompt-file PATH   Prompt file
   --out-dir DIR        Write backend logs/report
@@ -157,6 +160,9 @@ function validateBridgeOptions(opts) {
   }
   if (!['auto', 'always', 'never'].includes(opts.messageMode)) {
     throw new Error('--message-mode must be auto|always|never');
+  }
+  if (opts.requireClaim && (!Number.isInteger(opts.taskId) || opts.taskId <= 0)) {
+    throw new Error('--require-claim requires --task-id');
   }
   if (!Number.isFinite(opts.threadTail) || opts.threadTail < 0) {
     throw new Error('--thread-tail must be a non-negative number');
