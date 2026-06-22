@@ -166,6 +166,40 @@ function truncate(value, max) {
   return text.length <= max ? text : `${text.slice(0, max - 3)}...`;
 }
 
+function extractPreviewField(preview, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(preview || '').match(new RegExp(`"${escapedKey}"\\s*:\\s*(?:"([^"]*)"|([^,}\\]]+))`));
+  if (!match) return null;
+  return String(match[1] ?? match[2] ?? '').trim().replace(/^null$/, '') || null;
+}
+
+function shouldSummarizeThreadMessageRole(role) {
+  const normalized = String(role || '').toLowerCase();
+  return normalized === 'canary' || normalized.includes('result');
+}
+
+function summarizeBridgeResultPreview(preview, role) {
+  if (!shouldSummarizeThreadMessageRole(role)) return null;
+  const text = String(preview || '');
+  if (!text.includes('"schema":"bridge-result-v1"') && !text.includes('"schema": "bridge-result-v1"')) {
+    return null;
+  }
+  const fields = [
+    ['status', extractPreviewField(text, 'status')],
+    ['backend', extractPreviewField(text, 'backend')],
+    ['agent', extractPreviewField(text, 'agent_id')],
+    ['role', extractPreviewField(text, 'role')],
+    ['digest', extractPreviewField(text, 'output_digest')],
+    ['error', extractPreviewField(text, 'error')],
+  ].filter(([, value]) => value);
+  return `bridge-result-v1 ${fields.map(([key, value]) => `${key}=${value}`).join(' ')}`;
+}
+
+function countBridgeResultPreviews(thread) {
+  if (!thread || !Array.isArray(thread.messages)) return 0;
+  return thread.messages.filter((message) => summarizeBridgeResultPreview(message.content_preview, message.role)).length;
+}
+
 function compactThreadPreflight(thread, previewChars = 180) {
   if (!thread || thread.success !== true || !Array.isArray(thread.messages)) return thread || null;
   return {
@@ -183,7 +217,7 @@ function compactThreadPreflight(thread, previewChars = 180) {
       role: message.role || null,
       created_at: message.created_at,
       content_digest: message.content_digest,
-      content_preview: truncate(message.content_preview || '', previewChars),
+      content_preview: summarizeBridgeResultPreview(message.content_preview, message.role) || truncate(message.content_preview || '', previewChars),
     })),
   };
 }
@@ -203,6 +237,44 @@ function compactTaskRoutingPreflight(taskRouting, agentId) {
     self_rank: selfIndex >= 0 ? selfIndex + 1 : null,
     top_agent: Array.isArray(top) ? top[0] : (top?.id || top?.agent?.id || null),
     top_score: Array.isArray(top) ? top[1] : (top?.score ?? null),
+  };
+}
+
+function compactHubDigestPreflight(hubDigest) {
+  if (!hubDigest || hubDigest.success !== true) return hubDigest || null;
+  const digest = hubDigest.digest || hubDigest.d || {};
+  const signals = digest.signals || {};
+  const events = digest.events || {};
+  const memory = digest.memory || {};
+  const signalItems = Array.isArray(signals.items) ? signals.items : [];
+  const memoryItems = Array.isArray(memory.memories) ? memory.memories : [];
+  return {
+    success: true,
+    sections: hubDigest.sections || hubDigest.s || Object.keys(digest),
+    signals: {
+      count: signals.count ?? signals.c ?? signalItems.length,
+      refs: signalItems.slice(0, 5).map((item) => ({
+        source: item.source,
+        id: item.id,
+        thread_id: item.thread_id || null,
+        thread_role: item.thread_role || null,
+        digest: item.content_digest || item.digest || null,
+      })),
+    },
+    events: {
+      cursor: events.cursor ?? events.c ?? null,
+      count: Array.isArray(events.events) ? events.events.length : (events.count ?? events.c ?? null),
+    },
+    memory: {
+      count: memory.count ?? memory.c ?? memoryItems.length,
+      namespace: memory.namespace || null,
+      memories: memoryItems.slice(0, 3).map((item) => ({
+        key: item.key,
+        tags: item.tags,
+        digest: item.text_digest || item.digest || null,
+        preview: truncate(item.text_preview || '', 120),
+      })),
+    },
   };
 }
 
@@ -263,15 +335,22 @@ function buildModelProfile(opts) {
 }
 
 function serializePreflight(preflight) {
-  const full = JSON.stringify(preflight);
+  const originalChars = JSON.stringify(preflight).length;
+  const wirePreflight = {
+    ...preflight,
+    hub_digest: compactHubDigestPreflight(preflight?.hub_digest),
+    thread: compactThreadPreflight(preflight?.thread, 180),
+    task_routing: compactTaskRoutingPreflight(preflight?.task_routing, preflight?.agent_id),
+  };
+  const full = JSON.stringify(wirePreflight);
   if (full.length <= MAX_PREFLIGHT_CHARS) {
-    return { text: full, truncated: false, original_chars: full.length };
+    return { text: full, truncated: false, original_chars: originalChars, wire_chars: full.length };
   }
   const digest = preflight?.hub_digest?.digest || preflight?.hub_digest?.d || {};
   const digestSections = preflight?.hub_digest?.sections || preflight?.hub_digest?.s || Object.keys(digest);
   let stub = {
     truncated: true,
-    original_chars: full.length,
+    original_chars: originalChars,
     agent_id: preflight?.agent_id,
     namespace: preflight?.namespace,
     digest_sections: digestSections,
@@ -310,7 +389,7 @@ function serializePreflight(preflight) {
     };
     text = JSON.stringify(stub);
   }
-  return { text, truncated: true, original_chars: full.length };
+  return { text, truncated: true, original_chars: originalChars, wire_chars: full.length };
 }
 
 function buildBackendPrompt(prompt, preflight) {
@@ -786,6 +865,9 @@ function compactResult(opts, prompt, backendResult) {
       preflight_thread_mode: backendResult.preflight_thread_mode,
       preflight_truncated: backendResult.preflight_truncated,
       preflight_original_chars: backendResult.preflight_original_chars,
+      preflight_wire_chars: backendResult.preflight_wire_chars,
+      preflight_sent_chars: backendResult.preflight_sent_chars,
+      preflight_bridge_result_summaries: backendResult.preflight_bridge_result_summaries,
       context_error: backendResult.context_error,
       message_error: backendResult.message_error,
       memory_id: backendResult.memory_id,
@@ -1077,6 +1159,9 @@ async function main() {
     backendResult.preflight_thread_mode = opts.threadId && opts.threadTail > 0 ? 'compact' : null;
     backendResult.preflight_truncated = preflightSerialized.truncated;
     backendResult.preflight_original_chars = preflightSerialized.original_chars;
+    backendResult.preflight_wire_chars = preflightSerialized.wire_chars;
+    backendResult.preflight_sent_chars = preflightSerialized.text.length;
+    backendResult.preflight_bridge_result_summaries = countBridgeResultPreviews(threadTail);
     const compactTaskRouting = compactTaskRoutingPreflight(taskRouting, opts.agentId);
     backendResult.task_routing_self_rank = compactTaskRouting?.self_rank ?? null;
     backendResult.task_routing_top_agent = compactTaskRouting?.top_agent ?? null;
