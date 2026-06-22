@@ -307,6 +307,7 @@ BRIDGE_ARGS=(
   --backend "$BACKEND"
   --agent-id "$AGENT_ID"
   --agent-name "$AGENT_NAME"
+  --role "$ROLE"
   --lifecycle "$LIFECYCLE"
   --onboarding-mode "$ONBOARDING_MODE"
   --capabilities "$CAPABILITIES"
