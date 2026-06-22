@@ -9,6 +9,12 @@ const DEFAULT_ENDPOINT = process.env.ENDPOINT || process.env.MCP_ENDPOINT || 'ht
 const MAX_CONTEXT_CHARS = Number(process.env.BRIDGE_CONTEXT_MAX_CHARS || 1900);
 const MAX_MESSAGE_CHARS = Number(process.env.BRIDGE_MESSAGE_MAX_CHARS || 900);
 const MAX_PREFLIGHT_CHARS = Number(process.env.BRIDGE_PREFLIGHT_MAX_CHARS || 3000);
+const RESULT_BLOB_MIN_CHARS = Number.isFinite(Number(process.env.BRIDGE_RESULT_BLOB_MIN_CHARS))
+  ? Math.max(0, Math.floor(Number(process.env.BRIDGE_RESULT_BLOB_MIN_CHARS)))
+  : 1800;
+const RESULT_BLOB_MAX_CHARS = Number.isFinite(Number(process.env.BRIDGE_RESULT_BLOB_MAX_CHARS))
+  ? Math.max(4096, Math.min(32768, Math.floor(Number(process.env.BRIDGE_RESULT_BLOB_MAX_CHARS))))
+  : 30_000;
 const BRIDGE_HTTP_RETRIES = Number.isFinite(Number(process.env.BRIDGE_HTTP_RETRIES))
   ? Math.max(0, Math.min(5, Math.floor(Number(process.env.BRIDGE_HTTP_RETRIES))))
   : 2;
@@ -775,6 +781,12 @@ function compactResult(opts, prompt, backendResult) {
       memory_error: backendResult.memory_error,
       thread_message_id: backendResult.thread_message_id,
       thread_error: backendResult.thread_error,
+      result_blob_hash: backendResult.result_blob_hash,
+      result_blob_short_hash: backendResult.result_blob_short_hash,
+      result_blob_chars: backendResult.result_blob_chars,
+      result_blob_truncated: backendResult.result_blob_truncated,
+      result_blob_original_chars: backendResult.result_blob_original_chars,
+      result_blob_error: backendResult.result_blob_error,
       task_routing_self_rank: backendResult.task_routing_self_rank,
       task_routing_top_agent: backendResult.task_routing_top_agent,
       task_routing_error: backendResult.task_routing_error,
@@ -784,6 +796,109 @@ function compactResult(opts, prompt, backendResult) {
       claim_renewal_error: backendResult.claim_renewal_error,
     },
   };
+}
+
+function buildResultBlobPayload(fullReport, maxChars = RESULT_BLOB_MAX_CHARS) {
+  const fullPayload = JSON.stringify({ schema: 'bridge-result-full-v1', ...fullReport });
+  if (fullPayload.length <= maxChars) {
+    return { payload: fullPayload, truncated: false, original_chars: fullPayload.length };
+  }
+  const output = String(fullReport.output || '');
+  const stderr = String(fullReport.stderr || '');
+  const rawError = String(fullReport.raw_error || '');
+  const base = {
+    schema: 'bridge-result-full-v1',
+    ...fullReport,
+    output: '',
+    stderr: '',
+    raw_error: rawError ? truncate(rawError, 1000) : rawError,
+    result_blob_truncated: true,
+    result_blob_original_chars: fullPayload.length,
+  };
+  const baseChars = JSON.stringify(base).length;
+  const budget = Math.max(1000, maxChars - baseChars - 200);
+  const outputBudget = Math.floor(budget * 0.8);
+  const stderrBudget = budget - outputBudget;
+  const payload = JSON.stringify({
+    ...base,
+    output: truncate(output, outputBudget),
+    stderr: truncate(stderr, stderrBudget),
+  });
+  if (payload.length <= maxChars) {
+    return { payload, truncated: true, original_chars: fullPayload.length };
+  }
+  return {
+    payload: JSON.stringify({
+      schema: 'bridge-result-full-v1',
+      result_blob_truncated: true,
+      result_blob_original_chars: fullPayload.length,
+      output_digest: fullReport.output_digest,
+      error_digest: fullReport.error_digest,
+      backend_result: fullReport.backend_result,
+    }),
+    truncated: true,
+    original_chars: fullPayload.length,
+  };
+}
+
+function buildPublishPayload(opts, prompt, backendResult, maxChars = MAX_CONTEXT_CHARS) {
+  const base = compactResult(opts, prompt, backendResult);
+  const variants = [
+    base,
+    {
+      ...base,
+      output_preview: truncate(base.output_preview, backendResult.result_blob_hash ? 180 : 700),
+      backend_result: {
+        ...base.backend_result,
+        phase_timings_ms: undefined,
+      },
+    },
+    {
+      schema: base.schema,
+      status: base.status,
+      run_id: base.run_id,
+      backend: base.backend,
+      agent_id: base.agent_id,
+      role: base.role,
+      namespace: base.namespace,
+      started_at: base.started_at,
+      finished_at: base.finished_at,
+      prompt_digest: base.prompt_digest,
+      output_digest: base.output_digest,
+      output_preview: truncate(base.output_preview, backendResult.result_blob_hash ? 120 : 300),
+      kpi: base.kpi,
+      backend_result: {
+        ok: backendResult.ok,
+        duration_ms: backendResult.duration_ms,
+        exit_code: backendResult.exit_code,
+        timed_out: backendResult.timed_out,
+        aborted: backendResult.aborted,
+        error: backendResult.error,
+        rpc_retries: backendResult.rpc_retries,
+        result_blob_hash: backendResult.result_blob_hash,
+        result_blob_short_hash: backendResult.result_blob_short_hash,
+        result_blob_chars: backendResult.result_blob_chars,
+        result_blob_truncated: backendResult.result_blob_truncated,
+        result_blob_original_chars: backendResult.result_blob_original_chars,
+      },
+    },
+  ];
+  for (const variant of variants) {
+    const payload = JSON.stringify(variant);
+    if (payload.length <= maxChars) return payload;
+  }
+  const minimal = {
+    schema: 'bridge-result-v1',
+    status: base.status,
+    run_id: base.run_id,
+    backend: base.backend,
+    agent_id: base.agent_id,
+    output_digest: base.output_digest,
+    result_blob_hash: backendResult.result_blob_hash,
+    result_blob_short_hash: backendResult.result_blob_short_hash,
+    error: backendResult.error,
+  };
+  return JSON.stringify(minimal);
 }
 
 function errorDigest(error) {
@@ -1131,13 +1246,26 @@ async function main() {
 
     runState.phase = 'publishing';
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
-    let payload = JSON.stringify(compactResult(opts, prompt, backendResult));
-    if (payload.length > MAX_CONTEXT_CHARS) {
-      payload = JSON.stringify({
-        ...compactResult(opts, prompt, backendResult),
-        output_preview: truncate(backendResult.output || backendResult.error || backendResult.stderr || '', 700),
-      });
+    const resultBlob = buildResultBlobPayload(fullReport);
+    if (resultBlob.payload.length >= RESULT_BLOB_MIN_CHARS) {
+      const blob = await measurePhase(phaseTimings, 'store_result_blob_ms', () => mcp.call('store_protocol_blob', {
+        agent_id: opts.agentId,
+        auth_token: authToken,
+        payload: resultBlob.payload,
+        compression_mode: 'json',
+        hash_truncate: 16,
+      }));
+      if (blob.success === true) {
+        backendResult.result_blob_hash = blob.hash;
+        backendResult.result_blob_short_hash = blob.short_hash;
+        backendResult.result_blob_chars = blob.blob_chars;
+        backendResult.result_blob_truncated = resultBlob.truncated;
+        backendResult.result_blob_original_chars = resultBlob.original_chars;
+      } else {
+        backendResult.result_blob_error = blob.error_code || blob.error || 'store_protocol_blob_failed';
+      }
     }
+    let payload = buildPublishPayload(opts, prompt, backendResult);
     let context = await measurePhase(phaseTimings, 'share_context_ms', () => mcp.call('share_context', {
       agent_id: opts.agentId,
       auth_token: authToken,
@@ -1185,13 +1313,7 @@ async function main() {
       }
     }
     if (context.success === true && (backendResult.message_error || backendResult.thread_error)) {
-      payload = JSON.stringify(compactResult(opts, prompt, backendResult));
-      if (payload.length > MAX_CONTEXT_CHARS) {
-        payload = JSON.stringify({
-          ...compactResult(opts, prompt, backendResult),
-          output_preview: truncate(backendResult.output || backendResult.error || backendResult.stderr || '', 700),
-        });
-      }
+      payload = buildPublishPayload(opts, prompt, backendResult);
       context = await measurePhase(phaseTimings, 'share_context_publish_correction_ms', () => mcp.call('share_context', {
         agent_id: opts.agentId,
         auth_token: authToken,
@@ -1215,6 +1337,7 @@ async function main() {
         contextId ? `context_id:${contextId}` : null,
         messageId ? `message_id:${messageId}` : null,
         threadMessageId ? `message_id:${threadMessageId}` : null,
+        backendResult.result_blob_hash ? `blob:${backendResult.result_blob_hash}` : null,
       ].filter(Boolean);
       release = await measurePhase(phaseTimings, 'release_task_claim_ms', () => mcp.call('release_task_claim', {
         task_id: opts.taskId,
@@ -1246,7 +1369,7 @@ async function main() {
           auth_token: authToken,
           key: opts.key,
           namespace: opts.namespace,
-          value: JSON.stringify(compactResult(opts, prompt, backendResult)).slice(0, MAX_CONTEXT_CHARS),
+          value: buildPublishPayload(opts, prompt, backendResult),
           idempotency_key: `${opts.agentId}:${opts.key}:release-correction`,
         }));
       }
@@ -1284,6 +1407,7 @@ async function main() {
       released: release?.success === true || false,
       report_path: reportPath,
       output_digest: sha256(backendResult.output || '').slice(0, 16),
+      result_blob_short_hash: backendResult.result_blob_short_hash || null,
       json_valid: backendResult.json_valid ?? null,
       rpc_retries: backendResult.rpc_retries ?? 0,
       preflight_truncated: backendResult.preflight_truncated ?? false,
