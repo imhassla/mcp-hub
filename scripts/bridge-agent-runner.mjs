@@ -29,6 +29,7 @@ function parseArgs(argv) {
     backend: 'codex',
     agentId: '',
     agentName: '',
+    role: process.env.BRIDGE_AGENT_ROLE || 'worker',
     lifecycle: process.env.BRIDGE_AGENT_LIFECYCLE || 'ephemeral',
     onboardingMode: process.env.BRIDGE_ONBOARDING_MODE || 'none',
     registerToken: process.env.BRIDGE_REGISTER_TOKEN || process.env.MCP_HUB_REGISTER_TOKEN || '',
@@ -53,7 +54,7 @@ function parseArgs(argv) {
     threadTail: Number(process.env.BRIDGE_THREAD_TAIL || 12),
     runtimeMode: process.env.BRIDGE_RUNTIME_MODE || 'auto',
     timeoutMs: Number(process.env.BRIDGE_TIMEOUT_MS || 180000),
-    publishMessage: true,
+    messageMode: process.env.BRIDGE_MESSAGE_MODE || 'auto',
     expectJson: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -67,6 +68,7 @@ function parseArgs(argv) {
     else if (arg === '--backend') out.backend = next();
     else if (arg === '--agent-id') out.agentId = next();
     else if (arg === '--agent-name') out.agentName = next();
+    else if (arg === '--role') out.role = next();
     else if (arg === '--lifecycle') out.lifecycle = next();
     else if (arg === '--onboarding-mode') out.onboardingMode = next();
     else if (arg === '--register-token') out.registerToken = next();
@@ -91,8 +93,9 @@ function parseArgs(argv) {
     else if (arg === '--thread-tail') out.threadTail = Number(next());
     else if (arg === '--runtime-mode') out.runtimeMode = next();
     else if (arg === '--timeout-ms') out.timeoutMs = Number(next());
+    else if (arg === '--message-mode') out.messageMode = next();
     else if (arg === '--expect-json') out.expectJson = true;
-    else if (arg === '--no-message') out.publishMessage = false;
+    else if (arg === '--no-message') out.messageMode = 'never';
     else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: bridge-agent-runner.mjs --backend claude|codex|custom --prompt "..." [options]
 
@@ -100,6 +103,7 @@ Options:
   --endpoint URL       MCP Streamable HTTP endpoint (default ${DEFAULT_ENDPOINT})
   --agent-id ID        Bridge agent id (default bridge-<backend>-<ts>)
   --agent-name NAME    Registered hub display name (default agent id)
+  --role ROLE          Hub coordination role: orchestrator|reviewer|assistant|worker (default worker)
   --lifecycle MODE     Agent lifecycle: ephemeral|persistent (default ephemeral)
   --onboarding-mode M  register_agent onboarding: none|compact|full (default none)
   --register-token T   Registration secret when MCP_HUB_REGISTER_TOKEN is configured
@@ -121,6 +125,7 @@ Options:
   --thread-tail N      Include latest N visible thread messages in backend preflight (default 12)
   --runtime-mode MODE  Runtime profile override: auto|repo|isolated|unknown
   --timeout-ms MS      Backend timeout
+  --message-mode MODE  Result broadcast mode: auto|always|never (default auto; auto skips duplicate broadcast for thread runs)
 
 Custom backend env:
   BRIDGE_CUSTOM_COMMAND executable path
@@ -139,6 +144,12 @@ function validateBridgeOptions(opts) {
   }
   if (!['none', 'compact', 'full'].includes(opts.onboardingMode)) {
     throw new Error('--onboarding-mode must be none|compact|full');
+  }
+  if (!['orchestrator', 'reviewer', 'assistant', 'worker'].includes(opts.role)) {
+    throw new Error('--role must be orchestrator|reviewer|assistant|worker');
+  }
+  if (!['auto', 'always', 'never'].includes(opts.messageMode)) {
+    throw new Error('--message-mode must be auto|always|never');
   }
   if (!Number.isFinite(opts.threadTail) || opts.threadTail < 0) {
     throw new Error('--thread-tail must be a non-negative number');
@@ -223,8 +234,8 @@ function buildModelProfile(opts) {
       provider: 'codex',
       id: modelId,
       family: modelFamily(modelId, 'openai'),
-      strengths: ['coding', 'code_review', 'repo_reasoning', 'tool_use'],
-      task_types: ['coding', 'review', 'debugging', 'research'],
+      strengths: ['coding', 'code_review', 'debugging', 'repo_reasoning', 'tool_use'],
+      task_types: ['coding', 'review', 'debugging', 'research', 'planning'],
       cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
       latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
     };
@@ -234,8 +245,8 @@ function buildModelProfile(opts) {
       provider: 'claude',
       id: modelId,
       family: modelFamily(modelId, 'claude'),
-      strengths: ['analysis', 'writing', 'research', 'review'],
-      task_types: ['research', 'review', 'planning', 'synthesis'],
+      strengths: ['analysis', 'code_review', 'planning', 'research', 'synthesis', 'writing'],
+      task_types: ['research', 'review', 'planning', 'synthesis', 'architecture'],
       cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
       latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
     };
@@ -244,8 +255,8 @@ function buildModelProfile(opts) {
     provider: 'custom',
     id: modelId,
     family: modelFamily(modelId, 'custom'),
-    strengths: parseCsv(process.env.BRIDGE_MODEL_STRENGTHS || 'custom,tool_use'),
-    task_types: parseCsv(process.env.BRIDGE_MODEL_TASK_TYPES || 'custom'),
+    strengths: parseCsv(process.env.BRIDGE_MODEL_STRENGTHS || 'custom,analysis,tool_use'),
+    task_types: parseCsv(process.env.BRIDGE_MODEL_TASK_TYPES || 'custom,research'),
     cost_tier: process.env.BRIDGE_MODEL_COST_TIER || 'unknown',
     latency_tier: process.env.BRIDGE_MODEL_LATENCY_TIER || 'unknown',
   };
@@ -470,30 +481,68 @@ function parseMcpPayload(json) {
   return JSON.parse(text);
 }
 
+function isReinitializeRequired(json) {
+  const error = json?.error;
+  if (!error) return false;
+  const text = `${error.code ?? ''} ${error.message ?? ''} ${JSON.stringify(error.data ?? '')}`.toLowerCase();
+  return text.includes('reinitialize_required')
+    || (text.includes('session') && (text.includes('expired') || text.includes('invalid') || text.includes('not found')));
+}
+
+function isRetryableJsonRpcError(json) {
+  const error = json?.error;
+  if (!error) return false;
+  const text = `${error.message ?? ''} ${JSON.stringify(error.data ?? '')}`.toLowerCase();
+  return error.code === -32603 && (
+    text.includes('temporar')
+    || text.includes('timeout')
+    || text.includes('busy')
+    || text.includes('retry')
+    || text.includes('transient')
+  );
+}
+
 async function createMcpClient(endpoint) {
   let nextId = 1;
-  const init = await postRpc(endpoint, {
-    jsonrpc: '2.0',
-    id: nextId++,
-    method: 'initialize',
-    params: {
-      protocolVersion: '2025-06-18',
-      capabilities: {},
-      clientInfo: { name: 'bridge-agent-runner', version: '1.0.0' },
-    },
-  });
-  const sessionId = init.res.headers.get('mcp-session-id');
-  if (!sessionId) throw new Error('MCP initialize did not return mcp-session-id');
-  await postRpc(endpoint, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, sessionId);
+  let sessionId = '';
+  async function initializeSession() {
+    const init = await postRpc(endpoint, {
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'bridge-agent-runner', version: '1.0.0' },
+      },
+    });
+    const nextSessionId = init.res.headers.get('mcp-session-id');
+    if (!nextSessionId) throw new Error('MCP initialize did not return mcp-session-id');
+    await postRpc(endpoint, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, nextSessionId);
+    sessionId = nextSessionId;
+  }
+  await initializeSession();
   return {
-    sessionId,
+    get sessionId() {
+      return sessionId;
+    },
     async call(name, args) {
-      const { json } = await postRpc(endpoint, {
+      const body = {
         jsonrpc: '2.0',
         id: nextId++,
         method: 'tools/call',
         params: { name, arguments: args },
-      }, sessionId);
+      };
+      let { json } = await postRpc(endpoint, body, sessionId);
+      if (isReinitializeRequired(json)) {
+        rpcRetries += 1;
+        await initializeSession();
+        ({ json } = await postRpc(endpoint, body, sessionId));
+      } else if (isRetryableJsonRpcError(json)) {
+        rpcRetries += 1;
+        await sleep(BRIDGE_HTTP_RETRY_DELAY_MS);
+        ({ json } = await postRpc(endpoint, body, sessionId));
+      }
       return parseMcpPayload(json);
     },
     async close() {
@@ -703,6 +752,7 @@ function compactResult(opts, prompt, backendResult) {
     run_id: backendResult.run_id,
     backend: opts.backend,
     agent_id: opts.agentId,
+    role: opts.role,
     namespace: opts.namespace,
     started_at: backendResult.started_at,
     finished_at: backendResult.finished_at,
@@ -718,6 +768,7 @@ function compactResult(opts, prompt, backendResult) {
       heartbeat_count: backendResult.heartbeat_count ?? 0,
       publish_attempts: backendResult.publish_attempts ?? 0,
       publish_failures: backendResult.publish_failures ?? 0,
+      message_mode: opts.messageMode,
     },
     backend_result: {
       ok: backendResult.ok,
@@ -767,6 +818,7 @@ function buildRunStatus(opts, prompt, state) {
     phase: state.phase,
     backend: opts.backend,
     agent_id: opts.agentId,
+    role: opts.role,
     namespace: opts.namespace,
     prompt_digest: sha256(prompt).slice(0, 16),
     started_at: state.startedAt,
@@ -897,12 +949,16 @@ async function main() {
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
   let authToken = '';
   let heartbeat = null;
+  let activeClaim = null;
+  let activeClaimRenewal = null;
+  let activeClaimReleased = false;
   try {
     runState.phase = 'registering';
     const registerArgs = {
       id: opts.agentId,
       name: opts.agentName,
       type: `bridge:${opts.backend}`,
+      role: opts.role,
       register_token: opts.registerToken || undefined,
       capabilities: ['bridge', 'external-runtime', opts.backend, ...parseCsv(opts.capabilities)].join(','),
       lifecycle: opts.lifecycle,
@@ -913,7 +969,7 @@ async function main() {
         blob_resolve: true,
         artifact_tickets: false,
         snapshot_reads: true,
-        push_transports: ['wait_for_updates'],
+        push_transports: ['sse_events', 'wait_for_updates'],
       },
     };
     const registration = await measurePhase(phaseTimings, 'register_agent_ms', () => mcp.call('register_agent', registerArgs));
@@ -975,12 +1031,10 @@ async function main() {
     const preflightSerialized = serializePreflight(preflight);
     const backendPrompt = buildBackendPrompt(prompt, preflight);
 
-    let claim = null;
-    let claimRenewal = null;
     if (Number.isInteger(opts.taskId) && opts.taskId > 0) {
       runState.phase = 'claiming';
       await publishRunStatus(mcp, opts, authToken, prompt, runState);
-      claim = await measurePhase(phaseTimings, 'claim_task_ms', () => mcp.call('claim_task', {
+      activeClaim = await measurePhase(phaseTimings, 'claim_task_ms', () => mcp.call('claim_task', {
         task_id: opts.taskId,
         agent_id: opts.agentId,
         auth_token: authToken,
@@ -988,10 +1042,10 @@ async function main() {
         namespace: opts.namespace || undefined,
         idempotency_key: `${opts.agentId}:claim:${opts.taskId}`,
       }));
-      if (claim.success !== true) {
-        throw new Error(`claim_task failed: ${JSON.stringify(claim)}`);
+      if (activeClaim.success !== true) {
+        throw new Error(`claim_task failed: ${JSON.stringify(activeClaim)}`);
       }
-      claimRenewal = startClaimRenewal(mcp, opts, authToken, claim);
+      activeClaimRenewal = startClaimRenewal(mcp, opts, authToken, activeClaim);
     }
 
     let backendResult;
@@ -1004,7 +1058,10 @@ async function main() {
     } finally {
       heartbeat?.stop();
       heartbeat = null;
-      if (claimRenewal) renewalSummary = await measurePhase(phaseTimings, 'claim_renewal_stop_ms', () => claimRenewal.stop());
+      if (activeClaimRenewal) {
+        renewalSummary = await measurePhase(phaseTimings, 'claim_renewal_stop_ms', () => activeClaimRenewal.stop());
+        activeClaimRenewal = null;
+      }
     }
     backendResult.run_id = runId;
     backendResult.started_at = startedAt;
@@ -1095,7 +1152,8 @@ async function main() {
       backendResult.context_error = context.error_code || context.error || 'share_context_failed';
     }
     let message = null;
-    if (opts.publishMessage) {
+    const shouldPublishMessage = opts.messageMode === 'always' || (opts.messageMode === 'auto' && !opts.threadId);
+    if (shouldPublishMessage) {
       message = await measurePhase(phaseTimings, 'send_message_ms', () => mcp.call('send_message', {
         from_agent: opts.agentId,
         auth_token: authToken,
@@ -1147,7 +1205,7 @@ async function main() {
       }
     }
     let release = null;
-    if (claim && Number.isInteger(opts.taskId) && opts.taskId > 0) {
+    if (activeClaim && Number.isInteger(opts.taskId) && opts.taskId > 0) {
       runState.phase = 'releasing';
       await publishRunStatus(mcp, opts, authToken, prompt, runState);
       const contextId = context.context?.id;
@@ -1162,7 +1220,7 @@ async function main() {
         task_id: opts.taskId,
         agent_id: opts.agentId,
         auth_token: authToken,
-        claim_id: claim.claim?.claim_id,
+        claim_id: activeClaim.claim?.claim_id,
         next_status: backendResult.ok ? 'done' : 'blocked',
         confidence: backendResult.ok ? 0.9 : undefined,
         verification_passed: backendResult.ok ? true : undefined,
@@ -1178,7 +1236,7 @@ async function main() {
           task_id: opts.taskId,
           agent_id: opts.agentId,
           auth_token: authToken,
-          claim_id: claim.claim?.claim_id,
+          claim_id: activeClaim.claim?.claim_id,
           next_status: 'blocked',
           idempotency_key: `${opts.agentId}:release-blocked:${opts.taskId}`,
         }));
@@ -1195,6 +1253,7 @@ async function main() {
       if (release.success !== true) {
         throw new Error(`release_task_claim failed: ${JSON.stringify(release)}`);
       }
+      activeClaimReleased = true;
     }
     backendResult.rpc_retries = rpcRetries;
     backendResult.finished_at = Date.now();
@@ -1233,11 +1292,31 @@ async function main() {
     process.exitCode = backendResult.ok ? 0 : 2;
   } catch (error) {
     heartbeat?.stop();
+    heartbeat = null;
     runState.phase = runState.phase || 'failed';
     runState.status = 'failed';
     runState.errorDigest = errorDigest(error);
     runState.errorClass = error?.name || 'Error';
     runState.errorPreview = truncate(error?.message || String(error), 500);
+    let blockedRelease = null;
+    if (activeClaimRenewal) {
+      await measurePhase(phaseTimings, 'claim_renewal_stop_after_error_ms', () => activeClaimRenewal.stop()).catch(() => undefined);
+      activeClaimRenewal = null;
+    }
+    if (activeClaim && !activeClaimReleased && authToken) {
+      blockedRelease = await measurePhase(phaseTimings, 'release_task_claim_after_error_ms', () => mcp.call('release_task_claim', {
+        task_id: opts.taskId,
+        agent_id: opts.agentId,
+        auth_token: authToken,
+        claim_id: activeClaim.claim?.claim_id,
+        next_status: 'blocked',
+        idempotency_key: `${opts.agentId}:release-after-error:${opts.taskId}:${startedAt}`,
+      })).catch((releaseError) => ({
+        success: false,
+        error: String(releaseError?.message || releaseError),
+      }));
+      activeClaimReleased = blockedRelease?.success === true;
+    }
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
     const failureReport = {
       schema: 'bridge-result-v1',
@@ -1250,6 +1329,8 @@ async function main() {
       finished_at: Date.now(),
       error_digest: runState.errorDigest,
       error: runState.errorPreview,
+      blocked_release: blockedRelease?.success ?? null,
+      blocked_release_error: blockedRelease?.success === false ? (blockedRelease.error_code || blockedRelease.error || 'release_task_claim_failed') : undefined,
       phase: runState.phase,
       phase_timings_ms: phaseTimings,
       rpc_retries: rpcRetries,
