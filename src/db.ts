@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { notifyStreamEvent } from './eventNotifier.js';
 import type {
   Agent,
   AgentLifecycle,
@@ -507,7 +508,9 @@ function insertStreamEvent(d: Database.Database, args: {
     payloadJson,
     now,
   );
-  return d.prepare('SELECT * FROM stream_events WHERE id = ?').get(result.lastInsertRowid) as StreamEvent;
+  const event = d.prepare('SELECT * FROM stream_events WHERE id = ?').get(result.lastInsertRowid) as StreamEvent;
+  notifyStreamEvent(event);
+  return event;
 }
 
 export function appendStreamEvent(args: {

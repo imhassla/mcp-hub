@@ -88,6 +88,7 @@ import { memoryTools, handleWriteMemory, handleSearchMemory, handleGetMemoryDige
 import { traceTools, handleGetTraceTimeline } from './tools/traces.js';
 import { threadTools, handleStartThread, handleReplyThread, handleReadThread } from './tools/threads.js';
 import { validateRegisterToken } from './auth.js';
+import { onStreamEvent } from './eventNotifier.js';
 
 function createServer() {
   return new McpServer({
@@ -2233,12 +2234,19 @@ app.get('/events', (req, res) => {
   let draining = false;
   let drainTimer: NodeJS.Timeout | null = null;
   let timer: NodeJS.Timeout | null = null;
+  let wakeTimer: NodeJS.Timeout | null = null;
+  let unsubscribeStreamEvents: (() => void) | null = null;
 
   const cleanup = () => {
     if (streamClosed) return;
     streamClosed = true;
     if (timer) clearInterval(timer);
+    if (wakeTimer) clearTimeout(wakeTimer);
     if (drainTimer) clearTimeout(drainTimer);
+    if (unsubscribeStreamEvents) {
+      unsubscribeStreamEvents();
+      unsubscribeStreamEvents = null;
+    }
     activeEventStreamCount = Math.max(0, activeEventStreamCount - 1);
     const currentAgentStreams = eventStreamCountsByAgent.get(agentId) || 0;
     if (currentAgentStreams <= 1) {
@@ -2360,6 +2368,21 @@ app.get('/events', (req, res) => {
     }
     return false;
   };
+
+  const wakeSoon = () => {
+    if (streamClosed || wakeTimer) return;
+    wakeTimer = setTimeout(() => {
+      wakeTimer = null;
+      emitAvailableEvents();
+    }, 0);
+    wakeTimer.unref();
+  };
+
+  unsubscribeStreamEvents = onStreamEvent((event) => {
+    if (streamClosed || !streams.includes(event.stream)) return;
+    if (event.target_agent_id && event.target_agent_id !== agentId && event.target_agent_id !== '*') return;
+    wakeSoon();
+  });
 
   emitAvailableEvents();
 
