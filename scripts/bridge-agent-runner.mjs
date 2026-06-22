@@ -647,29 +647,49 @@ function runProcess(command, args, options) {
     const stdout = [];
     const stderr = [];
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
+    let aborted = false;
+    const terminate = (reason) => {
+      if (child.killed) return;
+      if (reason === 'timeout') timedOut = true;
+      if (reason === 'abort') aborted = true;
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 2000).unref();
+    };
+    const timer = setTimeout(() => {
+      terminate('timeout');
     }, options.timeoutMs);
+    const abortListener = () => terminate('abort');
+    if (options.signal) {
+      if (options.signal.aborted) {
+        abortListener();
+      } else {
+        options.signal.addEventListener('abort', abortListener, { once: true });
+      }
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener?.('abort', abortListener);
+    };
     child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
     child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
     child.on('error', (error) => {
-      clearTimeout(timer);
+      cleanup();
       resolve({
         exitCode: 127,
         timedOut,
+        aborted,
         durationMs: Date.now() - startedAt,
         stdout: '',
         stderr: String(error?.stack || error),
       });
     });
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
+      cleanup();
       resolve({
         exitCode: code,
         signal: signal || null,
         timedOut,
+        aborted,
         durationMs: Date.now() - startedAt,
         stdout: Buffer.concat(stdout).toString('utf8'),
         stderr: Buffer.concat(stderr).toString('utf8'),
@@ -700,41 +720,43 @@ function parseCustomArgs() {
   return parsed;
 }
 
-async function runCodex(opts, prompt) {
+async function runCodex(opts, prompt, signal) {
   const args = ['exec', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', opts.codexSandbox];
   if (opts.codexModel) args.push('--model', opts.codexModel);
   args.push(prompt);
-  const result = await runProcess(opts.codexBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv() });
+  const result = await runProcess(opts.codexBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv(), signal });
   return {
     backend: 'codex',
-    ok: result.exitCode === 0 && !result.timedOut,
+    ok: result.exitCode === 0 && !result.timedOut && !result.aborted,
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
     exit_signal: result.signal,
     timed_out: result.timedOut,
+    aborted: result.aborted,
     duration_ms: result.durationMs,
   };
 }
 
-async function runClaude(opts, prompt) {
+async function runClaude(opts, prompt, signal) {
   const args = ['-p', '--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config'];
   if (opts.claudeModel) args.push('--model', opts.claudeModel);
   args.push(prompt);
-  const result = await runProcess(opts.claudeBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv() });
+  const result = await runProcess(opts.claudeBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv(), signal });
   return {
     backend: 'claude',
-    ok: result.exitCode === 0 && !result.timedOut,
+    ok: result.exitCode === 0 && !result.timedOut && !result.aborted,
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
     exit_signal: result.signal,
     timed_out: result.timedOut,
+    aborted: result.aborted,
     duration_ms: result.durationMs,
   };
 }
 
-async function runCustom(opts, prompt) {
+async function runCustom(opts, prompt, signal) {
   const command = process.env.BRIDGE_CUSTOM_COMMAND;
   if (!command) {
     return {
@@ -760,27 +782,29 @@ async function runCustom(opts, prompt) {
   const result = await runProcess(command, customArgs, {
     timeoutMs: opts.timeoutMs,
     env: buildBackendEnv({ BRIDGE_PROMPT: prompt }),
+    signal,
   });
   return {
     backend: 'custom',
-    ok: result.exitCode === 0 && !result.timedOut,
+    ok: result.exitCode === 0 && !result.timedOut && !result.aborted,
     output: result.stdout.trim(),
     stderr: result.stderr.trim(),
     exit_code: result.exitCode,
     exit_signal: result.signal,
     timed_out: result.timedOut,
+    aborted: result.aborted,
     duration_ms: result.durationMs,
   };
 }
 
-async function runBackend(opts, prompt) {
-  if (opts.backend === 'claude') return runClaude(opts, prompt);
-  if (opts.backend === 'codex') return runCodex(opts, prompt);
-  if (opts.backend === 'custom') return runCustom(opts, prompt);
+async function runBackend(opts, prompt, signal) {
+  if (opts.backend === 'claude') return runClaude(opts, prompt, signal);
+  if (opts.backend === 'codex') return runCodex(opts, prompt, signal);
+  if (opts.backend === 'custom') return runCustom(opts, prompt, signal);
   throw new Error(`Unsupported backend: ${opts.backend}`);
 }
 
-function startClaimRenewal(mcp, opts, authToken, claim) {
+function startClaimRenewal(mcp, opts, authToken, claim, abortController) {
   const intervalMs = Math.max(10_000, Math.min(60_000, Math.floor(opts.leaseSeconds * 1000 / 3)));
   let stopped = false;
   let inFlight = null;
@@ -801,9 +825,11 @@ function startClaimRenewal(mcp, opts, authToken, claim) {
           return;
         }
         lastError = JSON.stringify(result);
+        abortController?.abort(new Error(`claim_renewal_failed: ${lastError}`));
       })
       .catch((error) => {
         lastError = String(error?.message || error);
+        abortController?.abort(new Error(`claim_renewal_error: ${lastError}`));
       })
       .finally(() => {
         inFlight = null;
@@ -855,6 +881,7 @@ function compactResult(opts, prompt, backendResult) {
       exit_code: backendResult.exit_code,
       exit_signal: backendResult.exit_signal,
       timed_out: backendResult.timed_out,
+      aborted: backendResult.aborted,
       model: backendResult.model,
       error: backendResult.error,
       json_valid: backendResult.json_valid,
@@ -1034,6 +1061,16 @@ async function main() {
   let activeClaim = null;
   let activeClaimRenewal = null;
   let activeClaimReleased = false;
+  const backendAbort = new AbortController();
+  let shutdownSignal = null;
+  const requestShutdown = (signalName) => {
+    shutdownSignal = shutdownSignal || signalName;
+    backendAbort.abort(new Error(`received ${signalName}`));
+  };
+  const onSigint = () => requestShutdown('SIGINT');
+  const onSigterm = () => requestShutdown('SIGTERM');
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
   try {
     runState.phase = 'registering';
     const registerArgs = {
@@ -1127,7 +1164,7 @@ async function main() {
       if (activeClaim.success !== true) {
         throw new Error(`claim_task failed: ${JSON.stringify(activeClaim)}`);
       }
-      activeClaimRenewal = startClaimRenewal(mcp, opts, authToken, activeClaim);
+      activeClaimRenewal = startClaimRenewal(mcp, opts, authToken, activeClaim, backendAbort);
     }
 
     let backendResult;
@@ -1136,7 +1173,7 @@ async function main() {
       runState.phase = 'backend_running';
       await publishRunStatus(mcp, opts, authToken, prompt, runState);
       heartbeat = startRunHeartbeat(mcp, opts, authToken, prompt, runState);
-      backendResult = await measurePhase(phaseTimings, 'backend_ms', () => runBackend(opts, backendPrompt));
+      backendResult = await measurePhase(phaseTimings, 'backend_ms', () => runBackend(opts, backendPrompt, backendAbort.signal));
     } finally {
       heartbeat?.stop();
       heartbeat = null;
@@ -1173,6 +1210,11 @@ async function main() {
         backendResult.ok = false;
         backendResult.error = backendResult.error || 'claim_renewal_failed';
       }
+    }
+    if (shutdownSignal) {
+      backendResult.ok = false;
+      backendResult.aborted = true;
+      backendResult.error = backendResult.error || `shutdown_signal:${shutdownSignal}`;
     }
     if (opts.expectJson) {
       const parsed = parseLooseJson(backendResult.output);
@@ -1426,6 +1468,8 @@ async function main() {
     throw error;
   } finally {
     heartbeat?.stop();
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
     await measurePhase(phaseTimings, 'mcp_close_ms', () => mcp.close());
   }
 }
