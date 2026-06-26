@@ -10,6 +10,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { z } from 'zod';
 import { getDb } from './db.js';
+import { validateApiKeyToken } from './apiKeys.js';
 import { agentTools, handleRegisterAgent, handleListAgents, handleGetOnboarding, handleUpdateRuntimeProfile } from './tools/agents.js';
 import { messageTools, handleSendMessage, handleSendBlobMessage, handleReadMessages } from './tools/messages.js';
 import {
@@ -123,6 +124,49 @@ function jsonRpcErrorResponse(id: unknown, code: number, message: string, data?:
   };
 }
 
+function extractBearerToken(req: express.Request): string {
+  const header = req.headers.authorization;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== 'string') return '';
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function apiAuthMiddleware(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (API_AUTH_MODE !== 'enforce' || req.path === '/healthz') {
+    next();
+    return;
+  }
+
+  const token = extractBearerToken(req);
+  if (!token) {
+    res.setHeader('WWW-Authenticate', 'Bearer realm="mcp-hub"');
+    res.status(401).json({
+      success: false,
+      error_code: 'API_KEY_REQUIRED',
+      error: 'Authorization bearer token is required',
+    });
+    return;
+  }
+
+  const validation = validateApiKeyToken(token, API_JWT_SECRET);
+  if (!validation.valid) {
+    const label = validation.kid || validation.jti
+      ? ` kid=${validation.kid || 'unknown'} jti=${validation.jti || 'unknown'}`
+      : '';
+    console.warn(`[api-auth] rejected reason=${validation.reason}${label} route=${req.method} ${req.path}`);
+    res.setHeader('WWW-Authenticate', 'Bearer realm="mcp-hub", error="invalid_token"');
+    res.status(401).json({
+      success: false,
+      error_code: 'API_KEY_INVALID',
+      error: 'Authorization bearer token is invalid',
+    });
+    return;
+  }
+
+  next();
+}
+
 function extractAgentAuthPayload(args: Record<string, unknown>): { agentId: string | null; authToken: string | null } {
   const candidateAgentKeys = ['agent_id', 'from_agent', 'created_by', 'requesting_agent'] as const;
   const candidateTokenKeys = ['auth_token', 'token'] as const;
@@ -174,6 +218,11 @@ const AUTH_MODE = (() => {
   if (configured === 'observe' || configured === 'warn' || configured === 'enforce') return configured;
   return REQUIRE_AUTH ? 'enforce' : 'observe';
 })();
+const API_AUTH_MODE = (() => {
+  const configured = String(process.env.MCP_HUB_API_AUTH_MODE || 'off').toLowerCase().trim();
+  return configured === 'enforce' ? 'enforce' : 'off';
+})();
+const API_JWT_SECRET = process.env.MCP_HUB_API_JWT_SECRET || '';
 const MAINTENANCE_INTERVAL_MS = Number(process.env.MCP_HUB_MAINTENANCE_INTERVAL_MS || 30_000);
 const SESSION_IDLE_TIMEOUT_MS = (() => {
   const raw = Number(process.env.MCP_HUB_SESSION_IDLE_TIMEOUT_MS);
@@ -1327,9 +1376,19 @@ function registerTools(server: McpServer) {
 const PORT = parseInt(process.env.MCP_HUB_PORT || '3000');
 const HOST = process.env.MCP_HUB_HOST || '0.0.0.0';
 
+if (API_AUTH_MODE === 'enforce' && !API_JWT_SECRET.trim()) {
+  throw new Error('MCP_HUB_API_JWT_SECRET is required when MCP_HUB_API_AUTH_MODE=enforce');
+}
+
 const app = createMcpExpressApp({ host: HOST });
 fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
 const artifactUploadRaw = express.raw({ type: '*/*', limit: ARTIFACT_MAX_BYTES });
+
+app.get('/healthz', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.use(apiAuthMiddleware);
 
 app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) => {
   try {
@@ -1708,6 +1767,7 @@ app.get('/health', (_req, res) => {
     status: 'ok',
     sessions: transports.size,
     auth_mode: AUTH_MODE,
+    api_auth_mode: API_AUTH_MODE,
     namespace_quota_mode: NAMESPACE_QUOTA_MODE,
     namespace_quota_rps: NAMESPACE_QUOTA_RPS,
     namespace_token_budget_per_min: NAMESPACE_TOKEN_BUDGET_PER_MIN,
@@ -1761,6 +1821,6 @@ setInterval(() => {
 
 app.listen(PORT, HOST, () => {
   console.log(
-    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, unknown_session_policy=${UNKNOWN_SESSION_POLICY}, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
+    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, api_auth_mode=${API_AUTH_MODE}, unknown_session_policy=${UNKNOWN_SESSION_POLICY}, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
   );
 });

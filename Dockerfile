@@ -13,6 +13,8 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 COPY --from=build /app/dist ./dist
+RUN chmod +x /app/dist/cli/api-key.js \
+    && ln -s /app/dist/cli/api-key.js /usr/local/bin/mcp-hub-api-key
 
 EXPOSE 3000
 

@@ -273,6 +273,16 @@ function initSchema(d: Database.Database): void {
       last_used_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      token_id TEXT NOT NULL UNIQUE,
+      token_hash TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER,
+      revoked_at INTEGER
+    );
+
     CREATE TABLE IF NOT EXISTS tasks_archive (
       id INTEGER PRIMARY KEY,
       title TEXT NOT NULL,
@@ -399,6 +409,9 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_auth_events_created_at ON auth_events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_auth_events_tool_created_at ON auth_events(tool_name, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_auth_events_agent_created_at ON auth_events(agent_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_api_keys_name_created_at ON api_keys(name, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_active_name ON api_keys(name) WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_api_keys_revoked_at ON api_keys(revoked_at);
     CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_artifacts_namespace_created_at ON artifacts(namespace, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_artifacts_created_by_created_at ON artifacts(created_by, created_at DESC);

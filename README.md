@@ -165,6 +165,8 @@ Key protocol modes:
 
 ```bash
 MCP_HUB_AUTH_MODE=observe|warn|enforce
+MCP_HUB_API_AUTH_MODE=off|enforce
+MCP_HUB_API_JWT_SECRET=<jwt-signing-secret-required-when-api-auth-enforced>
 MCP_HUB_NAMESPACE_GOVERNANCE=off|warn|require
 MCP_HUB_EXTRA_BIND_HOSTS=100.107.1.68[,192.168.1.50]
 MCP_HUB_SESSION_IDLE_TIMEOUT_MS=21600000 # <=0 disables idle session eviction (sessions live until DELETE /mcp or server restart)
@@ -200,6 +202,31 @@ MCP_HUB_EPHEMERAL_DEFAULT_ONBOARDING_MODE=compact|full|none
 MCP_HUB_REREGISTER_ONBOARDING_MODE=none|compact|full
 MCP_HUB_PUBLIC_BASE_URL=http://localhost:3000
 ```
+
+### HTTP API Key Auth
+
+`MCP_HUB_API_AUTH_MODE=enforce` protects every HTTP route except `/healthz`
+with a bearer API key. This is separate from agent `auth_token` enforcement:
+the API key gates access to the service, while agent auth controls tool calls
+inside the hub.
+
+Keys are HS256 JWTs backed by DB rows. Create and revoke them with the container
+CLI:
+
+```bash
+docker exec mcp-hub mcp-hub-api-key create primary --exp 90d
+docker exec mcp-hub mcp-hub-api-key list
+docker exec mcp-hub mcp-hub-api-key revoke primary
+```
+
+Clients pass the token on MCP and HTTP requests:
+
+```text
+Authorization: Bearer <mcp-hub-api-key>
+```
+
+Missing keys return `API_KEY_REQUIRED`; invalid, expired, revoked, or unknown
+keys return `API_KEY_INVALID`.
 
 The persistent production profile is stored in the repository:
 
@@ -426,6 +453,7 @@ Role skill cheatsheets:
 | `/events` | GET | SSE-only push channel for high-load polling replacement (`agent_id`, `auth_token`, `streams`, `cursor`, `response_mode`) |
 | `/artifacts/upload/:artifactId` | POST | Side-channel upload binary artifact (ticket/token required) |
 | `/artifacts/download/:artifactId` | GET | Side-channel download binary artifact (ticket/token required) |
+| `/healthz` | GET | Minimal unauthenticated liveness check |
 | `/health` | GET | Health check (`auth_mode`, namespace quota mode, SSE settings, session counters) |
 
 ## Handshake Diagnostics
