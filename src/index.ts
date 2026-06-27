@@ -253,6 +253,21 @@ const EVENT_STREAM_DEFAULT_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_
 const EVENT_STREAM_HEARTBEAT_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))
   ? Math.max(2_000, Math.min(60_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_HEARTBEAT_MS))))
   : 15_000;
+// Keepalive for the standalone GET /mcp SSE stream. Reverse proxies cancel idle
+// streams (e.g. Cloudflare returns HTTP 524 after ~100s of inactivity). We emit a
+// periodic server->client `ping` which puts bytes on the standalone stream and
+// resets the proxy idle timer. Set MCP_HUB_SSE_KEEPALIVE_MS<=0 to disable.
+const MCP_SSE_KEEPALIVE_MS = (() => {
+  const raw = Number(process.env.MCP_HUB_SSE_KEEPALIVE_MS);
+  if (!Number.isFinite(raw)) return 25_000;
+  const normalized = Math.floor(raw);
+  if (normalized <= 0) return 0;
+  return Math.max(1_000, Math.min(90_000, normalized));
+})();
+const MCP_SSE_KEEPALIVE_TIMEOUT_MS = MCP_SSE_KEEPALIVE_MS > 0
+  ? Math.max(1_000, Math.min(MCP_SSE_KEEPALIVE_MS, 20_000))
+  : 20_000;
+const MCP_PING_RESULT_SCHEMA = z.object({}).passthrough();
 
 type ArtifactTicket = {
   token: string;
@@ -1500,6 +1515,10 @@ function touchSession(sessionId: string | undefined) {
   sessionLastActivity.set(sessionId, Date.now());
 }
 
+// The standalone GET SSE keepalive needs the connected McpServer to emit pings,
+// so we stash it on the transport instance for retrieval in the GET handler.
+type TransportWithKeepAlive = StreamableHTTPServerTransport & { __mcpServer?: McpServer };
+
 async function createConnectedTransport(options?: { stateless?: boolean }) {
   const stateless = options?.stateless === true;
   const transport = new StreamableHTTPServerTransport({
@@ -1510,6 +1529,7 @@ async function createConnectedTransport(options?: { stateless?: boolean }) {
   const server = createServer();
   registerTools(server);
   await server.connect(transport);
+  (transport as TransportWithKeepAlive).__mcpServer = server;
   return { server, transport };
 }
 
@@ -1607,7 +1627,39 @@ app.get('/mcp', async (req, res) => {
   }
   const transport = transports.get(sessionId)!;
   touchSession(sessionId);
-  await transport.handleRequest(req, res, req.body);
+
+  // Keep the long-lived standalone SSE stream warm so idle-timeout proxies
+  // (e.g. Cloudflare's ~100s limit, returning HTTP 524) do not cancel it. A
+  // server->client `ping` is written onto this stream and answered by the
+  // client; it requires no client capability and is otherwise a no-op.
+  const keepAliveServer = (transport as TransportWithKeepAlive).__mcpServer;
+  let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+  if (MCP_SSE_KEEPALIVE_MS > 0 && keepAliveServer) {
+    keepAliveTimer = setInterval(() => {
+      keepAliveServer.server
+        .request(
+          { method: 'ping' } as Parameters<typeof keepAliveServer.server.request>[0],
+          MCP_PING_RESULT_SCHEMA,
+          { timeout: MCP_SSE_KEEPALIVE_TIMEOUT_MS },
+        )
+        .then(() => touchSession(sessionId))
+        .catch(() => { /* client slow or disconnected; teardown clears the timer */ });
+    }, MCP_SSE_KEEPALIVE_MS);
+  }
+  const stopKeepAlive = () => {
+    if (keepAliveTimer) {
+      clearInterval(keepAliveTimer);
+      keepAliveTimer = null;
+    }
+  };
+  res.on('close', stopKeepAlive);
+  res.on('finish', stopKeepAlive);
+
+  try {
+    await transport.handleRequest(req, res, req.body);
+  } finally {
+    stopKeepAlive();
+  }
 });
 
 app.delete('/mcp', async (req, res) => {
