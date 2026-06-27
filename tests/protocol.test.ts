@@ -206,4 +206,28 @@ describe('protocol tools', () => {
     expect(listed.success).toBe(true);
     expect(listed.blobs.find((blob) => blob.hash === stored.hash)).toBeTruthy();
   });
+
+  it('dictionary packing is lossless for colliding keys (T78-F1)', () => {
+    // All previously-colliding pairs present at once: agent/agent_id, task/task_id,
+    // created_at/timestamp, references/refs, text/content.
+    const original = {
+      agent: 'a-x', agent_id: 'id-y',
+      task: 'tname', task_id: 9,
+      created_at: 111, timestamp: 222,
+      references: ['r1'], refs: ['r2'],
+      text: 'hello', content: 'world',
+    };
+    const packed = handlePackProtocolMessage({
+      agent_id: 'a1', payload: JSON.stringify(original), payload_format: 'json', mode: 'dictionary',
+    });
+    expect(packed.success).toBe(true);
+    if (!packed.success) return;
+
+    const unpacked = handleUnpackProtocolMessage({ agent_id: 'a1', packet_json: packed.packet_json });
+    expect(unpacked.success).toBe(true);
+    if (!unpacked.success) return;
+    expect(unpacked.hash_valid).toBe(true);
+    // Round-trip must be exactly lossless (pre-fix this corrupted agent->agent_id, text->content, etc).
+    expect(unpacked.decoded_payload).toEqual(original);
+  });
 });

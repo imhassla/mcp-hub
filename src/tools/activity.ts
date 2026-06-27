@@ -706,6 +706,59 @@ export async function handleWaitForUpdates(args: {
     };
   }
 
+  const buildHitResponse = (events: ReturnType<typeof listStreamEventsAfter>) => {
+    resetAdaptiveWaitRetry(watcherAgentId);
+    const nextEventId = events[events.length - 1].id;
+    const cursor = encodeEventCursor(nextEventId);
+    const changedStreams = [...new Set(events.map((event) => event.stream))];
+    const changed = changedStreamMap(changedStreams);
+    if (WAIT_LOG_HITS) {
+      logActivity(watcherAgentId, 'wait_for_updates_hit', `event_cursor=${afterId} changed=${JSON.stringify(changed)}`, { emit_stream_event: false });
+    }
+    if (responseMode === 'nano') {
+      return { c: 1, s: changedStreams, u: cursor, i: nextEventId };
+    }
+    if (responseMode === 'micro') {
+      return { changed: true, streams: changedStreams, cursor, event_id: nextEventId };
+    }
+    if (responseMode === 'tiny') {
+      return {
+        success: true,
+        changed: true,
+        streams: changedStreams,
+        cursor,
+        event_id: nextEventId,
+      };
+    }
+    if (responseMode === 'compact') {
+      return {
+        success: true,
+        changed: true,
+        elapsed_ms: Date.now() - startedAt,
+        streams: changedStreams,
+        cursor,
+        event_id: nextEventId,
+        events: events.map((event) => ({
+          id: event.id,
+          stream: event.stream,
+          op: event.op,
+          entity_id: event.entity_id,
+          created_at: event.created_at,
+        })),
+      };
+    }
+    return {
+      success: true,
+      changed: true,
+      elapsed_ms: Date.now() - startedAt,
+      cursor,
+      event_id: nextEventId,
+      changed_streams: changed,
+      watermark: getUpdateWatermark(watcherAgentId, { streams: timestampWatermarkStreams(watchedStreams) }),
+      events,
+    };
+  };
+
   while (Date.now() <= deadline) {
     const events = listStreamEventsAfter({
       agent_id: watcherAgentId,
@@ -714,58 +767,23 @@ export async function handleWaitForUpdates(args: {
       limit: 100,
     });
     if (events.length > 0) {
-      resetAdaptiveWaitRetry(watcherAgentId);
-      const nextEventId = events[events.length - 1].id;
-      const cursor = encodeEventCursor(nextEventId);
-      const changedStreams = [...new Set(events.map((event) => event.stream))];
-      const changed = changedStreamMap(changedStreams);
-      if (WAIT_LOG_HITS) {
-        logActivity(watcherAgentId, 'wait_for_updates_hit', `event_cursor=${afterId} changed=${JSON.stringify(changed)}`, { emit_stream_event: false });
-      }
-      if (responseMode === 'nano') {
-        return { c: 1, s: changedStreams, u: cursor, i: nextEventId };
-      }
-      if (responseMode === 'micro') {
-        return { changed: true, streams: changedStreams, cursor, event_id: nextEventId };
-      }
-      if (responseMode === 'tiny') {
-        return {
-          success: true,
-          changed: true,
-          streams: changedStreams,
-          cursor,
-          event_id: nextEventId,
-        };
-      }
-      if (responseMode === 'compact') {
-        return {
-          success: true,
-          changed: true,
-          elapsed_ms: Date.now() - startedAt,
-          streams: changedStreams,
-          cursor,
-          event_id: nextEventId,
-          events: events.map((event) => ({
-            id: event.id,
-            stream: event.stream,
-            op: event.op,
-            entity_id: event.entity_id,
-            created_at: event.created_at,
-          })),
-        };
-      }
-      return {
-        success: true,
-        changed: true,
-        elapsed_ms: Date.now() - startedAt,
-        cursor,
-        event_id: nextEventId,
-        changed_streams: changed,
-        watermark: getUpdateWatermark(watcherAgentId, { streams: timestampWatermarkStreams(watchedStreams) }),
-        events,
-      };
+      return buildHitResponse(events);
     }
     await sleep(pollIntervalMs);
+  }
+
+  // F4: an event can arrive during the final sleep window — after the last in-loop query but
+  // before the deadline. Without this final query the timeout would advance the cursor to the
+  // watermark (which includes that event), and a client adopting the returned cursor would skip
+  // it permanently. Deliver it instead.
+  const finalEvents = listStreamEventsAfter({
+    agent_id: watcherAgentId,
+    after_id: afterId,
+    streams: watchedStreams,
+    limit: 100,
+  });
+  if (finalEvents.length > 0) {
+    return buildHitResponse(finalEvents);
   }
 
   const watermarkEventId = Math.max(afterId, getStreamEventWatermark({

@@ -243,6 +243,8 @@ describe('consensus tools', () => {
       requesting_agent: 'arbiter',
       proposal_id: 'p-from-context',
       context_id: ctx.id,
+      // T78-F3: reading another agent's context as a vote source must name the source explicitly.
+      context_agent_id: 'worker-1',
       response_mode: 'tiny',
     });
 
@@ -251,6 +253,21 @@ describe('consensus tools', () => {
     expect(result.source_binding.kind).toBe('context');
     expect(result.source_binding.context_id).toBe(ctx.id);
     expect(result.source_binding.source_kind).toBe('blob_ref');
+  });
+
+  it('rejects an unscoped cross-agent context_id source (T78-F3)', () => {
+    const votesPayload = JSON.stringify({ votes: [{ agent_id: 'w1', vote: 'accept' }] });
+    const ctx = shareContext('worker-1', 'votes-payload-2', votesPayload);
+
+    const result = handleResolveConsensusFromContext({
+      requesting_agent: 'arbiter',
+      proposal_id: 'p-scope',
+      context_id: ctx.id,
+      response_mode: 'tiny',
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error_code).toBe('CONTEXT_SCOPE_REQUIRED');
   });
 
   it('resolve_consensus_from_message should resolve source from message content/metadata', () => {

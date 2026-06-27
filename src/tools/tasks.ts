@@ -1,6 +1,7 @@
 import {
   createTask,
   updateTask,
+  TaskDoneGateError,
   getTaskById,
   getTaskDependencies,
   getTaskWithDependencies,
@@ -246,8 +247,10 @@ function validateDoneGate(args: {
     ok: true,
     consistency_mode: consistencyMode,
     required_confidence: requiredConfidence,
+    confidence_floor: confidenceFloor,
     required_evidence_refs: requiredEvidenceRefs,
     evidence_refs: evidenceRefs,
+    require_independent_verifier: strictMode,
   };
 }
 
@@ -486,7 +489,9 @@ export function handleUpdateTask(args: {
     if (!previousTask) return { success: false, error: 'Task not found' };
 
     let requiredConfidence: number | undefined;
+    let confidenceFloor: number | undefined;
     let requiredEvidenceRefs: number | undefined;
+    let requireIndependentVerifier = false;
     let evidenceRefsTotal: number | undefined;
     const effectiveConsistencyMode = resolveTaskConsistencyMode({
       requested: args.consistency_mode,
@@ -528,6 +533,8 @@ export function handleUpdateTask(args: {
         };
       }
       requiredEvidenceRefs = gate.required_evidence_refs;
+      confidenceFloor = gate.confidence_floor;
+      requireIndependentVerifier = gate.require_independent_verifier === true;
     }
 
     const {
@@ -540,10 +547,40 @@ export function handleUpdateTask(args: {
       idempotency_key: _key,
       ...updates
     } = args;
-    const task = updateTask(args.id, updates);
+    // F6: persist evidence and the done-status flip in ONE transaction (see updateTask).
+    const evidenceBefore = listTaskEvidence(args.id, 1000).length;
+    let task: ReturnType<typeof updateTask>;
+    try {
+      task = updateTask(args.id, updates, {
+        evidenceRefs,
+        minEvidenceRefs: args.status === 'done' ? (requiredEvidenceRefs ?? 0) : 0,
+        addedBy: agent_id,
+        confidence: args.confidence,
+        requiredConfidence,
+        confidenceFloor,
+        verificationPassed: args.verification_passed,
+        verifiedBy: args.verified_by,
+        requireIndependentVerifier,
+      });
+    } catch (error) {
+      if (error instanceof TaskDoneGateError) {
+        logActivity(args.agent_id, 'update_task_done_gate_failed', `Task #${args.id}: ${error.message}`);
+        return {
+          success: false,
+          error_code: error.error_code,
+          error: error.message,
+          required_confidence: error.required_confidence ?? requiredConfidence,
+          required_evidence_refs: error.required_evidence_refs ?? requiredEvidenceRefs,
+          evidence_refs_total: error.evidence_refs_total,
+          consistency_mode: effectiveConsistencyMode,
+        };
+      }
+      throw error;
+    }
     if (!task) return { success: false, error: 'Task not found' };
 
-    const evidenceWrite = addTaskEvidence(task.id, agent_id, evidenceRefs);
+    const evidenceTotalNow = listTaskEvidence(task.id, 1000).length;
+    const evidenceWrite = { added: Math.max(0, evidenceTotalNow - evidenceBefore), total: evidenceTotalNow };
     evidenceRefsTotal = evidenceWrite.total;
 
     if (previousTask.status !== task.status) {
@@ -825,7 +862,9 @@ export function handleReleaseTaskClaim(args: {
   heartbeat(args.agent_id);
   return withIdempotency(args.agent_id, 'release_task_claim', args.idempotency_key, () => {
     let requiredConfidence: number | undefined;
+    let confidenceFloor: number | undefined;
     let requiredEvidenceRefs: number | undefined;
+    let requireIndependentVerifier = false;
     let evidenceRefsTotal: number | undefined;
     const previousTask = getTaskById(args.task_id);
     const effectiveConsistencyMode = resolveTaskConsistencyMode({
@@ -868,14 +907,28 @@ export function handleReleaseTaskClaim(args: {
         };
       }
       requiredEvidenceRefs = gate.required_evidence_refs;
+      confidenceFloor = gate.confidence_floor;
+      requireIndependentVerifier = gate.require_independent_verifier === true;
     }
 
-    const result = releaseTaskClaim(args.task_id, args.agent_id, args.next_status, args.claim_id);
+    // F6: release the claim, persist evidence, and flip status in ONE transaction. The db layer
+    // re-enforces the minimum evidence count for the done transition so the status and its
+    // required evidence can never be committed separately.
+    const result = releaseTaskClaim(args.task_id, args.agent_id, args.next_status, args.claim_id, {
+      evidenceRefs,
+      minEvidenceRefs: args.next_status === 'done' ? requiredEvidenceRefs : 0,
+      confidence: args.confidence,
+      requiredConfidence,
+      confidenceFloor,
+      verificationPassed: args.verification_passed,
+      verifiedBy: args.verified_by,
+      requireIndependentVerifier,
+    });
     if (!result.success) {
       logActivity(args.agent_id, 'release_task_claim_failed', `Task #${args.task_id}: ${result.error} (${result.error_code})`);
       return result;
     }
-    const evidenceWrite = addTaskEvidence(result.task.id, args.agent_id, evidenceRefs);
+    const evidenceWrite = { added: result.evidence_added, total: result.evidence_total };
     evidenceRefsTotal = evidenceWrite.total;
     if (previousTask && previousTask.status !== result.task.status) {
       recordTaskStatusTransition({

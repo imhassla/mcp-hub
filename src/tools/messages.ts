@@ -1,6 +1,7 @@
 import {
   sendMessage,
   readMessages,
+  markMessagesRead,
   heartbeat,
   logActivity,
   putProtocolBlob,
@@ -280,6 +281,9 @@ export function handleReadMessages(args: {
   }
   const queryLimit = useDeltaOrdering ? Math.min(MAX_READ_LIMIT + 1, limit + 1) : limit;
   const offset = Math.max(0, Math.floor(args.offset ?? 0));
+  // T77-F1: fetch WITHOUT marking (the delta path over-fetches limit+1 to compute has_more), then
+  // mark only the rows actually returned to the caller. Marking the over-fetched peek row would
+  // drop it permanently under unread_only + delta pagination.
   const messages = readMessages(args.agent_id, {
     from: args.from,
     unread_only: args.unread_only,
@@ -287,10 +291,13 @@ export function handleReadMessages(args: {
     offset,
     since_ts: sinceTs,
     cursor: cursor || undefined,
-    mark_read: args.mark_read,
+    mark_read: false,
   });
   const hasMore = useDeltaOrdering ? messages.length > limit : false;
   const slicedMessages = hasMore ? messages.slice(0, limit) : messages;
+  if (args.mark_read !== false) {
+    markMessagesRead(args.agent_id, slicedMessages.filter((message) => message.read === 0).map((message) => message.id));
+  }
   const nextCursor = slicedMessages.length > 0 ? formatMessageCursor(slicedMessages[slicedMessages.length - 1]) : args.cursor || null;
   const resolvedMessages: ResolvedMessage[] = args.resolve_blob_refs
     ? slicedMessages.map((message) => {

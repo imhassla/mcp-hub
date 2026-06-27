@@ -58,8 +58,12 @@ function normalizeOptionalKeyPrefix(keyPrefix?: string): string | null {
   return cleaned || null;
 }
 
-function contextKey(memoryKey: string): string {
-  return `${MEMORY_KEY_PREFIX}${memoryKey}`;
+// T78-F4: include the namespace in the stored context key so memory identity is
+// (agent_id, namespace, key). Previously the key was only `memory:<key>`, so writing the same
+// key under two namespaces collided on the context UNIQUE(agent_id, key) and silently overwrote
+// the first namespace's memory.
+function contextKey(namespace: string, memoryKey: string): string {
+  return `${MEMORY_KEY_PREFIX}${namespace}:${memoryKey}`;
 }
 
 function normalizeTags(tags?: unknown): string[] {
@@ -119,7 +123,10 @@ function preview(value: string, max = 220): string {
 function formatMemory(rows: MemoryRow[], mode: MemoryMode) {
   return rows.map((row) => {
     const payload = parsePayload(row);
-    const memoryKey = row.key.startsWith(MEMORY_KEY_PREFIX) ? row.key.slice(MEMORY_KEY_PREFIX.length) : row.key;
+    let memoryKey = row.key.startsWith(MEMORY_KEY_PREFIX) ? row.key.slice(MEMORY_KEY_PREFIX.length) : row.key;
+    // Strip the leading `<namespace>:` segment so the caller sees the bare memory key (T78-F4).
+    const nsPrefix = `${row.namespace}:`;
+    if (memoryKey.startsWith(nsPrefix)) memoryKey = memoryKey.slice(nsPrefix.length);
     if (mode === 'nano') {
       return [row.id, row.agent_id, memoryKey, row.namespace, payload.importance, row.updated_at, sha256Hex(payload.text).slice(0, 12)];
     }
@@ -170,7 +177,7 @@ export function handleWriteMemory(args: {
       updated_by: args.agent_id,
       updated_at: now,
     };
-    const ctx = shareContext(args.agent_id, contextKey(key), JSON.stringify(payload), undefined, undefined, namespace);
+    const ctx = shareContext(args.agent_id, contextKey(namespace, key), JSON.stringify(payload), undefined, undefined, namespace);
     logActivity(args.agent_id, 'write_memory', `memory_id=${ctx.id} key=${key} ns=${namespace} tags=${payload.tags.join(',')}`, { emit_stream_event: false });
     return {
       success: true,
@@ -267,8 +274,10 @@ export function handleGetMemoryDigest(args: {
     params.push(namespace);
   }
   if (keyPrefix) {
+    // Keys are now `memory:<namespace>:<key>`, so match the key segment after the namespace.
+    // The namespace column filter (above) already scopes results when a namespace is given.
     query += ` AND LOWER(key) LIKE ? ESCAPE '\\'`;
-    params.push(`${MEMORY_KEY_PREFIX}${escapeLike(keyPrefix)}%`);
+    params.push(`${MEMORY_KEY_PREFIX}%:${escapeLike(keyPrefix)}%`);
   }
   if (updatedBy) {
     query += ' AND LOWER(agent_id) = ?';

@@ -414,9 +414,25 @@ export function handleShareArtifact(args: {
         error: 'Sender has no access to this artifact',
       };
     }
-
+    // T78-F2: only the artifact owner may widen access. A non-owner grantee could otherwise
+    // re-share another agent's artifact to a third party or to '*'.
+    if (artifact.created_by !== args.from_agent) {
+      return {
+        success: false,
+        error_code: 'ARTIFACT_NOT_OWNER',
+        error: 'Only the artifact owner can share it',
+      };
+    }
+    // T78-F2: require an explicit target. A blank to_agent must NOT silently default to public.
     const toAgent = typeof args.to_agent === 'string' ? args.to_agent.trim() : '';
-    const target = toAgent || '*';
+    if (!toAgent) {
+      return {
+        success: false,
+        error_code: 'SHARE_TARGET_REQUIRED',
+        error: 'to_agent is required (pass an explicit agent id; "*" must be supplied explicitly to share with all agents)',
+      };
+    }
+    const target = toAgent;
     grantArtifactAccess({ artifact_id: artifactId, to_agent: target, granted_by: args.from_agent });
     let taskBinding:
       | {

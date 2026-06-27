@@ -79,6 +79,32 @@ let watermarkAllMessagesCache: {
 } | null = null;
 const watermarkAgentMessageCache = new Map<string, { sampled_at: number; latest_message_ts: number }>();
 
+type TaskDoneGateErrorCode = 'DONE_GATE_FAILED' | 'VERIFIER_REQUIRED' | 'EVIDENCE_REQUIRED';
+
+export class TaskDoneGateError extends Error {
+  error_code: TaskDoneGateErrorCode;
+  required_confidence?: number;
+  required_evidence_refs?: number;
+  evidence_refs_total?: number;
+
+  constructor(
+    errorCode: TaskDoneGateErrorCode,
+    message: string,
+    details: {
+      required_confidence?: number;
+      required_evidence_refs?: number;
+      evidence_refs_total?: number;
+    } = {}
+  ) {
+    super(message);
+    this.name = 'TaskDoneGateError';
+    this.error_code = errorCode;
+    this.required_confidence = details.required_confidence;
+    this.required_evidence_refs = details.required_evidence_refs;
+    this.evidence_refs_total = details.evidence_refs_total;
+  }
+}
+
 function resetWatermarkCaches() {
   watermarkCoreCache = null;
   watermarkAllMessagesCache = null;
@@ -1060,6 +1086,26 @@ export function readMessages(agentId: string, options: {
   return messages;
 }
 
+// Mark a specific set of messages read for an agent. Used by the read_messages handler so that
+// only the rows actually returned to the caller are marked — never an over-fetched limit+1 peek
+// row, which would otherwise be lost under unread_only + delta pagination (T77-F1).
+export function markMessagesRead(agentId: string, messageIds: number[]): number {
+  if (!Array.isArray(messageIds) || messageIds.length === 0) return 0;
+  const ids = [...new Set(messageIds.filter((id) => Number.isFinite(id)))];
+  if (ids.length === 0) return 0;
+  const d = getDb();
+  const now = Date.now();
+  let marked = 0;
+  const tx = d.transaction((rows: number[]) => {
+    const insert = d.prepare('INSERT OR IGNORE INTO message_reads (message_id, agent_id, read_at) VALUES (?, ?, ?)');
+    for (const messageId of rows) {
+      marked += insert.run(messageId, agentId, now).changes;
+    }
+  });
+  tx(ids);
+  return marked;
+}
+
 export function getMessageForAgent(agentId: string, messageId: number): Message | null {
   const normalizedMessageId = Number.isFinite(messageId) ? Math.floor(Number(messageId)) : 0;
   if (normalizedMessageId <= 0) return null;
@@ -1172,6 +1218,86 @@ export function createTask(task: {
   } as Task;
 }
 
+function normalizeTaskEvidenceRefs(evidenceRefs?: string[]): string[] {
+  if (!Array.isArray(evidenceRefs)) return [];
+  return [...new Set(
+    evidenceRefs
+      .map((ref) => (typeof ref === 'string' ? ref.trim() : ''))
+      .filter((ref) => ref.length > 0)
+  )];
+}
+
+function assertDoneGateCommit(args: {
+  agentId: string;
+  confidence?: number;
+  requiredConfidence?: number;
+  confidenceFloor?: number;
+  verificationPassed?: boolean;
+  verifiedBy?: string;
+  requireIndependentVerifier?: boolean;
+  evidenceRefs: string[];
+  existingEvidenceRefs: string[];
+  minEvidenceRefs?: number;
+}) {
+  const confidence = Number(args.confidence);
+  const requiredConfidence = Number(args.requiredConfidence);
+  const confidenceFloor = Number(args.confidenceFloor);
+  if (!Number.isFinite(confidence)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing confidence for done transition');
+  }
+  if (!Number.isFinite(requiredConfidence)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing required confidence for done transition');
+  }
+  if (!Number.isFinite(confidenceFloor)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing confidence floor for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  if (confidence < confidenceFloor) {
+    throw new TaskDoneGateError(
+      'DONE_GATE_FAILED',
+      `Confidence ${confidence.toFixed(2)} below floor ${confidenceFloor.toFixed(2)} for done transition`,
+      { required_confidence: requiredConfidence }
+    );
+  }
+  if (args.verificationPassed !== true) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'verification_passed must be true for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+
+  const verifiedBy = (args.verifiedBy || '').trim();
+  const hasIndependentVerifier = verifiedBy.length > 0 && verifiedBy !== args.agentId;
+  if (args.requireIndependentVerifier === true && !hasIndependentVerifier) {
+    throw new TaskDoneGateError('VERIFIER_REQUIRED', 'Independent verifier is required for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  if (confidence < requiredConfidence && !hasIndependentVerifier) {
+    throw new TaskDoneGateError(
+      'VERIFIER_REQUIRED',
+      `Independent verifier required when confidence (${confidence.toFixed(2)}) is below threshold ${requiredConfidence.toFixed(2)}`,
+      { required_confidence: requiredConfidence }
+    );
+  }
+
+  if (!Number.isFinite(Number(args.minEvidenceRefs))) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing required evidence count for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  const minEvidenceRefs = Math.max(0, Math.floor(Number(args.minEvidenceRefs)));
+  const allEvidence = new Set(args.existingEvidenceRefs);
+  for (const ref of args.evidenceRefs) allEvidence.add(ref);
+  if (allEvidence.size < minEvidenceRefs) {
+    throw new TaskDoneGateError('EVIDENCE_REQUIRED', `done transition requires at least ${minEvidenceRefs} evidence ref(s)`, {
+      required_confidence: requiredConfidence,
+      required_evidence_refs: minEvidenceRefs,
+      evidence_refs_total: allEvidence.size,
+    });
+  }
+}
+
 export function updateTask(id: number, updates: {
   status?: string;
   assigned_to?: string;
@@ -1184,10 +1310,30 @@ export function updateTask(id: number, updates: {
   trace_id?: string;
   span_id?: string;
   depends_on?: number[];
-}): Task | null {
+}, options: {
+  evidenceRefs?: string[];
+  minEvidenceRefs?: number;
+  addedBy?: string;
+  confidence?: number;
+  requiredConfidence?: number;
+  confidenceFloor?: number;
+  verificationPassed?: boolean;
+  verifiedBy?: string;
+  requireIndependentVerifier?: boolean;
+} = {}): Task | null {
   const d = getDb();
   const existing = d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
   if (!existing) return null;
+
+  // F6: when this update transitions the task to `done`, evidence must be inserted in the SAME
+  // transaction as the status flip (and the minimum-evidence invariant enforced there) so a crash
+  // can never leave a task done with fewer than the required evidence refs.
+  const willBeDone = updates.status === 'done';
+  const evidenceRefs = normalizeTaskEvidenceRefs(options.evidenceRefs);
+  const minEvidenceRefs = willBeDone && Number.isFinite(Number(options.minEvidenceRefs))
+    ? Math.max(0, Math.floor(Number(options.minEvidenceRefs)))
+    : undefined;
+  const evidenceAddedBy = options.addedBy || existing.assigned_to || existing.created_by;
 
   const fields: string[] = [];
   const params: unknown[] = [];
@@ -1204,7 +1350,7 @@ export function updateTask(id: number, updates: {
   if (updates.span_id !== undefined) { fields.push('span_id = ?'); params.push(updates.span_id || null); }
   const hasDependencyUpdate = updates.depends_on !== undefined;
 
-  if (fields.length === 0 && !hasDependencyUpdate) return existing;
+  if (fields.length === 0 && !hasDependencyUpdate && evidenceRefs.length === 0 && minEvidenceRefs === undefined) return existing;
 
   const now = Date.now();
   if (fields.length > 0) {
@@ -1218,6 +1364,41 @@ export function updateTask(id: number, updates: {
       d.prepare(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`).run(...params);
     } else if (hasDependencyUpdate) {
       d.prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now, id);
+    }
+    // F5: reconcile task_claims when status/assignment is changed out-of-band. Leaving a
+    // stale claim row lets renew_task_claim reopen a finished task, blocks re-claim of a
+    // task reverted to pending (UNIQUE collision), and makes the task undeletable.
+    const statusBreaksClaim = updates.status !== undefined && updates.status !== 'in_progress';
+    const assignmentChanged = updates.assigned_to !== undefined;
+    if (statusBreaksClaim || assignmentChanged) {
+      d.prepare('DELETE FROM task_claims WHERE task_id = ?').run(id);
+    }
+    // F6: atomic done-evidence. Enforce the minimum evidence count for a done transition INSIDE
+    // this transaction (a violation throws and rolls back the whole update), and insert any
+    // provided evidence rows in the same transaction as the status flip. Evidence may also be
+    // accumulated on non-done updates, so the insert runs regardless of status; only the
+    // minimum-evidence invariant is gated on the done transition.
+    if (willBeDone) {
+      const existingRefs = (d.prepare('SELECT evidence_ref FROM task_evidence WHERE task_id = ?').all(id) as Array<{ evidence_ref: string }>)
+        .map((row) => row.evidence_ref);
+      assertDoneGateCommit({
+        agentId: evidenceAddedBy,
+        confidence: options.confidence,
+        requiredConfidence: options.requiredConfidence,
+        confidenceFloor: options.confidenceFloor,
+        verificationPassed: options.verificationPassed,
+        verifiedBy: options.verifiedBy,
+        requireIndependentVerifier: options.requireIndependentVerifier,
+        evidenceRefs,
+        existingEvidenceRefs: existingRefs,
+        minEvidenceRefs,
+      });
+    }
+    if (evidenceRefs.length > 0) {
+      const insertEvidence = d.prepare('INSERT OR IGNORE INTO task_evidence (task_id, evidence_ref, added_by, created_at) VALUES (?, ?, ?, ?)');
+      for (const ref of evidenceRefs) {
+        insertEvidence.run(id, ref, evidenceAddedBy, now);
+      }
     }
     if (hasDependencyUpdate) {
       const deps = normalizeDependencyIds(id, updates.depends_on);
@@ -1479,6 +1660,11 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
         throw new Error('CLAIM_STOLEN');
       }
     } else {
+      // F3: an expired lease must not block takeover. The throttled cleanupExpiredTaskClaims
+      // may have left the stale row in place, so remove any expired claim for this task before
+      // inserting. A still-valid foreign claim was already rejected above; a concurrent fresh
+      // claim is caught by the task_id UNIQUE/PK constraint (handled in the catch below).
+      d.prepare('DELETE FROM task_claims WHERE task_id = ? AND lease_expires_at <= ?').run(taskId, now);
       d.prepare(`
         INSERT INTO task_claims (task_id, agent_id, claim_id, claimed_at, lease_expires_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -1532,7 +1718,7 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
   claim: TaskClaim;
 } | {
   success: false;
-  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN';
+  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN' | 'TASK_NOT_RENEWABLE';
   error: string;
   current_claim?: TaskClaim;
 } {
@@ -1547,6 +1733,13 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
   }
   if (claimId && existing.claim_id !== claimId) {
     return { success: false, error_code: 'CLAIM_ID_MISMATCH', error: 'Claim ID does not match active claim', current_claim: existing };
+  }
+  // F5: refuse to renew a terminal task. The renew tx unconditionally sets status='in_progress',
+  // so renewing a claim left on a done task would silently reopen it. A claim on a done task is
+  // stale (it should have been reconciled); reject instead of resurrecting the task.
+  const currentTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;
+  if (currentTask && currentTask.status === 'done') {
+    return { success: false, error_code: 'TASK_NOT_RENEWABLE', error: 'Task is already done; claim cannot be renewed', current_claim: existing };
   }
   const expectedClaimId = claimId || existing.claim_id;
 
@@ -1598,14 +1791,34 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
   return { success: true, task, claim };
 }
 
-export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: string, claimId?: string): {
+export function releaseTaskClaim(
+  taskId: number,
+  agentId: string,
+  nextStatus?: string,
+  claimId?: string,
+  options: {
+    evidenceRefs?: string[];
+    minEvidenceRefs?: number;
+    confidence?: number;
+    requiredConfidence?: number;
+    confidenceFloor?: number;
+    verificationPassed?: boolean;
+    verifiedBy?: string;
+    requireIndependentVerifier?: boolean;
+  } = {}
+): {
   success: true;
   task: Task;
+  evidence_added: number;
+  evidence_total: number;
 } | {
   success: false;
-  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN';
+  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN' | 'DONE_GATE_FAILED' | 'VERIFIER_REQUIRED' | 'EVIDENCE_REQUIRED';
   error: string;
   current_claim?: TaskClaim;
+  required_confidence?: number;
+  required_evidence_refs?: number;
+  evidence_refs_total?: number;
 } {
   const d = getDb();
   const now = Date.now();
@@ -1623,6 +1836,14 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
 
   const effectiveStatus = nextStatus || 'pending';
   const assignedTo = effectiveStatus === 'done' ? agentId : null;
+  // F6: persist evidence and the done-status flip atomically. The minEvidenceRefs invariant is
+  // enforced INSIDE the transaction so a process crash can never leave a task `done` with fewer
+  // than the required evidence refs, and direct db-layer callers cannot bypass the minimum.
+  const evidenceRefs = normalizeTaskEvidenceRefs(options.evidenceRefs);
+  const minEvidenceRefs = effectiveStatus === 'done' && Number.isFinite(Number(options.minEvidenceRefs))
+    ? Math.max(0, Math.floor(Number(options.minEvidenceRefs)))
+    : undefined;
+  let evidenceAdded = 0;
 
   const tx = d.transaction(() => {
     const removed = d.prepare(`
@@ -1631,6 +1852,28 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
     `).run(taskId, agentId, expectedClaimId);
     if (removed.changes !== 1) {
       throw new Error('CLAIM_STOLEN');
+    }
+    if (effectiveStatus === 'done') {
+      const existingRefs = (d.prepare('SELECT evidence_ref FROM task_evidence WHERE task_id = ?').all(taskId) as Array<{ evidence_ref: string }>)
+        .map((row) => row.evidence_ref);
+      assertDoneGateCommit({
+        agentId,
+        confidence: options.confidence,
+        requiredConfidence: options.requiredConfidence,
+        confidenceFloor: options.confidenceFloor,
+        verificationPassed: options.verificationPassed,
+        verifiedBy: options.verifiedBy,
+        requireIndependentVerifier: options.requireIndependentVerifier,
+        evidenceRefs,
+        existingEvidenceRefs: existingRefs,
+        minEvidenceRefs,
+      });
+    }
+    if (evidenceRefs.length > 0) {
+      const insert = d.prepare('INSERT OR IGNORE INTO task_evidence (task_id, evidence_ref, added_by, created_at) VALUES (?, ?, ?, ?)');
+      for (const ref of evidenceRefs) {
+        evidenceAdded += insert.run(taskId, ref, agentId, now).changes;
+      }
     }
     d.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
       .run(effectiveStatus, assignedTo, now, taskId);
@@ -1648,8 +1891,19 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
         current_claim: current,
       };
     }
+    if (error instanceof TaskDoneGateError) {
+      return {
+        success: false,
+        error_code: error.error_code,
+        error: error.message,
+        required_confidence: error.required_confidence,
+        required_evidence_refs: error.required_evidence_refs,
+        evidence_refs_total: error.evidence_refs_total ?? countTaskEvidence(taskId),
+      };
+    }
     throw error;
   }
+  const evidenceTotal = countTaskEvidence(taskId);
   const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
   insertStreamEvent(d, {
     stream: 'tasks',
@@ -1663,7 +1917,7 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
     },
     created_at: now,
   });
-  return { success: true, task };
+  return { success: true, task, evidence_added: evidenceAdded, evidence_total: evidenceTotal };
 }
 
 export function listTaskClaims(options: { agent_id?: string } = {}): TaskClaimWithTask[] {

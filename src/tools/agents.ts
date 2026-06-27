@@ -1,4 +1,4 @@
-import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
+import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, validateAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
 import type { Agent, AgentLifecycle, AgentModelProfile, AgentRuntimeProfile, AgentWorkspaceMode, TaskExecutionMode } from '../types.js';
 
 type OnboardingMode = 'full' | 'compact' | 'none';
@@ -554,6 +554,8 @@ export function handleRegisterAgent(args: {
   lifecycle?: AgentLifecycle;
   runtime_profile?: AgentRuntimeProfile;
   role?: AgentRole;
+  auth_token?: string;
+  register_token?: string;
 }) {
   const lifecycle = normalizeLifecycle(args.lifecycle);
   const role = normalizeRole(args.role);
@@ -586,6 +588,13 @@ export function handleRegisterAgent(args: {
   );
   const onboarding = buildOnboarding(onboardingMode);
   const auth = getAgentToken(args.id);
+  // Security (F1): never return an existing agent's auth_token to a caller who has not
+  // proven ownership. A freshly created agent's token goes to its registrant; an existing
+  // agent's token is only echoed back when the caller supplies the matching token.
+  const ownershipProven = typeof args.auth_token === 'string'
+    && args.auth_token.length > 0
+    && validateAgentToken(args.id, args.auth_token);
+  const exposeToken = registrationResult.is_new || ownershipProven;
   const roleGuidance = buildRoleGuidance(role);
   const runtimeGuidance = buildRuntimeGuidance(runtimeProfile);
   return {
@@ -600,10 +609,14 @@ export function handleRegisterAgent(args: {
       server: serverCapabilities,
       negotiated,
     },
-    auth: auth ? {
+    auth: auth ? (exposeToken ? {
       token: auth.token,
       note: 'Keep token private. It is used by MCP_HUB_AUTH_MODE=warn|enforce.',
-    } : null,
+    } : {
+      token: null,
+      proof_required: true,
+      note: 'This agent id already exists. Re-register with its original auth_token to retrieve the token (proof of ownership required).',
+    }) : null,
     client_runtime: {
       session_recovery: {
         error_code: -32000,

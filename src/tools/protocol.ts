@@ -11,22 +11,28 @@ const DEFAULT_AUTO_PACK_MIN_GAIN_PCT = Number.isFinite(Number(process.env.MCP_HU
   ? Math.max(0, Math.min(100, Number(process.env.MCP_HUB_AUTO_PACK_MIN_GAIN_PCT)))
   : 3;
 
+// T78-F1: the alias mapping MUST be bijective. Previously several distinct long keys shared one
+// alias (agent/agent_id->a, task/task_id->t, timestamp/created_at->ts, refs/references->r,
+// content/text->x, experiment/experiment_id->e), so unpack decoded them to the WRONG key (e.g.
+// {agent:..} round-tripped to {agent_id:..}) while the integrity hash still validated. Each long
+// key now has a unique alias; the previously-winning alias (what ALIAS_TO_KEY decoded to) is kept
+// stable so already-packed data still decodes identically.
 const KEY_TO_ALIAS: Record<string, string> = {
   experiment: 'e',
-  experiment_id: 'e',
-  agent: 'a',
+  experiment_id: 'ei',
+  agent: 'ag',
   agent_id: 'a',
-  task: 't',
+  task: 'tk',
   task_id: 't',
   status: 's',
   confidence: 'c',
   summary: 'm',
   metadata: 'md',
   timestamp: 'ts',
-  created_at: 'ts',
+  created_at: 'ca',
   updated_at: 'tu',
   refs: 'r',
-  references: 'r',
+  references: 'rf',
   depends_on: 'd',
   priority: 'p',
   outcome: 'o',
@@ -37,20 +43,25 @@ const KEY_TO_ALIAS: Record<string, string> = {
   recommendation: 'rec',
   message: 'msg',
   content: 'x',
-  text: 'x',
+  text: 'tx',
 };
 
 const ALIAS_TO_KEY: Record<string, string> = {
   e: 'experiment',
+  ei: 'experiment_id',
   a: 'agent_id',
+  ag: 'agent',
   t: 'task_id',
+  tk: 'task',
   s: 'status',
   c: 'confidence',
   m: 'summary',
   md: 'metadata',
   ts: 'timestamp',
+  ca: 'created_at',
   tu: 'updated_at',
   r: 'refs',
+  rf: 'references',
   d: 'depends_on',
   p: 'priority',
   o: 'outcome',
@@ -61,6 +72,7 @@ const ALIAS_TO_KEY: Record<string, string> = {
   rec: 'recommendation',
   msg: 'message',
   x: 'content',
+  tx: 'text',
 };
 
 function sortKeysDeep(value: unknown): unknown {
@@ -148,6 +160,11 @@ export function handlePackProtocolMessage(args: {
   const dictEncoded = toShortKeys(normalized);
   const jsonEncodedStr = canonicalJson(jsonEncoded);
   const dictEncodedStr = canonicalJson(dictEncoded);
+  // T78-F1: guarantee dictionary encoding is losslessly reversible before ever selecting it. The
+  // bijective alias table makes this true for known keys; this round-trip check additionally
+  // protects against a payload whose literal key collides with another key's alias (and any future
+  // map regression) by forcing a JSON fallback instead of silently corrupting the payload.
+  const dictLossless = canonicalJson(toLongKeys(dictEncoded)) === canonicalJson(normalized);
   const dictionaryGainPctRaw = jsonEncodedStr.length > 0
     ? ((jsonEncodedStr.length - dictEncodedStr.length) / jsonEncodedStr.length) * 100
     : 0;
@@ -160,6 +177,11 @@ export function handlePackProtocolMessage(args: {
       return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
     }
     if (requestedMode === 'dictionary') {
+      if (!dictLossless) {
+        // Refuse to emit a lossy dictionary packet even when explicitly requested.
+        decisionReason = 'dictionary_lossy_fallback_json';
+        return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
+      }
       decisionReason = 'forced_dictionary';
       return { encoding: 'dictionary' as const, data: dictEncoded, dataStr: dictEncodedStr };
     }
@@ -170,6 +192,10 @@ export function handlePackProtocolMessage(args: {
     }
     if (dictionaryGainPct < minGainPct) {
       decisionReason = 'below_min_gain_pct';
+      return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
+    }
+    if (!dictLossless) {
+      decisionReason = 'dictionary_lossy_fallback_json';
       return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
     }
     decisionReason = 'gain_threshold_met';

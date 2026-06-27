@@ -175,4 +175,22 @@ describe('message tools', () => {
     expect(second.messages).toHaveLength(1);
     expect(second.has_more).toBe(false);
   });
+
+  it('does not lose the over-fetched peek row under unread_only + delta (T77-F1)', () => {
+    handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'u1' });
+    handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'u2' });
+    handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'u3' });
+
+    // Page 1: delta + unread_only + limit 2 over-fetches limit+1=3 rows (peek = u3, the 3rd).
+    // The peek row must NOT be marked read just because it was fetched to compute has_more.
+    const page1 = handleReadMessages({ agent_id: 'a2', since_ts: 0, limit: 2, unread_only: true, response_mode: 'compact' });
+    expect(page1.messages).toHaveLength(2);
+    expect(page1.has_more).toBe(true);
+
+    // Page 2: u3 is still unread and must be delivered. Pre-fix it was marked read on page 1 and
+    // then excluded by unread_only here -> permanently lost (page2 would be empty).
+    const page2 = handleReadMessages({ agent_id: 'a2', cursor: page1.next_cursor, limit: 2, unread_only: true, response_mode: 'compact' });
+    expect(page2.messages).toHaveLength(1);
+    expect(page2.has_more).toBe(false);
+  });
 });

@@ -541,6 +541,15 @@ export function handleResolveConsensusFromContext(args: ResolveConsensusSourceBa
     logActivity(args.requesting_agent, 'resolve_consensus_from_context_rejected', error);
     return { success: false, error_code: 'CONTEXT_NOT_FOUND', error };
   }
+  // T78-F3: scope a raw context_id lookup. When the caller resolves by numeric context_id without
+  // naming the owner, the context must belong to the requesting agent; to use another agent's
+  // context as a vote source the caller must explicitly pass context_agent_id (acknowledging the
+  // source), mirroring the message variant's recipient scoping.
+  if (hasContextId && !contextAgentId && sourceContext.agent_id !== args.requesting_agent) {
+    const error = 'context_id belongs to another agent; pass context_agent_id to use it explicitly as a consensus source';
+    logActivity(args.requesting_agent, 'resolve_consensus_from_context_rejected', error);
+    return { success: false, error_code: 'CONTEXT_SCOPE_REQUIRED', error };
+  }
   if (contextAgentId && sourceContext.agent_id !== contextAgentId) {
     const error = `Context source agent mismatch: expected "${contextAgentId}", got "${sourceContext.agent_id}"`;
     logActivity(args.requesting_agent, 'resolve_consensus_from_context_rejected', error);

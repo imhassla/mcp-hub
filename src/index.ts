@@ -610,36 +610,42 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     request_tokens_est: requestTokensEst,
   });
 
-  if (agentId && !consumeRateLimit(agentId, now)) {
-    return {
-      allowed: false,
-      response: {
-        success: false,
-        error_code: 'RATE_LIMIT_EXCEEDED',
-        error: 'Rate limit exceeded for this agent. Retry shortly.',
-        retry_after_ms: 1000,
-      },
-    };
-  }
-
-  if (NAMESPACE_QUOTA_MODE !== 'off') {
-    const namespace = extractNamespace(toolName, args);
-    quotaNamespace = namespace;
-    const namespaceRpsOk = consumeNamespaceRateLimit(namespace, now);
-    const tokenCost = estimateTokensFromValue(args);
-    requestTokensEst = tokenCost;
-    const namespaceTokenOk = consumeNamespaceTokenBudget(namespace, tokenCost, now);
-    if (!namespaceRpsOk || !namespaceTokenOk) {
-      const quotaError = namespaceQuotaError(namespace, {
-        request_tokens_est: tokenCost,
-        quota_scope: !namespaceRpsOk ? 'request_rate' : 'request_tokens',
-      });
-      if (NAMESPACE_QUOTA_MODE === 'enforce') {
-        return { allowed: false, response: quotaError };
-      }
-      warnings.push(`[namespace_quota_warn] ${quotaError.error}`);
+  // Consume namespace + per-agent rate/token buckets. These are keyed by caller-controlled
+  // identity (agent_id/namespace), so they MUST run only after the caller is authenticated
+  // (or is the auth-exempt register_agent). Otherwise a forged agent_id/namespace lets an
+  // attacker drain a victim's rate-limit / token budget pre-auth (F2).
+  const applyQuotas = (): ToolGuardResult | null => {
+    if (agentId && !consumeRateLimit(agentId, now)) {
+      return {
+        allowed: false,
+        response: {
+          success: false,
+          error_code: 'RATE_LIMIT_EXCEEDED',
+          error: 'Rate limit exceeded for this agent. Retry shortly.',
+          retry_after_ms: 1000,
+        },
+      };
     }
-  }
+    if (NAMESPACE_QUOTA_MODE !== 'off') {
+      const namespace = extractNamespace(toolName, args);
+      quotaNamespace = namespace;
+      const namespaceRpsOk = consumeNamespaceRateLimit(namespace, now);
+      const tokenCost = estimateTokensFromValue(args);
+      requestTokensEst = tokenCost;
+      const namespaceTokenOk = consumeNamespaceTokenBudget(namespace, tokenCost, now);
+      if (!namespaceRpsOk || !namespaceTokenOk) {
+        const quotaError = namespaceQuotaError(namespace, {
+          request_tokens_est: tokenCost,
+          quota_scope: !namespaceRpsOk ? 'request_rate' : 'request_tokens',
+        });
+        if (NAMESPACE_QUOTA_MODE === 'enforce') {
+          return { allowed: false, response: quotaError };
+        }
+        warnings.push(`[namespace_quota_warn] ${quotaError.error}`);
+      }
+    }
+    return null;
+  };
 
   if (shouldBypassAuth(toolName)) {
     const registerAgentId = typeof args.id === 'string' && args.id.trim().length > 0 ? args.id.trim() : agentId;
@@ -662,6 +668,8 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     } else {
       recordAuthEvent(registerAgentId, toolName, 'skipped');
     }
+    const quotaRejection = applyQuotas();
+    if (quotaRejection) return quotaRejection;
     return allow();
   }
 
@@ -681,8 +689,9 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     }
     if (AUTH_MODE === 'warn') {
       warnings.push(warning);
-      return allow();
     }
+    const quotaRejection = applyQuotas();
+    if (quotaRejection) return quotaRejection;
     return allow();
   }
 
@@ -692,6 +701,8 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
   recordAuthEvent(agentId, toolName, status);
 
   if (AUTH_MODE === 'enforce' && !valid) {
+    // Reject BEFORE consuming the (caller-controlled) agent's rate-limit/token buckets (F2),
+    // so an unauthenticated caller cannot drain a victim's quota by forging their agent_id.
     return {
       allowed: false,
       response: {
@@ -710,9 +721,10 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
       ? 'Auth token is invalid (warn mode). This will fail once auth_mode=enforce.'
       : 'Auth token missing (warn mode). This will fail once auth_mode=enforce.';
     warnings.push(warning);
-    return allow();
   }
 
+  const quotaRejection = applyQuotas();
+  if (quotaRejection) return quotaRejection;
   return allow();
 }
 
@@ -806,6 +818,7 @@ function registerTools(server: McpServer) {
       name: z.string().describe('Human-readable agent name'),
       type: z.string().describe('Agent type (e.g. claude, codex, custom)'),
       register_token: z.string().optional().describe('Registration secret required when MCP_HUB_REGISTER_TOKEN is configured'),
+      auth_token: z.string().optional().describe('Existing auth token for this agent id; required to retrieve the token when re-registering an agent that already exists (proof of ownership)'),
       capabilities: z.string().optional().describe('Comma-separated list of capabilities'),
       client_capabilities: z.object({
         response_modes: z.array(z.enum(['full', 'compact', 'tiny', 'nano'])).optional(),
@@ -2212,6 +2225,20 @@ app.get('/events', (req, res) => {
     return;
   }
 
+  // F7: perform the (throwable) watermark/min reads BEFORE incrementing the connection
+  // counter or sending headers. If a DB read throws here we must not leak activeEventStreamCount
+  // / eventStreamCountsByAgent (which would eventually 429 all /events subscribers); since headers
+  // aren't flushed yet we can still return a clean 500.
+  let initialEventId: number;
+  let minEventId: number;
+  try {
+    initialEventId = getStreamEventWatermark({ agent_id: agentId, streams });
+    minEventId = getMinStreamEventId({ agent_id: agentId, streams });
+  } catch (error) {
+    res.status(500).json({ success: false, error_code: 'EVENTS_INIT_FAILED', error: 'Failed to initialize event stream' });
+    return;
+  }
+
   activeEventStreamCount += 1;
   eventStreamCountsByAgent.set(agentId, agentEventStreams + 1);
   logActivity(agentId, 'events_subscribe', `streams=${streams.join(',')} mode=${responseMode} poll_ms=${pollMs}`, { emit_stream_event: false });
@@ -2222,9 +2249,7 @@ app.get('/events', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const initialEventId = getStreamEventWatermark({ agent_id: agentId, streams });
   let sinceEventId = lastEventId ?? parsedStreamCursor ?? initialEventId;
-  const minEventId = getMinStreamEventId({ agent_id: agentId, streams });
   const cursorStale = sinceEventId > 0 && minEventId > 0 && sinceEventId < minEventId;
   if (cursorStale) {
     sinceEventId = initialEventId;

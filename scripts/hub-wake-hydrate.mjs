@@ -16,7 +16,8 @@
 // stream filter (only subscribed streams).
 //
 // Usage:
-//   node scripts/hub-wake-hydrate.mjs --agent-id ID --token TOK \
+//   export HUB_AUTH_TOKEN=...
+//   node scripts/hub-wake-hydrate.mjs --agent-id ID \
 //     --streams messages,tasks --hydrate-mode tiny --cap 25 [--once] [--timeout-ms N]
 
 import { spawn } from 'node:child_process';
@@ -28,10 +29,13 @@ import { createMcpClient } from './lib/mcp-client.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
+  const envToken = process.env.HUB_AUTH_TOKEN || process.env.AUTH_TOKEN || process.env.MCP_HUB_AUTH_TOKEN || '';
   const o = {
     endpoint: process.env.HUB_ENDPOINT || 'http://127.0.0.1:3000/mcp',
     agentId: process.env.AGENT_ID || '',
-    token: process.env.HUB_AUTH_TOKEN || process.env.AUTH_TOKEN || '',
+    token: envToken,
+    tokenFile: process.env.HUB_AUTH_TOKEN_FILE || process.env.AUTH_TOKEN_FILE || '',
+    tokenFromArgv: false,
     streams: 'messages,tasks',
     hydrateMode: 'tiny',          // tiny|compact|nano|full for fetch_hub_refs
     cursor: '',
@@ -48,7 +52,8 @@ function parseArgs(argv) {
     const next = () => argv[++i];
     if (a === '--endpoint') o.endpoint = next();
     else if (a === '--agent-id') o.agentId = next();
-    else if (a === '--token' || a === '--auth-token') o.token = next();
+    else if (a === '--token' || a === '--auth-token') { o.token = next(); o.tokenFromArgv = true; }
+    else if (a === '--token-file') o.tokenFile = next();
     else if (a === '--streams') o.streams = next();
     else if (a === '--hydrate-mode') o.hydrateMode = next();
     else if (a === '--cursor') o.cursor = next();
@@ -63,7 +68,6 @@ function parseArgs(argv) {
     else throw new Error(`Unknown arg: ${a}`);
   }
   if (!o.agentId) throw new Error('--agent-id is required');
-  if (!o.token) throw new Error('--token is required (or HUB_AUTH_TOKEN)');
   if (!['nano', 'tiny', 'compact', 'full'].includes(o.hydrateMode)) {
     throw new Error('--hydrate-mode must be nano|tiny|compact|full');
   }
@@ -80,10 +84,17 @@ function parseArgs(argv) {
 }
 
 function printHelp(o) {
-  console.log(`Usage: hub-wake-hydrate.mjs --agent-id ID --token TOKEN [options]
+  console.log(`Usage: hub-wake-hydrate.mjs --agent-id ID [options]
 
 Wakes on SSE /events (nano) and hydrates only the changed entities (low token).
 Output: JSON Lines {t:"hydrated",cursor,counts,items} and {t:"wake"|"error"}.
+
+Auth:
+  Set HUB_AUTH_TOKEN or AUTH_TOKEN in the environment (preferred).
+  MCP_HUB_AUTH_TOKEN is also accepted for compatibility.
+  --token-file PATH    Read token from a local file (trimmed)
+  --token TOKEN        Legacy compatibility only; warning: visible in ps/process listings
+  --auth-token TOKEN   Legacy alias with the same ps/process-listing exposure
 
   --endpoint URL       MCP endpoint (default ${o.endpoint})
   --streams CSV        Streams to watch/hydrate (default messages,tasks)
@@ -95,6 +106,18 @@ Output: JSON Lines {t:"hydrated",cursor,counts,items} and {t:"wake"|"error"}.
   --preview-chars N    Message/content preview length when hydrate-mode supports it
   --once               Exit after the first hydrate batch
   --timeout-ms MS      Exit after MS of wall time`);
+}
+
+async function resolveAuthToken(opts) {
+  if (!opts.token && opts.tokenFile) {
+    opts.token = (await fs.readFile(opts.tokenFile, 'utf8')).trim();
+  }
+  if (opts.tokenFromArgv) {
+    process.stderr.write('[security] --token/--auth-token exposes the auth token in ps/process listings; prefer HUB_AUTH_TOKEN, AUTH_TOKEN, or --token-file.\n');
+  }
+  if (!opts.token) {
+    throw new Error('auth token is required via HUB_AUTH_TOKEN, AUTH_TOKEN, or --token-file (legacy --token/--auth-token is ps-visible)');
+  }
 }
 
 async function readCursorFile(filePath) {
@@ -130,6 +153,7 @@ function addEntityRef(refs, stream, entityId) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  await resolveAuthToken(opts);
   const streams = opts.streams.split(',').map((s) => s.trim()).filter(Boolean);
   const emit = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
   const mcp = await createMcpClient(opts.endpoint, {
@@ -233,16 +257,20 @@ async function main() {
   };
 
   // ---- spawn canonical SSE client as the wake transport (nano, ~0 token) ----
+  // T79-F4: pass the auth token via the child's ENV (the client reads AUTH_TOKEN), never on argv,
+  // so the secret is not visible in `ps`/proc for the spawned process.
   const childArgs = [
     opts.clientPath,
     '--endpoint', opts.endpoint,
     '--agent-id', opts.agentId,
-    '--auth-token', opts.token,
     '--streams', opts.streams,
     '--response-mode', 'nano',
   ];
   if (hydratedCursor) childArgs.push('--cursor', hydratedCursor);
-  child = spawn(process.execPath, childArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+  child = spawn(process.execPath, childArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, AUTH_TOKEN: opts.token },
+  });
 
   let buf = '';
   child.stdout.on('data', (chunk) => {

@@ -325,8 +325,10 @@ if [ -n "${THREAD_ID:-}" ]; then
   BRIDGE_ARGS+=(--thread-id "$THREAD_ID" --thread-role "$ROLE")
 fi
 
+# T79-F5: pass the registration secret via env (the runner reads BRIDGE_REGISTER_TOKEN) instead of
+# on argv, so it is never visible in `ps`/process listings.
 if [ -n "${REGISTER_TOKEN:-}" ]; then
-  BRIDGE_ARGS+=(--register-token "$REGISTER_TOKEN")
+  BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN" node "${BRIDGE_ARGS[@]}"
+else
+  node "${BRIDGE_ARGS[@]}"
 fi
-
-node "${BRIDGE_ARGS[@]}"

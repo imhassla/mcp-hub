@@ -1,15 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   initDb, closeDb, getDb, registerAgent, listAgents, heartbeat,
   sendMessage, readMessages,
   createTask, updateTask, listTasks, pollAndClaim, getTaskDependencies, getTaskWithDependencies,
-  claimTask, renewTaskClaim, releaseTaskClaim, listTaskClaims,
+  claimTask, renewTaskClaim, releaseTaskClaim, listTaskClaims, cleanupExpiredTaskClaims,
   getAgentQuality, recordTaskCompletion, recordTaskRollback,
   shareContext, getContext,
   getIdempotencyRecord, saveIdempotencyRecord,
   logActivity, getActivityLog,
   getKpiWindows, evaluateSloAlerts, listSloAlerts,
   recordAuthEvent, getAuthCoverageSnapshot, getUpdateWatermark, runMaintenance,
+  listStreamEventsAfter, getStreamEventWatermark,
+  createArtifactRecord, cleanupArtifacts,
 } from '../src/db.js';
 
 beforeEach(() => {
@@ -17,8 +19,32 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   closeDb();
 });
+
+function dbDoneUpdateOptions(addedBy = 'a1', evidenceRefs = ['test:db-done']) {
+  return {
+    addedBy,
+    evidenceRefs,
+    minEvidenceRefs: 1,
+    confidence: 0.95,
+    requiredConfidence: 0.9,
+    confidenceFloor: 0.75,
+    verificationPassed: true,
+  };
+}
+
+function dbDoneReleaseOptions(evidenceRefs = ['test:db-done']) {
+  return {
+    evidenceRefs,
+    minEvidenceRefs: 1,
+    confidence: 0.95,
+    requiredConfidence: 0.9,
+    confidenceFloor: 0.75,
+    verificationPassed: true,
+  };
+}
 
 describe('agents', () => {
   it('should register and list agents', () => {
@@ -99,6 +125,34 @@ describe('agents', () => {
     expect(refreshed?.status).toBe('pending');
     expect(refreshed?.assigned_to).toBeNull();
     expect(listTaskClaims({}).some((row) => row.task_id === task.id)).toBe(false);
+
+    const taskEvents = listStreamEventsAfter({ streams: ['tasks'], after_id: 0, limit: 20 });
+    expect(taskEvents.map((event) => event.op)).toContain('task.ephemeral_claim_reaped');
+  });
+
+  it('should clean orphan feed acks and saved filters in maintenance', () => {
+    const now = Date.now();
+    registerAgent({ id: 'a1', name: 'Agent 1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'Agent 2', type: 'codex', capabilities: '' });
+    const message = sendMessage('a1', 'a2', 'keep ack target');
+    const d = getDb();
+    d.prepare('INSERT INTO feed_acks (agent_id, source, entity_id, acked_at) VALUES (?, ?, ?, ?)')
+      .run('a2', 'messages', String(message.id), now);
+    d.prepare('INSERT INTO feed_acks (agent_id, source, entity_id, acked_at) VALUES (?, ?, ?, ?)')
+      .run('a2', 'messages', '999999', now);
+    d.prepare('INSERT INTO saved_filters (owner_agent_id, name, filter_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+      .run('a1', 'keep-filter', '{"kind":"search","q":"needle"}', now, now);
+    d.prepare('INSERT INTO saved_filters (owner_agent_id, name, filter_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+      .run('missing-agent', 'orphan-filter', '{"kind":"search","q":"needle"}', now, now);
+
+    const summary = runMaintenance(now);
+
+    expect(summary.feed_acks_cleaned).toBeGreaterThanOrEqual(1);
+    expect(summary.saved_filters_cleaned).toBeGreaterThanOrEqual(1);
+    const acks = d.prepare('SELECT entity_id FROM feed_acks ORDER BY entity_id').all() as Array<{ entity_id: string }>;
+    expect(acks.map((row) => row.entity_id)).toEqual([String(message.id)]);
+    const filters = d.prepare('SELECT owner_agent_id, name FROM saved_filters').all() as Array<{ owner_agent_id: string; name: string }>;
+    expect(filters).toEqual([{ owner_agent_id: 'a1', name: 'keep-filter' }]);
   });
 });
 
@@ -123,6 +177,31 @@ describe('messages', () => {
     expect(forA3).toHaveLength(1);
   });
 
+  it('should append replayable message events with same-millisecond ordering and visibility', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+
+    const first = sendMessage('a1', 'a2', 'private-1');
+    const second = sendMessage('a1', 'a2', 'private-2');
+    sendMessage('a1', 'a3', 'private-3');
+    const broadcast = sendMessage('a1', null, 'broadcast');
+
+    const forA2 = listStreamEventsAfter({ agent_id: 'a2', after_id: 0, streams: ['messages'], limit: 10 });
+    expect(forA2.map((event) => event.entity_id)).toEqual([
+      String(first.id),
+      String(second.id),
+      String(broadcast.id),
+    ]);
+    expect(forA2[0].id).toBeLessThan(forA2[1].id);
+    expect(forA2[0].created_at).toBe(forA2[1].created_at);
+
+    const forA3 = listStreamEventsAfter({ agent_id: 'a3', after_id: 0, streams: ['messages'], limit: 10 });
+    expect(forA3.map((event) => event.entity_id)).toEqual([
+      '3',
+      String(broadcast.id),
+    ]);
+    expect(getStreamEventWatermark({ agent_id: 'a2', streams: ['messages'] })).toBe(broadcast.id);
+  });
+
   it('should mark messages as read', () => {
     sendMessage('a1', 'a2', 'Test');
     readMessages('a2'); // marks as read
@@ -138,6 +217,30 @@ describe('messages', () => {
     const messages = readMessages('a3', { from: 'a1' });
     expect(messages).toHaveLength(1);
     expect(messages[0].from_agent).toBe('a1');
+  });
+});
+
+describe('artifacts cleanup', () => {
+  it('does not delete fallback-ttl artifacts when ttlMs is disabled', () => {
+    const now = Date.now();
+    createArtifactRecord({
+      id: 'keep-artifact-ttl-disabled',
+      created_by: 'a1',
+      name: 'keep.bin',
+    });
+    createArtifactRecord({
+      id: 'drop-explicit-expired',
+      created_by: 'a1',
+      name: 'drop.bin',
+      ttl_expires_at: now - 1,
+    });
+    getDb().prepare('UPDATE artifacts SET updated_at = ? WHERE id = ?').run(now - 60_000, 'keep-artifact-ttl-disabled');
+
+    const cleaned = cleanupArtifacts(now, 0);
+
+    expect(cleaned.deleted).toBe(1);
+    const rows = getDb().prepare('SELECT id FROM artifacts ORDER BY id').all() as Array<{ id: string }>;
+    expect(rows.map((row) => row.id)).toEqual(['keep-artifact-ttl-disabled']);
   });
 });
 
@@ -161,7 +264,7 @@ describe('tasks', () => {
   it('should filter tasks', () => {
     createTask({ title: 'T1', created_by: 'a1', assigned_to: 'a2' });
     const t2 = createTask({ title: 'T2', created_by: 'a1' });
-    updateTask(t2.id, { status: 'done' });
+    updateTask(t2.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:filter-done']));
 
     expect(listTasks({ status: 'pending' })).toHaveLength(1);
     expect(listTasks({ assigned_to: 'a2' })).toHaveLength(1);
@@ -169,7 +272,7 @@ describe('tasks', () => {
   });
 
   it('should return null for unknown task', () => {
-    expect(updateTask(999, { status: 'done' })).toBeNull();
+    expect(updateTask(999, { status: 'done' }, dbDoneUpdateOptions())).toBeNull();
   });
 
   it('should persist and update task dependencies', () => {
@@ -194,7 +297,7 @@ describe('tasks', () => {
     const first = pollAndClaim('a2', 120);
     expect(first?.task.id).toBe(readyHigh.id);
     if (first) {
-      releaseTaskClaim(first.task.id, 'a2', 'done', first.claim.claim_id);
+      releaseTaskClaim(first.task.id, 'a2', 'done', first.claim.claim_id, dbDoneReleaseOptions(['test:dependency-ready']));
     }
     const second = pollAndClaim('a2', 120);
     expect(second?.task.id).toBe(upstream.id);
@@ -262,12 +365,56 @@ describe('task claims', () => {
     const first = claimTask(task.id, 'a2', 120);
     expect(first.success).toBe(true);
 
-    const released = releaseTaskClaim(task.id, 'a2', 'done');
+    const released = releaseTaskClaim(task.id, 'a2', 'done', undefined, dbDoneReleaseOptions(['test:release-done']));
     expect(released.success).toBe(true);
     if (!released.success) return;
     expect(released.task.status).toBe('done');
     expect(released.task.assigned_to).toBe('a2');
     expect(listTaskClaims({})).toHaveLength(0);
+  });
+
+  it('should reject direct done release without done-gate metadata', () => {
+    const task = createTask({ title: 'Finish guarded', created_by: 'a1' });
+    const first = claimTask(task.id, 'a2', 120);
+    expect(first.success).toBe(true);
+
+    const released = releaseTaskClaim(task.id, 'a2', 'done');
+
+    expect(released.success).toBe(false);
+    if (!released.success) expect(released.error_code).toBe('DONE_GATE_FAILED');
+    expect(getTaskWithDependencies(task.id)?.status).toBe('in_progress');
+    expect(listTaskClaims({}).filter((claim) => claim.task_id === task.id)).toHaveLength(1);
+  });
+
+  it('should append replayable task events when expired claims are cleaned', () => {
+    const now = Date.now();
+    const task = createTask({ title: 'Expired lease', created_by: 'a1' });
+    const claimed = claimTask(task.id, 'a2', 120);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    getDb().prepare('UPDATE task_claims SET lease_expires_at = ? WHERE task_id = ?').run(now - 1, task.id);
+    const baseline = getStreamEventWatermark({ streams: ['tasks'] });
+    const cleaned = cleanupExpiredTaskClaims(now, { force: true });
+    expect(cleaned).toBeGreaterThanOrEqual(1);
+
+    const events = listStreamEventsAfter({ streams: ['tasks'], after_id: baseline, limit: 10 });
+    expect(events.map((event) => event.op)).toContain('task.claim.expired');
+    expect(events.some((event) => event.entity_id === String(task.id))).toBe(true);
+  });
+
+  it('should append replayable task events when orphan assignments are requeued', () => {
+    const now = Date.now();
+    const task = createTask({ title: 'Orphan assignment', created_by: 'a1', assigned_to: 'missing-agent' });
+    const baseline = getStreamEventWatermark({ streams: ['tasks'] });
+
+    const summary = runMaintenance(now);
+    expect(summary.orphaned_assignments_requeued).toBeGreaterThanOrEqual(1);
+
+    const refreshed = listTasks({}).find((row) => row.id === task.id);
+    expect(refreshed?.assigned_to).toBeNull();
+    const events = listStreamEventsAfter({ streams: ['tasks'], after_id: baseline, limit: 10 });
+    expect(events.map((event) => event.op)).toContain('task.orphan_requeued');
   });
 
   it('should reject renew/release when claim_id does not match', () => {
@@ -328,6 +475,24 @@ describe('context', () => {
 
     const all = getContext();
     expect(all).toHaveLength(2);
+  });
+
+  it('should page same-millisecond context updates with tuple cursors', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_001_000);
+
+    const first = shareContext('a1', 'k1', 'v1');
+    const second = shareContext('a1', 'k2', 'v2');
+
+    const page1 = getContext({ updated_after: first.updated_at - 1, limit: 1 });
+    expect(page1).toHaveLength(1);
+    expect(page1[0].id).toBe(first.id);
+
+    const page2 = getContext({
+      cursor: { ts: page1[0].updated_at, id: page1[0].id },
+      limit: 1,
+    });
+    expect(page2).toHaveLength(1);
+    expect(page2[0].id).toBe(second.id);
   });
 });
 
@@ -465,5 +630,160 @@ describe('auth coverage', () => {
     expect(coverage.skipped_events).toBe(1);
     expect(coverage.valid_coverage_pct).toBeCloseTo(33.33, 2);
     expect(coverage.by_tool.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('claim lifecycle correctness (F3/F5)', () => {
+  it('allows takeover of an expired lease even while cleanup is throttled (F3)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Takeover me', created_by: 'a1' });
+
+    const first = claimTask(task.id, 'a1', 300);
+    expect(first.success).toBe(true);
+    // The claim's internal cleanup just ran, so the next claim's cleanup is throttled.
+    // Expire a1's lease in place (the stale row remains because cleanup is throttled).
+    getDb().prepare('UPDATE task_claims SET lease_expires_at = ? WHERE task_id = ?').run(Date.now() - 1000, task.id);
+
+    const takeover = claimTask(task.id, 'a2', 300);
+    expect(takeover.success).toBe(true);
+    if (takeover.success) {
+      expect(takeover.task.assigned_to).toBe('a2');
+    }
+    const claims = listTaskClaims();
+    expect(claims.filter((c) => c.task_id === task.id)).toHaveLength(1);
+    expect(claims.find((c) => c.task_id === task.id)?.agent_id).toBe('a2');
+  });
+
+  it('reconciles (deletes) the claim when update_task changes status/assignment, so renew cannot reopen a done task (F5)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Reconcile me', created_by: 'a1' });
+    const claim = claimTask(task.id, 'a2', 300);
+    expect(claim.success).toBe(true);
+
+    updateTask(task.id, { status: 'done' }, dbDoneUpdateOptions('a2', ['test:reconcile-done']));
+    // The claim row must be gone after the external status change.
+    expect(listTaskClaims().filter((c) => c.task_id === task.id)).toHaveLength(0);
+
+    // Renewing the (now absent) claim must not resurrect the done task.
+    const renew = renewTaskClaim(task.id, 'a2', 300, claim.success ? claim.claim.claim_id : undefined);
+    expect(renew.success).toBe(false);
+    const after = getTaskWithDependencies(task.id);
+    expect(after?.status).toBe('done');
+  });
+
+  it('refuses to renew a claim that still sits on a done task (TASK_NOT_RENEWABLE guard, F5)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Stale claim', created_by: 'a1' });
+    const claim = claimTask(task.id, 'a2', 300);
+    expect(claim.success).toBe(true);
+    // Simulate a stale claim left on a done task (e.g. a direct status write that bypassed reconciliation).
+    getDb().prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(task.id);
+
+    const renew = renewTaskClaim(task.id, 'a2', 300, claim.success ? claim.claim.claim_id : undefined);
+    expect(renew.success).toBe(false);
+    if (!renew.success) expect(renew.error_code).toBe('TASK_NOT_RENEWABLE');
+    expect(getTaskWithDependencies(task.id)?.status).toBe('done');
+  });
+
+  it('lets a task reverted to pending via update_task be re-claimed (F5)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Revert me', created_by: 'a1' });
+    expect(claimTask(task.id, 'a2', 300).success).toBe(true);
+
+    updateTask(task.id, { status: 'pending', assigned_to: undefined });
+    expect(listTaskClaims().filter((c) => c.task_id === task.id)).toHaveLength(0);
+
+    const reclaim = claimTask(task.id, 'a1', 300);
+    expect(reclaim.success).toBe(true);
+  });
+});
+
+describe('atomic done-gate evidence persistence (F6)', () => {
+  it('refuses direct update_task done without done-gate metadata and rolls back atomically', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Direct update guarded', created_by: 'a1' });
+
+    expect(() => updateTask(task.id, { status: 'done' }, {
+      evidenceRefs: ['context_id:direct'],
+      minEvidenceRefs: 1,
+      addedBy: 'a1',
+    })).toThrow('Missing confidence');
+
+    expect(getTaskWithDependencies(task.id)?.status).toBe('pending');
+    expect((getDb().prepare('SELECT COUNT(*) AS c FROM task_evidence WHERE task_id = ?').get(task.id) as { c: number }).c).toBe(0);
+  });
+
+  it('refuses a done release with insufficient evidence and rolls back atomically', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Gate me', created_by: 'a1' });
+    const claim = claimTask(task.id, 'a2', 300);
+    expect(claim.success).toBe(true);
+
+    const released = releaseTaskClaim(task.id, 'a2', 'done', claim.success ? claim.claim.claim_id : undefined, {
+      evidenceRefs: [],
+      minEvidenceRefs: 2,
+      confidence: 0.95,
+      requiredConfidence: 0.9,
+      confidenceFloor: 0.75,
+      verificationPassed: true,
+    });
+    expect(released.success).toBe(false);
+    if (!released.success) expect(released.error_code).toBe('EVIDENCE_REQUIRED');
+    // Atomic rollback: status unchanged and the claim is still held.
+    expect(getTaskWithDependencies(task.id)?.status).toBe('in_progress');
+    expect(listTaskClaims().filter((c) => c.task_id === task.id)).toHaveLength(1);
+  });
+
+  it('persists evidence and the done status in the same transaction', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Finish atomically', created_by: 'a1' });
+    const claim = claimTask(task.id, 'a2', 300);
+    expect(claim.success).toBe(true);
+
+    const released = releaseTaskClaim(task.id, 'a2', 'done', claim.success ? claim.claim.claim_id : undefined, {
+      evidenceRefs: ['context_id:1', 'message_id:2'],
+      minEvidenceRefs: 1,
+      confidence: 0.95,
+      requiredConfidence: 0.9,
+      confidenceFloor: 0.75,
+      verificationPassed: true,
+    });
+    expect(released.success).toBe(true);
+    if (released.success) {
+      expect(released.evidence_added).toBe(2);
+      expect(released.evidence_total).toBe(2);
+      expect(released.task.status).toBe('done');
+    }
+    const rows = getDb().prepare('SELECT evidence_ref FROM task_evidence WHERE task_id = ? ORDER BY evidence_ref').all(task.id) as Array<{ evidence_ref: string }>;
+    expect(rows.map((r) => r.evidence_ref)).toEqual(['context_id:1', 'message_id:2']);
+  });
+
+  it('update_task done is atomic: insufficient evidence rolls back status and evidence (F6)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Update done me', created_by: 'a1' });
+
+    expect(() => updateTask(task.id, { status: 'done' }, {
+      ...dbDoneUpdateOptions('a1', []),
+      minEvidenceRefs: 2,
+    })).toThrow('done transition requires at least 2 evidence ref');
+    // Atomic rollback: status unchanged and no evidence persisted.
+    expect(getTaskWithDependencies(task.id)?.status).toBe('pending');
+    expect((getDb().prepare('SELECT COUNT(*) AS c FROM task_evidence WHERE task_id = ?').get(task.id) as { c: number }).c).toBe(0);
+  });
+
+  it('update_task done persists evidence and the done status in one transaction (F6)', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    const task = createTask({ title: 'Update done atomically', created_by: 'a1' });
+
+    const updated = updateTask(task.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['context_id:9', 'message_id:10']));
+    expect(updated?.status).toBe('done');
+    const rows = getDb().prepare('SELECT evidence_ref FROM task_evidence WHERE task_id = ? ORDER BY evidence_ref').all(task.id) as Array<{ evidence_ref: string }>;
+    expect(rows.map((r) => r.evidence_ref)).toEqual(['context_id:9', 'message_id:10']);
   });
 });

@@ -243,4 +243,28 @@ describe('artifact tools', () => {
     expect(list.artifacts[0].artifact_id).toBe(created.artifact.id);
     expect(list.artifacts[0].has_access).toBe(true);
   });
+
+  it('only the owner can re-share, and a blank target is rejected (T78-F2)', () => {
+    const created = handleCreateArtifactUpload({ agent_id: 'owner', name: 'secret.bin', namespace: 'EXP-C' });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    finalizeArtifactUpload({ id: created.artifact.id, size_bytes: 16, sha256: 'b'.repeat(64), storage_path: '/tmp/secret.bin' });
+
+    // Owner shares to worker (worker now has read access).
+    expect(handleShareArtifact({ from_agent: 'owner', artifact_id: created.artifact.id, to_agent: 'worker', notify: false }).success).toBe(true);
+
+    // A non-owner with access cannot re-share to a third party.
+    const reShare = handleShareArtifact({ from_agent: 'worker', artifact_id: created.artifact.id, to_agent: 'evil', notify: false });
+    expect(reShare.success).toBe(false);
+    if (!reShare.success) expect(reShare.error_code).toBe('ARTIFACT_NOT_OWNER');
+
+    // A blank to_agent no longer silently publishes to '*'.
+    const blank = handleShareArtifact({ from_agent: 'owner', artifact_id: created.artifact.id, to_agent: '', notify: false });
+    expect(blank.success).toBe(false);
+    if (!blank.success) expect(blank.error_code).toBe('SHARE_TARGET_REQUIRED');
+
+    // 'evil' never gained access via the rejected re-share.
+    const evilDownload = handleCreateArtifactDownload({ agent_id: 'evil', artifact_id: created.artifact.id });
+    expect(evilDownload.success).toBe(false);
+  });
 });

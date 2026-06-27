@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb, createTask, getUpdateWatermark, initDb, logActivity, registerAgent, sendMessage, shareContext } from '../src/db.js';
-import { handleGetActivityLog, handleGetKpiSnapshot, handleGetTransportSnapshot, handleReadSnapshot, handleWaitForUpdates } from '../src/tools/activity.js';
+import { appendStreamEvent, cleanupStreamEvents, closeDb, createTask, getStreamEventWatermark, initDb, logActivity, readMessages, registerAgent, sendMessage, shareContext } from '../src/db.js';
+import { handleGetActivityLog, handleGetKpiSnapshot, handleGetTransportSnapshot, handleReadEventDeltas, handleReadSnapshot, handleWaitForUpdates } from '../src/tools/activity.js';
 
 beforeEach(() => {
   initDb(':memory:');
@@ -45,6 +45,8 @@ describe('wait_for_updates response modes', () => {
       tasks: false,
       context: false,
       activity: false,
+      artifacts: false,
+      consensus: false,
     });
     expect(result.watermark.latest_message_ts).toBeTypeOf('number');
     expect(result.watermark.latest_task_ts).toBeTypeOf('number');
@@ -165,9 +167,99 @@ describe('wait_for_updates response modes', () => {
     expect((second.retry_after_ms as number) >= (first.retry_after_ms as number)).toBe(true);
   });
 
-  it('returns compact hit payload with changed streams and watermark', async () => {
+  it('detects same-millisecond message bursts with event cursors', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
-    const baseline = getUpdateWatermark('watcher');
+
+    const idle = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    expect(idle.changed).toBe(false);
+    expect(idle.cursor).toMatch(/^e:/);
+
+    sendMessage('sender', 'watcher', 'event-1');
+    sendMessage('sender', 'watcher', 'event-2');
+
+    const hit = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      cursor: idle.cursor,
+      wait_ms: 120,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+    }) as Record<string, any>;
+
+    expect(hit.changed).toBe(true);
+    expect(hit.cursor).toMatch(/^e:/);
+    expect(hit.streams).toEqual(['messages']);
+    expect(hit.events.map((event: { op: string }) => event.op)).toEqual(['message.created', 'message.created']);
+    expect(hit.events[0].id).toBeLessThan(hit.events[1].id);
+
+    const snapshot = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: idle.cursor,
+      response_mode: 'compact',
+      message_limit: 10,
+      task_limit: 10,
+      context_limit: 10,
+    }) as Record<string, any>;
+
+    expect(snapshot.changed.messages).toBe(true);
+    expect(snapshot.cursor).toMatch(/^e:/);
+    expect(snapshot.events.map((event: { op: string }) => event.op)).toContain('message.created');
+
+    const afterSnapshot = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      cursor: snapshot.cursor,
+      wait_ms: 120,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+    expect(afterSnapshot.changed).toBe(false);
+  });
+
+  it('accepts artifact and consensus streams advertised by the tool schema', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    appendStreamEvent({ stream: 'artifacts', op: 'artifact.ready', entity_id: 'artifact-1', target_agent_id: 'watcher' });
+    appendStreamEvent({ stream: 'consensus', op: 'consensus.saved', entity_id: 'decision-1', target_agent_id: 'watcher' });
+
+    const hit = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      cursor: baseline.cursor,
+      streams: ['artifacts', 'consensus'] as any,
+      wait_ms: 120,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    expect(hit.success).toBe(true);
+    expect(hit.changed).toBe(true);
+    expect(hit.streams).toEqual(['artifacts', 'consensus']);
+    expect(hit.events.map((event: { op: string }) => event.op)).toEqual(['artifact.ready', 'consensus.saved']);
+  });
+
+  it('returns compact hit payload with changed streams and event metadata', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     setTimeout(() => {
       sendMessage('sender', 'watcher', 'ping');
@@ -175,10 +267,7 @@ describe('wait_for_updates response modes', () => {
 
     const result = await handleWaitForUpdates({
       agent_id: 'watcher',
-      message_since_ts: baseline.latest_message_ts,
-      task_since_ts: baseline.latest_task_ts,
-      context_since_ts: baseline.latest_context_ts,
-      activity_since_ts: baseline.latest_activity_ts,
+      cursor: baseline.cursor,
       wait_ms: 1000,
       poll_interval_ms: 100,
       response_mode: 'compact',
@@ -188,7 +277,8 @@ describe('wait_for_updates response modes', () => {
     expect(result.changed).toBe(true);
     expect(typeof result.cursor).toBe('string');
     expect(result.streams).toContain('messages');
-    expect(result.watermark.latest_message_ts).toBeGreaterThan(baseline.latest_message_ts);
+    expect(result.event_id).toBeGreaterThan(baseline.event_id);
+    expect(result.events[0].op).toBe('message.created');
   });
 
   it('does not log timeout events by default', async () => {
@@ -206,9 +296,15 @@ describe('wait_for_updates response modes', () => {
     expect(timeoutEntries).toHaveLength(0);
   });
 
-  it('returns tiny hit payload with compact watermark fields', async () => {
+  it('returns tiny hit payload with compact event metadata', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
-    const baseline = getUpdateWatermark('watcher');
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'tiny',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     setTimeout(() => {
       sendMessage('sender', 'watcher', 'ping');
@@ -216,10 +312,7 @@ describe('wait_for_updates response modes', () => {
 
     const result = await handleWaitForUpdates({
       agent_id: 'watcher',
-      message_since_ts: baseline.latest_message_ts,
-      task_since_ts: baseline.latest_task_ts,
-      context_since_ts: baseline.latest_context_ts,
-      activity_since_ts: baseline.latest_activity_ts,
+      cursor: baseline.cursor,
       wait_ms: 1000,
       poll_interval_ms: 100,
       response_mode: 'tiny',
@@ -229,13 +322,19 @@ describe('wait_for_updates response modes', () => {
     expect(result.changed).toBe(true);
     expect(typeof result.cursor).toBe('string');
     expect(result.streams).toContain('messages');
-    expect(result.watermark.message).toBeGreaterThan(baseline.latest_message_ts);
-    expect(result.watermark.latest_message_ts).toBeUndefined();
+    expect(result.event_id).toBeGreaterThan(baseline.event_id);
+    expect(result.watermark).toBeUndefined();
   });
 
   it('returns micro hit payload without watermark fields', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
-    const baseline = getUpdateWatermark('watcher');
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'micro',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     setTimeout(() => {
       sendMessage('sender', 'watcher', 'micro-ping');
@@ -243,10 +342,7 @@ describe('wait_for_updates response modes', () => {
 
     const result = await handleWaitForUpdates({
       agent_id: 'watcher',
-      message_since_ts: baseline.latest_message_ts,
-      task_since_ts: baseline.latest_task_ts,
-      context_since_ts: baseline.latest_context_ts,
-      activity_since_ts: baseline.latest_activity_ts,
+      cursor: baseline.cursor,
       wait_ms: 1000,
       poll_interval_ms: 100,
       response_mode: 'micro',
@@ -262,7 +358,13 @@ describe('wait_for_updates response modes', () => {
 
   it('returns nano hit payload with compact keys', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
-    const baseline = getUpdateWatermark('watcher');
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'nano',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     setTimeout(() => {
       sendMessage('sender', 'watcher', 'nano-ping');
@@ -270,10 +372,7 @@ describe('wait_for_updates response modes', () => {
 
     const result = await handleWaitForUpdates({
       agent_id: 'watcher',
-      message_since_ts: baseline.latest_message_ts,
-      task_since_ts: baseline.latest_task_ts,
-      context_since_ts: baseline.latest_context_ts,
-      activity_since_ts: baseline.latest_activity_ts,
+      cursor: baseline.u,
       wait_ms: 1000,
       poll_interval_ms: 100,
       response_mode: 'nano',
@@ -329,11 +428,63 @@ describe('wait_for_updates response modes', () => {
     }) as Record<string, any>;
     expect(result.success).toBe(false);
     expect(result.error_code).toBe('CURSOR_INVALID');
+
+    const partial = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      cursor: 'e:1!junk',
+      wait_ms: 120,
+      poll_interval_ms: 100,
+      response_mode: 'tiny',
+    }) as Record<string, any>;
+    expect(partial.success).toBe(false);
+    expect(partial.error_code).toBe('CURSOR_INVALID');
+  });
+
+  it('marks wait cursors stale when retained event history has a gap', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const oldEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'old',
+      target_agent_id: 'watcher',
+      created_at: 1_000,
+    });
+    const retainedEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'retained',
+      target_agent_id: 'watcher',
+      created_at: 2_000,
+    });
+    cleanupStreamEvents(2_500, 1_000);
+
+    const result = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      cursor: `e:${oldEvent.id.toString(36)}`,
+      streams: ['messages'],
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'tiny',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    expect(result.success).toBe(true);
+    expect(result.cursor_stale).toBe(true);
+    expect(result.resync_required).toBe(true);
+    expect(result.resync_hint).toBe('read_snapshot');
+    expect(result.min_event_id).toBe(retainedEvent.id);
   });
 
   it('should support stream filtering and ignore non-watched updates', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
-    const baseline = getUpdateWatermark('watcher');
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      streams: ['tasks'],
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'micro',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     setTimeout(() => {
       sendMessage('sender', 'watcher', 'message-ignored-for-tasks-stream');
@@ -342,10 +493,7 @@ describe('wait_for_updates response modes', () => {
     const ignored = await handleWaitForUpdates({
       agent_id: 'watcher',
       streams: ['tasks'],
-      message_since_ts: baseline.latest_message_ts,
-      task_since_ts: baseline.latest_task_ts,
-      context_since_ts: baseline.latest_context_ts,
-      activity_since_ts: baseline.latest_activity_ts,
+      cursor: baseline.cursor,
       wait_ms: 250,
       poll_interval_ms: 100,
       response_mode: 'micro',
@@ -388,10 +536,16 @@ describe('wait_for_updates response modes', () => {
 });
 
 describe('read_snapshot', () => {
-  it('returns nano batch with unified cursor', () => {
+  it('returns nano batch with unified event cursor', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
 
-    const cursor = '0.0.0.0';
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'nano',
+      adaptive_retry: false,
+    }) as Record<string, any>;
 
     sendMessage('sender', 'watcher', 'snapshot-msg');
     createTask({ title: 'snapshot-task', created_by: 'watcher' });
@@ -399,7 +553,7 @@ describe('read_snapshot', () => {
 
     const result = handleReadSnapshot({
       agent_id: 'watcher',
-      cursor,
+      cursor: baseline.u,
       response_mode: 'nano',
       task_ready_only: true,
     }) as Record<string, any>;
@@ -414,6 +568,61 @@ describe('read_snapshot', () => {
     expect(result.ch.c).toBe(1);
   });
 
+  it('does not advance cursor past unreturned event refs under burst load', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const baseline = getStreamEventWatermark({ agent_id: 'watcher', streams: ['activity'] });
+    for (let i = 0; i < 1005; i += 1) {
+      appendStreamEvent({
+        stream: 'activity',
+        op: 'burst',
+        entity_id: `burst-${i}`,
+        agent_id: 'sender',
+      });
+    }
+
+    const first = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: `e:${baseline.toString(36)}`,
+      response_mode: 'compact',
+    }) as Record<string, any>;
+
+    expect(first.success).toBe(true);
+    expect(first.events).toHaveLength(1000);
+    expect(first.events_has_more).toBe(true);
+    expect(first.event_id).toBe(first.events[999].id);
+    expect(first.event_watermark).toBeGreaterThan(first.event_id);
+    expect(first.cursor).toBe(`e:${first.event_id.toString(36)}`);
+
+    const second = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: first.cursor,
+      response_mode: 'compact',
+    }) as Record<string, any>;
+
+    expect(second.success).toBe(true);
+    expect(second.events).toHaveLength(5);
+    expect(second.events_has_more).toBe(false);
+    expect(second.event_id).toBe(second.event_watermark);
+  });
+
+  it('includes artifact and consensus refs in snapshot event deltas', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const baseline = getStreamEventWatermark({ agent_id: 'watcher' });
+    appendStreamEvent({ stream: 'artifacts', op: 'artifact.ready', entity_id: 'artifact-2', target_agent_id: 'watcher' });
+    appendStreamEvent({ stream: 'consensus', op: 'consensus.saved', entity_id: 'decision-2', target_agent_id: 'watcher' });
+
+    const snapshot = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: `e:${baseline.toString(36)}`,
+      response_mode: 'compact',
+    }) as Record<string, any>;
+
+    expect(snapshot.success).toBe(true);
+    expect(snapshot.changed.artifacts).toBe(true);
+    expect(snapshot.changed.consensus).toBe(true);
+    expect(snapshot.events.map((event: { stream: string }) => event.stream)).toEqual(['artifacts', 'consensus']);
+  });
+
   it('rejects full response_mode for snapshot polling', () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
     const result = handleReadSnapshot({
@@ -422,6 +631,146 @@ describe('read_snapshot', () => {
     }) as Record<string, any>;
     expect(result.success).toBe(false);
     expect(result.error_code).toBe('FULL_MODE_FORBIDDEN_IN_POLLING');
+  });
+
+  it('does not read unchanged streams when an event cursor has no changes', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    sendMessage('sender', 'watcher', 'pre-cursor-unread');
+
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    const snapshot = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: baseline.cursor,
+      response_mode: 'compact',
+      message_unread_only: true,
+    }) as Record<string, any>;
+
+    expect(snapshot.changed.messages).toBe(false);
+    expect(snapshot.snapshot.messages.messages).toEqual([]);
+    expect(readMessages('watcher', { unread_only: true })).toHaveLength(1);
+  });
+
+  it('does not mark pre-cursor unread messages read when a later message event changes the stream', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const oldMessage = sendMessage('sender', 'watcher', 'old-unread-before-cursor');
+
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    sendMessage('sender', 'watcher', 'new-unread-after-cursor');
+    const snapshot = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: baseline.cursor,
+      response_mode: 'compact',
+      message_unread_only: true,
+    }) as Record<string, any>;
+
+    expect(snapshot.changed.messages).toBe(true);
+    expect(snapshot.snapshot.messages.messages.length).toBeGreaterThan(0);
+    const unread = readMessages('watcher', { unread_only: true, mark_read: false });
+    expect(unread.some((message) => message.id === oldMessage.id)).toBe(true);
+  });
+});
+
+describe('read_event_deltas', () => {
+  it('returns exact changed refs for retained events', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const baseline = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      wait_ms: 20,
+      poll_interval_ms: 10,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    const message = sendMessage('sender', 'watcher', 'delta-message');
+    const task = createTask({ title: 'delta-task', created_by: 'watcher' });
+    shareContext('watcher', 'delta-key', 'delta-value');
+
+    const deltas = handleReadEventDeltas({
+      agent_id: 'watcher',
+      cursor: baseline.cursor,
+      streams: ['messages', 'tasks', 'context'],
+      response_mode: 'compact',
+      include_payload: true,
+    }) as Record<string, any>;
+
+    expect(deltas.success).toBe(true);
+    expect(deltas.changed).toBe(true);
+    expect(deltas.cursor).toMatch(/^e:/);
+    expect(deltas.events.map((event: { entity_id: string }) => event.entity_id)).toContain(String(message.id));
+    expect(deltas.events.map((event: { entity_id: string }) => event.entity_id)).toContain(String(task.id));
+    expect(deltas.events.every((event: { payload?: unknown }) => event.payload !== undefined)).toBe(true);
+
+    const next = handleReadEventDeltas({
+      agent_id: 'watcher',
+      cursor: deltas.cursor,
+      streams: ['messages', 'tasks', 'context'],
+      response_mode: 'tiny',
+    }) as Record<string, any>;
+    expect(next.changed).toBe(false);
+    expect(next.events).toEqual([]);
+  });
+
+  it('supports e:0 replay and nano output', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    sendMessage('sender', 'watcher', 'delta-replay');
+
+    const result = handleReadEventDeltas({
+      agent_id: 'watcher',
+      cursor: 'e:0',
+      streams: ['messages'],
+      response_mode: 'nano',
+    }) as Record<string, any>;
+
+    expect(result.c).toBe(1);
+    expect(result.u).toMatch(/^e:/);
+    expect(result.s).toEqual(['messages']);
+    expect(result.e[0][1]).toBe('messages');
+  });
+
+  it('marks delta cursors stale when older retained events were cleaned up', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    const oldEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'old-delta',
+      target_agent_id: 'watcher',
+      created_at: 1_000,
+    });
+    const retainedEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'retained-delta',
+      target_agent_id: 'watcher',
+      created_at: 2_000,
+    });
+    cleanupStreamEvents(2_500, 1_000);
+
+    const result = handleReadEventDeltas({
+      agent_id: 'watcher',
+      cursor: `e:${oldEvent.id.toString(36)}`,
+      streams: ['messages'],
+      response_mode: 'tiny',
+    }) as Record<string, any>;
+
+    expect(result.success).toBe(true);
+    expect(result.cursor_stale).toBe(true);
+    expect(result.resync_required).toBe(true);
+    expect(result.min_event_id).toBe(retainedEvent.id);
+    expect(result.events.map((event: { entity_id: string }) => event.entity_id)).toEqual(['retained-delta']);
   });
 });
 
@@ -487,5 +836,32 @@ describe('get_transport_snapshot', () => {
     expect(result.transport.wait_hits).toBeGreaterThanOrEqual(1);
     expect(result.transport.wait_timeouts).toBeGreaterThanOrEqual(1);
     expect(result.transport.wait_hit_rate_pct).toBeTypeOf('number');
+  });
+});
+
+describe('wait_for_updates final-window event delivery (F4)', () => {
+  it('delivers an event that arrives during the final poll window instead of skipping it on timeout', async () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    registerAgent({ id: 'sender', name: 'Sender', type: 'codex', capabilities: '' });
+
+    // Insert the message ~50ms in: after the single in-loop query (t=0) but before the deadline.
+    // With poll_interval_ms large and wait_ms small, the loop queries once then sleeps past the
+    // deadline; only the post-loop final query can catch this event. The pre-fix code advanced
+    // the timeout cursor to the watermark (which includes this event) and reported changed:false,
+    // permanently skipping it.
+    setTimeout(() => { sendMessage('sender', 'watcher', 'final-window'); }, 50);
+
+    const result = await handleWaitForUpdates({
+      agent_id: 'watcher',
+      streams: ['messages'],
+      wait_ms: 150,
+      poll_interval_ms: 2000,
+      response_mode: 'compact',
+      adaptive_retry: false,
+    }) as Record<string, any>;
+
+    expect(result.changed).toBe(true);
+    expect(result.streams).toContain('messages');
+    expect(result.events?.[0]?.op).toBe('message.created');
   });
 });

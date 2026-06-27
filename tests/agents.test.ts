@@ -159,3 +159,38 @@ describe('agent tools', () => {
     ]);
   });
 });
+
+describe('register_agent auth-token disclosure (F1)', () => {
+  it('returns the auth token to the registrant when the agent is newly created', () => {
+    const res = handleRegisterAgent({ id: 'owner-1', name: 'Owner', type: 'claude' });
+    expect(res.registration.is_new).toBe(true);
+    expect(res.auth).not.toBeNull();
+    expect(typeof res.auth?.token).toBe('string');
+    expect((res.auth?.token as string).length).toBeGreaterThan(0);
+  });
+
+  it('does NOT return an existing agent token to a caller without proof of ownership', () => {
+    const first = handleRegisterAgent({ id: 'victim-1', name: 'Victim', type: 'claude' });
+    const stolen = first.auth?.token as string;
+    expect(stolen.length).toBeGreaterThan(0);
+
+    // Attacker re-registers the same id with no auth_token (the F1 takeover attempt).
+    const attacker = handleRegisterAgent({ id: 'victim-1', name: 'Victim', type: 'claude' });
+    expect(attacker.registration.is_new).toBe(false);
+    expect(attacker.auth?.token).toBeNull();
+    expect((attacker.auth as Record<string, unknown>).proof_required).toBe(true);
+  });
+
+  it('returns the token on re-registration when the caller proves ownership with the existing token', () => {
+    const first = handleRegisterAgent({ id: 'owner-2', name: 'Owner', type: 'claude' });
+    const token = first.auth?.token as string;
+
+    const reReg = handleRegisterAgent({ id: 'owner-2', name: 'Owner', type: 'claude', auth_token: token });
+    expect(reReg.registration.is_new).toBe(false);
+    expect(reReg.auth?.token).toBe(token);
+
+    // A wrong token does not unlock disclosure.
+    const wrong = handleRegisterAgent({ id: 'owner-2', name: 'Owner', type: 'claude', auth_token: 'not-the-token' });
+    expect(wrong.auth?.token).toBeNull();
+  });
+});

@@ -528,17 +528,31 @@ function runProcess(command, args, options) {
       cwd: options.cwd || process.cwd(),
       env: options.env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // T79-F2: run the backend in its own process group so a timeout/abort can signal the whole
+      // tree. `codex exec` / `claude -p` fork helper subprocesses; signalling only the direct child
+      // PID re-parents those grandchildren to init and leaks them.
+      detached: true,
     });
     const stdout = [];
     const stderr = [];
     let timedOut = false;
     let aborted = false;
+    // Signal the entire process group (negative PID) so grandchildren die with the backend; fall
+    // back to the direct child if the group is already gone or process groups are unsupported.
+    const signalTree = (signal) => {
+      try {
+        if (typeof child.pid === 'number') process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try { child.kill(signal); } catch { /* already exited */ }
+      }
+    };
     const terminate = (reason) => {
       if (child.killed) return;
       if (reason === 'timeout') timedOut = true;
       if (reason === 'abort') aborted = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), 2000).unref();
+      signalTree('SIGTERM');
+      setTimeout(() => signalTree('SIGKILL'), 2000).unref();
     };
     const timer = setTimeout(() => {
       terminate('timeout');
