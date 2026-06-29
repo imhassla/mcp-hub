@@ -169,7 +169,7 @@ MCP_HUB_NAMESPACE_GOVERNANCE=off|warn|require
 MCP_HUB_EXTRA_BIND_HOSTS=100.107.1.68[,192.168.1.50]
 MCP_HUB_SESSION_IDLE_TIMEOUT_MS=21600000 # <=0 disables idle session eviction (sessions live until DELETE /mcp or server restart)
 MCP_HUB_SESSION_GC_INTERVAL_MS=60000
-MCP_HUB_UNKNOWN_SESSION_POLICY=error|stateless_fallback
+MCP_HUB_UNKNOWN_SESSION_POLICY=error
 MCP_HUB_AGENT_OFFLINE_AFTER_MS=1800000
 MCP_HUB_AGENT_RETENTION_MS=604800000
 MCP_HUB_AUTO_PACK_MIN_PAYLOAD_CHARS=2048
@@ -361,6 +361,12 @@ One Docker daemon server, all agents connect via HTTP (Streamable HTTP transport
 | `list_slo_alerts` | List open/closed SLO alerts |
 | `get_auth_coverage` | Auth-token usage coverage by time window and tools |
 
+Artifact upload/download ticket tools require a client/runtime that actually has MCP tool access and
+has negotiated `artifact_tickets: true`. Bridge-launched CLIs are mediated by the bridge runner and
+must not call `create_artifact_upload`, `create_artifact_download`, or `share_artifact` directly
+when the bridge advertises `artifact_tickets: false`; they should return structured handoffs and
+`/tmp` paths for a hub-connected bridge/operator instead.
+
 `nano` mode for read tools (lossless, short keys only):
 - `read_messages`: `{ m, h, n }` + `m[]` items with keys `i/f/t/u/r/c/d` (+`x/y` for trace/span, `b/z` for blob-ref)
 - `list_tasks`: `{ t, h, n }` + `t[]` items with keys `i/s/a/p/n/e/cm/u/tc/t/dc` (+`x/y` for trace/span)
@@ -410,7 +416,10 @@ What launcher does:
 - registers `orchestrator/reviewer/assistant` roles as `lifecycle: "persistent"` by default (set `--lifecycle ephemeral` for short-lived workers);
 - injects profile into `register_agent` contract;
 - loads system onboarding + role prompt;
-- starts selected CLI with `agent-hub` connected.
+- starts the selected CLI behind the bridge runner. The backend CLI receives read-only preflight
+  context and returns a structured result; the bridge handles hub registration, evidence
+  publication, and any artifact side-channel work only when its negotiated capabilities include
+  `artifact_tickets: true`.
 
 Role skill cheatsheets:
 - `skills/codex-hub.md`
@@ -423,7 +432,7 @@ Role skill cheatsheets:
 | `/mcp` | POST | MCP Streamable HTTP (primary) |
 | `/mcp` | GET | SSE stream for notifications |
 | `/mcp` | DELETE | Close session |
-| `/events` | GET | SSE-only push channel for high-load polling replacement (`agent_id`, `auth_token`, `streams`, `cursor`, `response_mode`) |
+| `/events` | GET | SSE-only push channel for high-load polling replacement (`agent_id`, `streams`, `cursor`, `response_mode`; auth via `Authorization: Bearer <token>`) |
 | `/artifacts/upload/:artifactId` | POST | Side-channel upload binary artifact (ticket/token required) |
 | `/artifacts/download/:artifactId` | GET | Side-channel download binary artifact (ticket/token required) |
 | `/health` | GET | Health check (`auth_mode`, namespace quota mode, SSE settings, session counters) |
@@ -467,14 +476,6 @@ Server also adds:
 - `error.data.recovery_sequence`
 - HTTP header `x-mcp-reinit-required: 1`
 
-Optionally, enable server-side auto-recovery mode:
-
-```bash
-MCP_HUB_UNKNOWN_SESSION_POLICY=stateless_fallback
-```
-
-In this mode, requests with expired `mcp-session-id` are handled via one-shot stateless transport without `-32000`, reducing client breaks during long rounds/after restarts.
-
 For long-lived pools, you can fully disable idle expiration of transport sessions:
 
 ```bash
@@ -484,7 +485,7 @@ MCP_HUB_SESSION_IDLE_TIMEOUT_MS=0
 Why not Redis for "live" MCP sessions:
 - In the SDK, transport session keeps in-memory connection state and is not serializable.
 - Redis is useful for metrics/queues/event-store, but transport itself does not resume from Redis after process restart.
-- Practical reliability path: `MCP_HUB_SESSION_IDLE_TIMEOUT_MS=0` (or long timeout) + client auto-reinit + `stateless_fallback` for unknown session.
+- Practical reliability path: `MCP_HUB_SESSION_IDLE_TIMEOUT_MS=0` (or long timeout) + client auto-reinit on unknown session.
 
 ### Onboarding at Agent Startup
 

@@ -8,10 +8,13 @@ const DEFAULT_ENDPOINT = process.env.EVENTS_ENDPOINT
   || 'http://127.0.0.1:3000/mcp';
 
 function parseArgs(argv) {
+  const envToken = process.env.HUB_AUTH_TOKEN || process.env.AUTH_TOKEN || process.env.MCP_HUB_AUTH_TOKEN || '';
   const out = {
     endpoint: DEFAULT_ENDPOINT,
     agentId: process.env.AGENT_ID || process.env.BRIDGE_AGENT_ID || '',
-    authToken: process.env.AUTH_TOKEN || process.env.MCP_HUB_AUTH_TOKEN || '',
+    authToken: envToken,
+    authTokenFile: process.env.HUB_AUTH_TOKEN_FILE || process.env.AUTH_TOKEN_FILE || '',
+    authTokenFromArgv: false,
     streams: process.env.HUB_EVENTS_STREAMS || 'messages,tasks',
     responseMode: process.env.HUB_EVENTS_RESPONSE_MODE || 'nano',
     cursor: process.env.HUB_EVENTS_CURSOR || '',
@@ -36,7 +39,8 @@ function parseArgs(argv) {
     if (arg === '--endpoint') out.endpoint = next();
     else if (arg === '--events-url') out.endpoint = next();
     else if (arg === '--agent-id') out.agentId = next();
-    else if (arg === '--auth-token') out.authToken = next();
+    else if (arg === '--auth-token') { out.authToken = next(); out.authTokenFromArgv = true; }
+    else if (arg === '--token-file') out.authTokenFile = next();
     else if (arg === '--streams') out.streams = next();
     else if (arg === '--response-mode') out.responseMode = next();
     else if (arg === '--cursor') out.cursor = next();
@@ -49,13 +53,18 @@ function parseArgs(argv) {
     else if (arg === '--no-reconnect') out.reconnect = false;
     else if (arg === '--max-reconnects') out.maxReconnects = Number(next());
     else if (arg === '--help' || arg === '-h') {
-      console.log(`Usage: hub-events-client.mjs --agent-id ID --auth-token TOKEN [options]
+      console.log(`Usage: hub-events-client.mjs --agent-id ID [options]
+
+Auth:
+  Set HUB_AUTH_TOKEN or AUTH_TOKEN in the environment (preferred).
+  MCP_HUB_AUTH_TOKEN is also accepted for compatibility.
+  --token-file PATH    Read token from a local file (trimmed)
+  --auth-token TOKEN   Legacy compatibility only; warning: visible in ps/process listings
 
 Options:
   --endpoint URL       MCP endpoint or /events URL (default ${DEFAULT_ENDPOINT})
   --events-url URL     Alias for --endpoint
   --agent-id ID        Agent id to subscribe as
-  --auth-token TOKEN   register_agent auth token, sent as Authorization: Bearer
   --streams CSV        Event streams (default messages,tasks)
   --response-mode MODE nano|compact (default nano)
   --cursor CURSOR      Resume cursor, e.g. e:1ab
@@ -118,6 +127,18 @@ async function writeCursorFile(filePath, cursor) {
   await fs.writeFile(filePath, `${cursor}\n`);
 }
 
+async function resolveAuthToken(opts) {
+  if (!opts.authToken && opts.authTokenFile) {
+    opts.authToken = (await fs.readFile(opts.authTokenFile, 'utf8')).trim();
+  }
+  if (opts.authTokenFromArgv) {
+    process.stderr.write('[security] --auth-token exposes the auth token in ps/process listings; prefer HUB_AUTH_TOKEN, AUTH_TOKEN, or --token-file.\n');
+  }
+  if (!opts.authToken) {
+    throw new Error('auth token is required via HUB_AUTH_TOKEN, AUTH_TOKEN, or --token-file (legacy --auth-token is ps-visible)');
+  }
+}
+
 function parseSseFrame(frame) {
   let event = 'message';
   let id = null;
@@ -146,7 +167,7 @@ function parseSseFrame(frame) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (!opts.agentId) throw new Error('--agent-id is required');
-  if (!opts.authToken) throw new Error('--auth-token is required');
+  await resolveAuthToken(opts);
   if (!['nano', 'compact'].includes(opts.responseMode)) throw new Error('--response-mode must be nano|compact');
 
   const storedCursor = await readCursorFile(opts.cursorFile);
