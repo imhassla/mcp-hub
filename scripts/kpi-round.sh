@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENDPOINT="${ENDPOINT:-http://localhost:3000/mcp}"
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:3000/mcp}"
 WORKERS="${WORKERS:-10}"
 OUT_DIR="${OUT_DIR:-/tmp/exp5}"
 USE_AUTH_TOKEN="${USE_AUTH_TOKEN:-auto}" # auto | true | false
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 BLOB_COMPRESSION_MODE="${BLOB_COMPRESSION_MODE:-lossless_auto}" # none | json | whitespace | auto | lossless_auto
 MCP_HTTP_CONNECT_TIMEOUT_SEC="${MCP_HTTP_CONNECT_TIMEOUT_SEC:-3}"
 MCP_HTTP_TIMEOUT_SEC="${MCP_HTTP_TIMEOUT_SEC:-25}"
@@ -108,12 +109,48 @@ LATENCY_MS=0
 TOOL_RESULT=''
 LAST_VALID_SID=''
 
+payload_is_replay_safe() {
+  local payload="$1"
+  printf '%s' "$payload" | jq -e '
+    .method == "tools/list"
+    or .method == "notifications/initialized"
+    or (
+      .method == "tools/call"
+      and ((.params.name // "") as $name | (.params.arguments // {}) as $args | (
+        ((([
+          "attach_task_artifact", "claim_task", "create_artifact_download", "create_artifact_upload",
+          "create_task", "create_task_artifact_downloads", "delete_task", "poll_and_claim",
+          "release_task_claim", "renew_task_claim", "reply_thread", "send_blob_message",
+          "send_message", "share_artifact", "share_blob_context", "share_context",
+          "start_thread", "update_task", "write_memory"
+        ] | index($name)) != null) and ((($args.idempotency_key // "") | tostring | length) > 0))
+        or (
+          ($name | test("^(get_|read_|list_|search_|fetch_|suggest_)"))
+          and ($name != "read_messages" or $args.mark_read == false)
+          and ($name != "read_filter_feed" or $args.advance_cursor != true)
+          and ($name != "fetch_hub_refs" or $args.mark_messages_read != true)
+          and ($name != "get_task_handoff" or $args.include_downloads != true)
+        )
+        or ($name | test("^(hash_payload|pack_protocol_message|unpack_protocol_message|store_protocol_blob)$"))
+        or (
+          $name == "register_agent"
+          and ((($args.auth_token // "") | tostring | length) >= 32)
+        )
+      ))
+    )
+  ' >/dev/null 2>&1
+}
+
 curl_post_json() {
   local sid="$1"
   local payload="$2"
   local attempt=1
+  local max_attempts=1
   local response=''
-  while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
+  if payload_is_replay_safe "$payload"; then
+    max_attempts=$((MCP_HTTP_RETRIES + 1))
+  fi
+  while [ "$attempt" -le "$max_attempts" ]; do
     local -a args
     args=(
       -sS
@@ -126,14 +163,12 @@ curl_post_json() {
     if [ -n "$sid" ]; then
       args+=(-H "mcp-session-id: $sid")
     fi
-    args+=(--data "$payload")
-
-    if response=$(curl "${args[@]}"); then
+    if response=$(printf '%s' "$payload" | curl "${args[@]}" --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
 
-    if [ "$attempt" -le "$MCP_HTTP_RETRIES" ]; then
+    if [ "$attempt" -lt "$max_attempts" ]; then
       sleep "$MCP_HTTP_RETRY_DELAY_SEC"
     fi
     attempt=$((attempt + 1))
@@ -146,13 +181,13 @@ curl_init_post() {
   local attempt=1
   local response=''
   while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
-    if response=$(curl -i -sS \
+    if response=$(printf '%s' "$payload" | curl -i -sS \
       --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" \
       --max-time "$MCP_HTTP_TIMEOUT_SEC" \
       -X POST "$ENDPOINT" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
-      --data "$payload"); then
+      --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
@@ -207,7 +242,7 @@ with_auth_token() {
     printf '%s' "$args_json"
     return 0
   fi
-  printf '%s' "$args_json" | jq -c --arg token "$token" '. + {auth_token:$token}'
+  printf '%s' "$args_json" | AUTH_TOKEN_VALUE="$token" jq -c '. + {auth_token:env.AUTH_TOKEN_VALUE}'
 }
 
 mcp_tool_call() {
@@ -338,12 +373,12 @@ run_variant() {
 
   sid=$(mcp_init)
   orchestrator="orch-${tag}"
-  worker_prefix="w-${tag}-"
+  worker_prefix="synthetic-${tag}-"
 
   declare -a task_ids
   declare -a worker_tokens
 
-  mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$orchestrator" '{id:$id,name:"Orchestrator",type:"codex",capabilities:"orchestration,kpi",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+  mcp_tool_call "$sid" register_agent "$(REGISTER_TOKEN="$REGISTER_TOKEN" jq -cn --arg id "$orchestrator" '{id:$id,name:"KPI Synthetic Orchestrator",type:"synthetic:kpi",capabilities:"synthetic-http-benchmark,orchestration,kpi",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
   assert_success "$TOOL_RESULT" "register_orchestrator"
   orchestrator_token=$(printf '%s' "$TOOL_RESULT" | jq -r '.auth.token // empty')
   if [ "$USE_AUTH_TOKEN" = "true" ] && [ -z "$orchestrator_token" ]; then
@@ -355,7 +390,7 @@ run_variant() {
     local wid tc
     wid="${worker_prefix}${i}"
 
-    mcp_tool_call "$sid" register_agent "$(jq -cn --arg id "$wid" --arg n "Worker-$i" --arg m "$mode" '{id:$id,name:$n,type:"claude",capabilities:("round,"+$m),onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+    mcp_tool_call "$sid" register_agent "$(REGISTER_TOKEN="$REGISTER_TOKEN" jq -cn --arg id "$wid" --arg n "Synthetic Worker-$i" --arg m "$mode" '{id:$id,name:$n,type:"synthetic:kpi",capabilities:("synthetic-http-benchmark,round,"+$m),onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
     assert_success "$TOOL_RESULT" "register_worker_$i"
 
     tc=$(printf '%s' "$TOOL_RESULT" | jq '.onboarding.tool_count // 0')
@@ -518,6 +553,7 @@ run_variant() {
       mode:$mode,
       tag:$tag,
       namespace:$namespace,
+      runtime_path:"synthetic_http_benchmark",
       workers:$workers,
       auth_token_mode:$auth_token_mode,
       blob_compression_mode:$blob_compression_mode,
@@ -572,7 +608,7 @@ case "$BLOB_COMPRESSION_MODE" in
     ;;
 esac
 TS=$(date +%s)
-BASE_TAG="EXP5-${TS}"
+BASE_TAG="EXP5-${TS}-$$-${RANDOM}"
 
 baseline_json=$(run_variant baseline "${BASE_TAG}-B")
 blob_json=$(run_variant blob "${BASE_TAG}-O")

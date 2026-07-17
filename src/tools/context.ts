@@ -5,6 +5,7 @@ import {
   heartbeat,
   logActivity,
   putProtocolBlob,
+  grantProtocolBlobAccess,
   getProtocolBlob,
 } from '../db.js';
 import type { Context } from '../types.js';
@@ -37,6 +38,24 @@ interface ContextBlobRef {
 interface ResolvedContext extends Context {
   blob_ref?: ContextBlobRef;
   resolved_value?: string | null;
+}
+
+interface ContextCursor {
+  ts: number;
+  id: number;
+}
+
+function parseContextCursor(cursor?: string): ContextCursor | null {
+  if (!cursor || typeof cursor !== 'string') return null;
+  const [tsRaw, idRaw] = cursor.split(':');
+  const ts = Number(tsRaw);
+  const id = Number(idRaw);
+  if (!Number.isFinite(ts) || !Number.isFinite(id) || ts <= 0 || id <= 0) return null;
+  return { ts: Math.floor(ts), id: Math.floor(id) };
+}
+
+function formatContextCursor(ctx: { updated_at: number; id: number }): string {
+  return `${ctx.updated_at}:${ctx.id}`;
 }
 
 function maybeCompressValue(value: string, mode: 'none' | 'json' | 'whitespace' | 'auto'): { value: string; compressed: boolean } {
@@ -86,8 +105,8 @@ export function handleShareContext(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'share_context', args.idempotency_key, () => {
-    const compressionMode = args.compression_mode || 'auto';
+  return withIdempotency(args.agent_id, 'share_context', args.idempotency_key, args, () => {
+    const compressionMode = args.compression_mode || 'none';
     const compressed = maybeCompressValue(args.value, compressionMode);
     if (compressed.value.length > MAX_CONTEXT_VALUE_CHARS) {
       const error = `Context value too long (${compressed.value.length} chars). Max is ${MAX_CONTEXT_VALUE_CHARS}.`;
@@ -127,7 +146,7 @@ export function handleShareBlobContext(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'share_blob_context', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'share_blob_context', args.idempotency_key, args, () => {
     const compressionMode = args.compression_mode || 'lossless_auto';
     const compressed = compressionMode === 'lossless_auto'
       ? (() => {
@@ -159,7 +178,6 @@ export function handleShareBlobContext(args: {
 
     const fullHash = sha256Hex(compressed.value);
     const shortLen = Number.isFinite(args.hash_truncate) ? Math.max(8, Math.min(64, Math.floor(Number(args.hash_truncate)))) : 16;
-    const { created } = putProtocolBlob(fullHash, compressed.value);
     const refValue = makeBlobRefEnvelope(fullHash, compressed.value.length);
 
     if (refValue.length > MAX_CONTEXT_VALUE_CHARS) {
@@ -168,8 +186,10 @@ export function handleShareBlobContext(args: {
       return { success: false, error_code: 'VALUE_TOO_LONG', error, max_chars: MAX_CONTEXT_VALUE_CHARS };
     }
 
+    const { created } = putProtocolBlob(fullHash, compressed.value, args.agent_id);
     const contextNamespace = (args.namespace || 'default').trim() || 'default';
     const ctx = shareContext(args.agent_id, args.key, refValue, args.trace_id, args.span_id, contextNamespace);
+    grantProtocolBlobAccess(fullHash, ['*'], args.agent_id);
     logActivity(
       args.agent_id,
       'share_blob_context',
@@ -212,6 +232,7 @@ export function handleGetContext(args: {
   limit?: number;
   offset?: number;
   updated_after?: number;
+  cursor?: string;
   response_mode?: 'full' | 'compact' | 'tiny' | 'nano' | 'summary';
   polling?: boolean;
   resolve_blob_refs?: boolean;
@@ -227,27 +248,36 @@ export function handleGetContext(args: {
     };
   }
   const limit = Math.max(1, Math.min(MAX_CONTEXT_LIMIT, Math.floor(args.limit ?? DEFAULT_CONTEXT_LIMIT)));
-  const offset = Math.max(0, Math.floor(args.offset ?? 0));
+  const cursor = parseContextCursor(args.cursor);
   const updatedAfter = Number.isFinite(args.updated_after) ? Math.floor(Number(args.updated_after)) : undefined;
+  const useDeltaOrdering = cursor !== null || updatedAfter !== undefined;
+  const pollingCycle = args.polling === true || useDeltaOrdering;
+  const queryLimit = useDeltaOrdering ? Math.min(MAX_CONTEXT_LIMIT + 1, limit + 1) : limit;
+  const offset = useDeltaOrdering ? 0 : Math.max(0, Math.floor(args.offset ?? 0));
   const contexts = getContext({
     agent_id: args.agent_id,
     key: args.key,
     namespace: args.namespace,
-    limit,
+    limit: queryLimit,
     offset,
     updated_after: updatedAfter,
+    cursor: cursor || undefined,
   });
+  const hasMore = useDeltaOrdering ? contexts.length > limit : false;
+  const slicedContexts = hasMore ? contexts.slice(0, limit) : contexts;
+  const nextCursor = slicedContexts.length > 0 ? formatContextCursor(slicedContexts[slicedContexts.length - 1]) : args.cursor || null;
   logActivity(
     args.requesting_agent || 'system',
     'get_context',
-    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}) : ${contexts.length} results`
+    `Queried context (agent=${args.agent_id || '*'}, key=${args.key || '*'}, ns=${args.namespace || '*'}, limit=${limit}, offset=${offset}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'}) : ${slicedContexts.length} results`,
+    { emit_stream_event: !pollingCycle }
   );
 
   const resolvedContexts: ResolvedContext[] = args.resolve_blob_refs
-    ? contexts.map((ctx) => {
+    ? slicedContexts.map((ctx) => {
       const blobRef = parseBlobRefEnvelope(ctx.value);
       if (!blobRef) return { ...ctx };
-      const blob = getProtocolBlob(blobRef.hash);
+      const blob = getProtocolBlob(blobRef.hash, args.requesting_agent || args.agent_id || '');
       const decoded = blob ? decodeLosslessBlobPayload(blob.value) : null;
       return {
         ...ctx,
@@ -261,7 +291,7 @@ export function handleGetContext(args: {
         resolved_value: decoded ? decoded.value : null,
       };
     })
-    : contexts;
+    : slicedContexts;
 
   if (responseMode === 'nano') {
     const nano = resolvedContexts.map((ctx) => {
@@ -286,6 +316,8 @@ export function handleGetContext(args: {
     });
     return {
       c: nano,
+      h: hasMore ? 1 : 0,
+      n: nextCursor,
     };
   }
 
@@ -316,6 +348,8 @@ export function handleGetContext(args: {
     });
     return {
       contexts: compactLike,
+      has_more: hasMore,
+      next_cursor: nextCursor,
     };
   }
 
@@ -353,7 +387,7 @@ export function handleGetContext(args: {
     };
   }
 
-  return { contexts: resolvedContexts };
+  return { contexts: resolvedContexts, has_more: hasMore, next_cursor: nextCursor };
 }
 
 export const contextTools = {
@@ -368,8 +402,8 @@ export const contextTools = {
         namespace: { type: 'string', description: 'Optional context namespace/tag (default "default")' },
         trace_id: { type: 'string', description: 'Optional trace identifier for cross-tool diagnostics' },
         span_id: { type: 'string', description: 'Optional span identifier for this context update' },
-        compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto'], description: 'Optional token-saving compression mode (default auto)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto'], description: 'Optional normalization/compression (default none preserves value exactly)' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['agent_id', 'key', 'value'],
     },
@@ -388,7 +422,7 @@ export const contextTools = {
         span_id: { type: 'string', description: 'Optional span identifier for this context update' },
         compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto', 'lossless_auto'], description: 'Compression mode before hashing/storage (lossless_auto is strict and reversible)' },
         hash_truncate: { type: 'number', description: 'Optional short hash length in response (8..64)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['agent_id', 'key', 'payload'],
     },
@@ -406,6 +440,7 @@ export const contextTools = {
         limit: { type: 'number', description: `Max rows to return (default ${DEFAULT_CONTEXT_LIMIT}, max ${MAX_CONTEXT_LIMIT})` },
         offset: { type: 'number', description: 'Row offset for pagination (default 0)' },
         updated_after: { type: 'number', description: 'Delta mode: return context rows with updated_at > updated_after (ms epoch)' },
+        cursor: { type: 'string', description: 'Delta cursor "<updated_at>:<id>" returned by previous get_context call' },
         response_mode: { type: 'string', enum: ['full', 'compact', 'tiny', 'nano', 'summary'], description: 'compact shows previews, tiny shows digests/sizes, nano uses short keys, summary returns aggregates' },
         polling: { type: 'boolean', description: 'Mark this call as polling-cycle read; full mode is forbidden when polling=true' },
         resolve_blob_refs: { type: 'boolean', description: 'Resolve CAEP blob-ref values from protocol blob store' },

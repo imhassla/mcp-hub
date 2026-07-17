@@ -1,9 +1,11 @@
 import {
   sendMessage,
   readMessages,
+  markMessagesRead,
   heartbeat,
   logActivity,
   putProtocolBlob,
+  grantProtocolBlobAccess,
   getProtocolBlob,
 } from '../db.js';
 import type { Message } from '../types.js';
@@ -122,8 +124,8 @@ export function handleSendMessage(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'send_message', args.idempotency_key, () => {
-    const compressionMode = args.compression_mode || 'auto';
+  return withIdempotency(args.from_agent, 'send_message', args.idempotency_key, args, () => {
+    const compressionMode = args.compression_mode || 'none';
     const compressed = maybeCompressContent(args.content, compressionMode);
     const metadata = normalizeJsonString(args.metadata || '{}');
 
@@ -148,7 +150,11 @@ export function handleSendMessage(args: {
     );
     const target = args.to_agent || 'broadcast';
     const savedChars = args.content.length - compressed.content.length;
-    logActivity(args.from_agent, 'send_message', `Message to ${target}: ${compressed.content.slice(0, 100)} (compressed=${compressed.compressed} saved_chars=${savedChars})`);
+    logActivity(
+      args.from_agent,
+      'send_message',
+      `Message to ${target}: chars=${compressed.content.length} digest=${sha256Hex(compressed.content).slice(0, 16)} compressed=${compressed.compressed} saved_chars=${savedChars}`
+    );
     return {
       success: true,
       message,
@@ -174,7 +180,7 @@ export function handleSendBlobMessage(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'send_blob_message', args.idempotency_key, () => {
+  return withIdempotency(args.from_agent, 'send_blob_message', args.idempotency_key, args, () => {
     const compressionMode = args.compression_mode || 'lossless_auto';
     const compressed = compressBlobPayload(args.payload, compressionMode);
     const storedPayload = compressed.stored;
@@ -186,7 +192,6 @@ export function handleSendBlobMessage(args: {
 
     const fullHash = sha256Hex(storedPayload);
     const shortLen = Number.isFinite(args.hash_truncate) ? Math.max(8, Math.min(64, Math.floor(Number(args.hash_truncate)))) : 16;
-    const { created } = putProtocolBlob(fullHash, storedPayload);
     const envelope = makeBlobRefEnvelope(fullHash, storedPayload.length);
 
     if (envelope.length > MAX_MESSAGE_CONTENT_CHARS) {
@@ -202,6 +207,7 @@ export function handleSendBlobMessage(args: {
       return { success: false, error_code: 'METADATA_TOO_LONG', error, max_chars: MAX_MESSAGE_METADATA_CHARS };
     }
 
+    const { created } = putProtocolBlob(fullHash, storedPayload, args.from_agent);
     const message = sendMessage(
       args.from_agent,
       args.to_agent || null,
@@ -210,6 +216,7 @@ export function handleSendBlobMessage(args: {
       args.trace_id,
       args.span_id,
     );
+    grantProtocolBlobAccess(fullHash, [args.to_agent || '*'], args.from_agent);
     const target = args.to_agent || 'broadcast';
     logActivity(
       args.from_agent,
@@ -257,6 +264,7 @@ export function handleReadMessages(args: {
   response_mode?: 'full' | 'compact' | 'tiny' | 'nano';
   polling?: boolean;
   resolve_blob_refs?: boolean;
+  mark_read?: boolean;
 }) {
   heartbeat(args.agent_id);
   const limit = Math.max(1, Math.min(MAX_READ_LIMIT, Math.floor(args.limit ?? DEFAULT_READ_LIMIT)));
@@ -275,6 +283,9 @@ export function handleReadMessages(args: {
   }
   const queryLimit = useDeltaOrdering ? Math.min(MAX_READ_LIMIT + 1, limit + 1) : limit;
   const offset = Math.max(0, Math.floor(args.offset ?? 0));
+  // T77-F1: fetch WITHOUT marking (the delta path over-fetches limit+1 to compute has_more), then
+  // mark only the rows actually returned to the caller. Marking the over-fetched peek row would
+  // drop it permanently under unread_only + delta pagination.
   const messages = readMessages(args.agent_id, {
     from: args.from,
     unread_only: args.unread_only,
@@ -282,15 +293,19 @@ export function handleReadMessages(args: {
     offset,
     since_ts: sinceTs,
     cursor: cursor || undefined,
+    mark_read: false,
   });
   const hasMore = useDeltaOrdering ? messages.length > limit : false;
   const slicedMessages = hasMore ? messages.slice(0, limit) : messages;
+  if (args.mark_read !== false) {
+    markMessagesRead(args.agent_id, slicedMessages.filter((message) => message.read === 0).map((message) => message.id));
+  }
   const nextCursor = slicedMessages.length > 0 ? formatMessageCursor(slicedMessages[slicedMessages.length - 1]) : args.cursor || null;
   const resolvedMessages: ResolvedMessage[] = args.resolve_blob_refs
     ? slicedMessages.map((message) => {
       const blobRef = parseBlobRefEnvelope(message.content);
       if (!blobRef) return { ...message };
-      const blob = getProtocolBlob(blobRef.hash);
+      const blob = getProtocolBlob(blobRef.hash, args.agent_id);
       const decoded = blob ? decodeLosslessBlobPayload(blob.value) : null;
       return {
         ...message,
@@ -309,7 +324,8 @@ export function handleReadMessages(args: {
   logActivity(
     args.agent_id,
     'read_messages',
-    `Read ${slicedMessages.length} messages (limit=${limit}, offset=${offset}, since_ts=${sinceTs ?? '-'}, cursor=${args.cursor || '-'}, resolve_blob_refs=${Boolean(args.resolve_blob_refs)})`
+    `Read ${slicedMessages.length} messages (limit=${limit}, offset=${offset}, since_ts=${sinceTs ?? '-'}, cursor=${args.cursor || '-'}, resolve_blob_refs=${Boolean(args.resolve_blob_refs)})`,
+    { emit_stream_event: !pollingCycle }
   );
   if (responseMode === 'nano') {
     const nano = resolvedMessages.map((message) => {
@@ -388,8 +404,8 @@ export const messageTools = {
         metadata: { type: 'string', description: 'JSON metadata string' },
         trace_id: { type: 'string', description: 'Optional trace identifier for cross-tool diagnostics' },
         span_id: { type: 'string', description: 'Optional span identifier for this message emission' },
-        compression_mode: { type: 'string', enum: ['none', 'whitespace', 'auto'], description: 'Optional token-saving compression mode (default auto)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        compression_mode: { type: 'string', enum: ['none', 'whitespace', 'auto'], description: 'Optional lossy whitespace compression (default none preserves content exactly)' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['from_agent', 'content'],
     },
@@ -408,14 +424,14 @@ export const messageTools = {
         span_id: { type: 'string', description: 'Optional span identifier for this message emission' },
         compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto', 'lossless_auto'], description: 'Compression mode before hashing/storage (lossless_auto is strict and reversible)' },
         hash_truncate: { type: 'number', description: 'Optional short hash length in response (8..64)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['from_agent', 'payload'],
     },
     handler: handleSendBlobMessage,
   },
   read_messages: {
-    description: `Read incoming messages. Messages are marked as read after retrieval. Defaults to limit=${DEFAULT_READ_LIMIT}, max limit=${MAX_READ_LIMIT}. Use response_mode=compact|tiny|nano to reduce token output.`,
+    description: `Read incoming messages. Messages are marked as read after retrieval unless mark_read=false. Defaults to limit=${DEFAULT_READ_LIMIT}, max limit=${MAX_READ_LIMIT}. Use response_mode=compact|tiny|nano to reduce token output.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -429,6 +445,7 @@ export const messageTools = {
         response_mode: { type: 'string', enum: ['full', 'compact', 'tiny', 'nano'], description: 'compact returns previews; tiny returns digests/sizes; nano uses short keys for routing loops' },
         polling: { type: 'boolean', description: 'Mark this call as polling-cycle read; full mode is forbidden when polling=true' },
         resolve_blob_refs: { type: 'boolean', description: 'Resolve CAEP blob-ref envelopes into payloads from protocol blob store' },
+        mark_read: { type: 'boolean', description: 'If false, visible messages are not marked read. Default true.' },
       },
       required: ['agent_id'],
     },

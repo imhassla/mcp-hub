@@ -2,11 +2,17 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY tsconfig.json vitest.config.ts ./
 COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY hub ./hub
+COPY hub.sh ./hub.sh
 COPY tests/ ./tests/
+
+RUN chown -R node:node /app
+USER node
 
 CMD ["sh"]

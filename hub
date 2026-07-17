@@ -2,17 +2,21 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENDPOINT="${HUB_ENDPOINT:-http://localhost:3000/mcp}"
+ENDPOINT="${HUB_ENDPOINT:-http://127.0.0.1:3000/mcp}"
 ROLE="assistant"
 BACKEND="codex"
 AGENT_ID=""
 AGENT_NAME=""
 NAMESPACE=""
+THREAD_ID=""
 ONBOARDING_MODE="compact"
 DRY_RUN=0
 EXTRA_NOTE=""
 RUNTIME_MODE_OVERRIDE=""
 LIFECYCLE_OVERRIDE=""
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
+REGISTER_TOKEN_FROM_ARGV=0
+AGENT_TOKEN_FILE="${HUB_AGENT_TOKEN_FILE:-}"
 
 usage() {
   cat <<USAGE
@@ -27,7 +31,10 @@ Options:
   --namespace <tag>
   --onboarding <full|compact|none>
   --lifecycle <persistent|ephemeral>
+  --register-token <token>
+  --agent-token-file <path>  Persist agent auth for a reusable --agent-id (mode 0600)
   --runtime-mode <repo|isolated|unknown>
+  --thread-id <id>       Publish result as a discussion thread reply
   --repo-runtime         Shortcut for --runtime-mode repo
   --isolated-runtime     Shortcut for --runtime-mode isolated
   --note <text>
@@ -163,8 +170,21 @@ while [ $# -gt 0 ]; do
       RUNTIME_MODE_OVERRIDE="${2:-}"
       shift 2
       ;;
+    --thread-id)
+      THREAD_ID="${2:-}"
+      shift 2
+      ;;
     --lifecycle)
       LIFECYCLE_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --register-token)
+      REGISTER_TOKEN="${2:-}"
+      REGISTER_TOKEN_FROM_ARGV=1
+      shift 2
+      ;;
+    --agent-token-file)
+      AGENT_TOKEN_FILE="${2:-}"
       shift 2
       ;;
     --repo-runtime)
@@ -195,6 +215,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$REGISTER_TOKEN_FROM_ARGV" -eq 1 ]; then
+  echo "[security] --register-token is visible in process listings; prefer HUB_REGISTER_TOKEN or MCP_HUB_REGISTER_TOKEN." >&2
+fi
+
 if [ "$BACKEND" != "codex" ] && [ "$BACKEND" != "claude" ]; then
   echo "Unsupported backend: $BACKEND (use codex|claude)" >&2
   exit 1
@@ -218,7 +242,7 @@ fi
 require_cmd jq
 
 if [ -z "$AGENT_ID" ]; then
-  AGENT_ID="${ROLE}-${BACKEND}-$(date +%s)"
+  AGENT_ID="${ROLE}-${BACKEND}-$(date +%s)-$$-${RANDOM}"
 fi
 if [ -z "$AGENT_NAME" ]; then
   role_title="$(printf '%s' "$ROLE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
@@ -257,26 +281,19 @@ if [ -n "$RUNTIME_MODE_OVERRIDE" ]; then
 fi
 
 PROMPT="$(cat <<EOF_PROMPT
-$(cat "$ROOT_DIR/AGENT_PROMPT.md")
-
-## Hub Launcher Contract
+## Hub Bridge Launcher Contract
 
 Runtime profile (auto-detected):
 authoritative_runtime_profile_json = $RUNTIME_PROFILE_JSON
 
-Startup contract for this session:
-1. register_agent with:
-   - id: \"$AGENT_ID\"
-   - name: \"$AGENT_NAME\"
-   - type: \"$BACKEND\"
-   - role: \"$ROLE\"
-   - capabilities: \"$CAPABILITIES\"
-   - lifecycle: \"$LIFECYCLE\"
-   - onboarding_mode: \"$ONBOARDING_MODE\"
-   - runtime_profile: authoritative_runtime_profile_json
-2. Extract auth.token and attach auth_token to every following tool call.
-3. Call get_onboarding(mode=\"compact\", role=\"$ROLE\", runtime_mode=\"${RUNTIME_MODE}\", empty_dir=$(printf '%s' "$RUNTIME_PROFILE_JSON" | jq -r '.empty_dir')) once and cache tool/rule map.
-4. Respect execution_mode routing on tasks (repo|isolated|any).
+This session is mediated by bridge-agent-runner:
+- Do not call MCP hub tools directly from the backend CLI.
+- The bridge handles register_agent, auth, onboarding, preflight digest, context/message publication, and optional thread reply.
+- Use the bounded hub preflight JSON injected by the bridge as read-only context.
+- If you need hub state, reason from the bridge preflight/digest/memory context already provided to you.
+- Return a compact, actionable result for role="$ROLE".
+- If you inspected files or ran commands, include evidence paths/commands in the result.
+- Prefer JSON when possible; otherwise keep output concise and structured.
 
 Session facts:
 - Endpoint: $ENDPOINT
@@ -294,53 +311,38 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$BACKEND" = "codex" ]; then
-  require_cmd codex
-  if [ -n "${CODEX_MODEL:-}" ]; then
-    codex -c "mcp_servers.agent-hub.url=\"$ENDPOINT\"" exec \
-      --full-auto \
-      --skip-git-repo-check \
-      --sandbox workspace-write \
-      --model "$CODEX_MODEL" \
-      "$PROMPT"
-  else
-    codex -c "mcp_servers.agent-hub.url=\"$ENDPOINT\"" exec \
-      --full-auto \
-      --skip-git-repo-check \
-      --sandbox workspace-write \
-      "$PROMPT"
-  fi
-  exit $?
+require_cmd node
+
+BRIDGE_ARGS=(
+  "$ROOT_DIR/scripts/bridge-agent-runner.mjs"
+  --endpoint "$ENDPOINT"
+  --backend "$BACKEND"
+  --agent-id "$AGENT_ID"
+  --agent-name "$AGENT_NAME"
+  --role "$ROLE"
+  --lifecycle "$LIFECYCLE"
+  --onboarding-mode "$ONBOARDING_MODE"
+  --capabilities "$CAPABILITIES"
+  --namespace "${NAMESPACE:-hub-launcher}"
+  --key "hub-${ROLE}-${BACKEND}"
+  --memory-namespace "${NAMESPACE:-hub-launcher}"
+  --remember-key "hub-${ROLE}-${BACKEND}-$(date +%s)"
+  --remember-tags "hub-launcher,$ROLE,$BACKEND"
+  --runtime-mode "${RUNTIME_MODE_OVERRIDE:-auto}"
+  --out-dir "${HUB_BRIDGE_OUT_DIR:-/tmp/hub-bridge-launcher}"
+)
+
+if [ -n "${THREAD_ID:-}" ]; then
+  BRIDGE_ARGS+=(--thread-id "$THREAD_ID" --thread-role "$ROLE")
+fi
+if [ -n "${AGENT_TOKEN_FILE:-}" ]; then
+  BRIDGE_ARGS+=(--agent-token-file "$AGENT_TOKEN_FILE")
 fi
 
-require_cmd claude
-TMP_MCP_CONFIG="$(mktemp)"
-cleanup() {
-  rm -f "$TMP_MCP_CONFIG"
-}
-trap cleanup EXIT
-
-cat > "$TMP_MCP_CONFIG" <<EOF_CFG
-{
-  "mcpServers": {
-    "agent-hub": {
-      "url": "$ENDPOINT"
-    }
-  }
-}
-EOF_CFG
-
-if [ -n "${CLAUDE_MODEL:-}" ]; then
-  claude -p \
-    --permission-mode bypassPermissions \
-    --mcp-config "$TMP_MCP_CONFIG" \
-    --strict-mcp-config \
-    --model "$CLAUDE_MODEL" \
-    "$PROMPT"
+# T79-F5: pass the registration secret via env (the runner reads BRIDGE_REGISTER_TOKEN) instead of
+# on argv, so it is never visible in `ps`/process listings.
+if [ -n "${REGISTER_TOKEN:-}" ]; then
+  printf '%s' "$PROMPT" | BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN" node "${BRIDGE_ARGS[@]}"
 else
-  claude -p \
-    --permission-mode bypassPermissions \
-    --mcp-config "$TMP_MCP_CONFIG" \
-    --strict-mcp-config \
-    "$PROMPT"
+  printf '%s' "$PROMPT" | node "${BRIDGE_ARGS[@]}"
 fi

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENDPOINT="${ENDPOINT:-http://localhost:3300/mcp}"
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:3300/mcp}"
 RUNS="${RUNS:-60}"
 VOTES="${VOTES:-96}"
 OUT_DIR="${OUT_DIR:-/tmp/consensus-ab}"
@@ -10,6 +10,7 @@ MCP_HTTP_TIMEOUT_SEC="${MCP_HTTP_TIMEOUT_SEC:-25}"
 MCP_HTTP_RETRIES="${MCP_HTTP_RETRIES:-2}"
 MCP_HTTP_RETRY_DELAY_SEC="${MCP_HTTP_RETRY_DELAY_SEC:-1}"
 MCP_REINIT_ON_SESSION_ERROR="${MCP_REINIT_ON_SESSION_ERROR:-1}"
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 INLINE_RESPONSE_MODE="${INLINE_RESPONSE_MODE:-full}" # full | compact | tiny
 BLOB_RESPONSE_MODE="${BLOB_RESPONSE_MODE:-tiny}"     # full | compact | tiny
 BLOB_COMPRESSION_MODE="${BLOB_COMPRESSION_MODE:-auto}" # none | json | whitespace | auto
@@ -21,6 +22,12 @@ HEALTH_URL="${ENDPOINT%/mcp}/health"
 mkdir -p "$OUT_DIR"
 RUN_TAG="CONSAB-$(date +%s)-$$-$RANDOM"
 REPORT_FILE="$OUT_DIR/${RUN_TAG}.json"
+AGENT_ID="${AGENT_ID:-consensus-ab-orchestrator-${RUN_TAG}}"
+INITIAL_AUTH_TOKEN="${HUB_AUTH_TOKEN:-}"
+if [ -z "$INITIAL_AUTH_TOKEN" ]; then
+  INITIAL_AUTH_TOKEN=$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('hex'))")
+fi
+AGENT_AUTH_TOKEN=''
 
 now_ms() {
   perl -MTime::HiRes=time -e 'printf("%.0f\n", time()*1000)'
@@ -56,12 +63,48 @@ wait_for_hub() {
   return 1
 }
 
+payload_is_replay_safe() {
+  local payload="$1"
+  printf '%s' "$payload" | jq -e '
+    .method == "tools/list"
+    or .method == "notifications/initialized"
+    or (
+      .method == "tools/call"
+      and ((.params.name // "") as $name | (.params.arguments // {}) as $args | (
+        ((([
+          "attach_task_artifact", "claim_task", "create_artifact_download", "create_artifact_upload",
+          "create_task", "create_task_artifact_downloads", "delete_task", "poll_and_claim",
+          "release_task_claim", "renew_task_claim", "reply_thread", "send_blob_message",
+          "send_message", "share_artifact", "share_blob_context", "share_context",
+          "start_thread", "update_task", "write_memory"
+        ] | index($name)) != null) and ((($args.idempotency_key // "") | tostring | length) > 0))
+        or (
+          ($name | test("^(get_|read_|list_|search_|fetch_|suggest_)"))
+          and ($name != "read_messages" or $args.mark_read == false)
+          and ($name != "read_filter_feed" or $args.advance_cursor != true)
+          and ($name != "fetch_hub_refs" or $args.mark_messages_read != true)
+          and ($name != "get_task_handoff" or $args.include_downloads != true)
+        )
+        or ($name | test("^(hash_payload|pack_protocol_message|unpack_protocol_message|store_protocol_blob)$"))
+        or (
+          $name == "register_agent"
+          and ((($args.auth_token // "") | tostring | length) >= 32)
+        )
+      ))
+    )
+  ' >/dev/null 2>&1
+}
+
 curl_post_json() {
   local sid="$1"
   local payload="$2"
   local attempt=1
+  local max_attempts=1
   local response=''
-  while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
+  if payload_is_replay_safe "$payload"; then
+    max_attempts=$((MCP_HTTP_RETRIES + 1))
+  fi
+  while [ "$attempt" -le "$max_attempts" ]; do
     local -a args
     args=(
       -sS
@@ -74,13 +117,11 @@ curl_post_json() {
     if [ -n "$sid" ]; then
       args+=(-H "mcp-session-id: $sid")
     fi
-    args+=(--data "$payload")
-
-    if response=$(curl "${args[@]}"); then
+    if response=$(printf '%s' "$payload" | curl "${args[@]}" --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
-    if [ "$attempt" -le "$MCP_HTTP_RETRIES" ]; then
+    if [ "$attempt" -lt "$max_attempts" ]; then
       sleep "$MCP_HTTP_RETRY_DELAY_SEC"
     fi
     attempt=$((attempt + 1))
@@ -93,13 +134,13 @@ curl_init_post() {
   local attempt=1
   local response=''
   while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
-    if response=$(curl -i -sS \
+    if response=$(printf '%s' "$payload" | curl -i -sS \
       --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" \
       --max-time "$MCP_HTTP_TIMEOUT_SEC" \
       -X POST "$ENDPOINT" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
-      --data "$payload"); then
+      --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
@@ -267,8 +308,12 @@ wait_for_hub
 SESSION_ID=$(mcp_init)
 trap 'mcp_close "$SESSION_ID"' EXIT
 
-AGENT_ID="consensus-ab-orchestrator"
-mcp_tool_call "$SESSION_ID" register_agent "$(jq -cn --arg id "$AGENT_ID" '{id:$id,name:"Consensus AB Runner",type:"codex",capabilities:"benchmark,consensus",onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+mcp_tool_call "$SESSION_ID" register_agent "$(REGISTER_TOKEN="$REGISTER_TOKEN" INITIAL_AUTH_TOKEN="$INITIAL_AUTH_TOKEN" jq -cn --arg id "$AGENT_ID" '{id:$id,name:"Consensus AB Runner",type:"codex",capabilities:"benchmark,consensus",onboarding_mode:"none",lifecycle:"ephemeral",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"},auth_token:env.INITIAL_AUTH_TOKEN} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
+AGENT_AUTH_TOKEN=$(printf '%s' "$TOOL_RESULT" | jq -r '.auth.token // empty')
+if [ -z "$AGENT_AUTH_TOKEN" ]; then
+  echo "register_agent did not return auth token" >&2
+  exit 1
+fi
 
 inline_req_total=0
 inline_resp_total=0
@@ -295,11 +340,11 @@ preloaded_votes_payload=''
 preloaded_blob_hash=''
 if [ "$BLOB_STORE_STRATEGY" = "preloaded" ]; then
   preloaded_votes_payload=$(generate_votes_payload 1)
-  store_args=$(jq -cn \
+  store_args=$(AGENT_AUTH_TOKEN="$AGENT_AUTH_TOKEN" jq -cn \
     --arg agent "$AGENT_ID" \
     --arg payload "$preloaded_votes_payload" \
     --arg mode "$BLOB_COMPRESSION_MODE" \
-    '{agent_id:$agent,payload:$payload,compression_mode:$mode}')
+    '{agent_id:$agent,payload:$payload,compression_mode:$mode,auth_token:env.AGENT_AUTH_TOKEN}')
   mcp_tool_call "$SESSION_ID" store_protocol_blob "$store_args"
   blob_store_calls=$((blob_store_calls + 1))
   blob_store_req_total=$((blob_store_req_total + CALL_REQ_CHARS))
@@ -321,7 +366,7 @@ for i in $(seq 1 "$RUNS"); do
   proposal_blob="${RUN_TAG}-blob-${i}"
   votes_payload=$(if [ "$BLOB_STORE_STRATEGY" = "preloaded" ]; then printf '%s' "$preloaded_votes_payload"; else generate_votes_payload "$i"; fi)
 
-  inline_args=$(jq -cn \
+  inline_args=$(AGENT_AUTH_TOKEN="$AGENT_AUTH_TOKEN" jq -cn \
     --arg agent "$AGENT_ID" \
     --arg proposal "$proposal_inline" \
     --arg mode "$INLINE_RESPONSE_MODE" \
@@ -330,7 +375,8 @@ for i in $(seq 1 "$RUNS"); do
       requesting_agent:$agent,
       proposal_id:$proposal,
       votes:$votes,
-      response_mode:$mode
+      response_mode:$mode,
+      auth_token:env.AGENT_AUTH_TOKEN
     }')
   mcp_tool_call "$SESSION_ID" resolve_consensus "$inline_args"
   inline_req_total=$((inline_req_total + CALL_REQ_CHARS))
@@ -346,11 +392,11 @@ for i in $(seq 1 "$RUNS"); do
   if [ "$BLOB_STORE_STRATEGY" = "preloaded" ]; then
     blob_hash="$preloaded_blob_hash"
   else
-    store_args=$(jq -cn \
+    store_args=$(AGENT_AUTH_TOKEN="$AGENT_AUTH_TOKEN" jq -cn \
       --arg agent "$AGENT_ID" \
       --arg payload "$votes_payload" \
       --arg mode "$BLOB_COMPRESSION_MODE" \
-      '{agent_id:$agent,payload:$payload,compression_mode:$mode}')
+      '{agent_id:$agent,payload:$payload,compression_mode:$mode,auth_token:env.AGENT_AUTH_TOKEN}')
     mcp_tool_call "$SESSION_ID" store_protocol_blob "$store_args"
     blob_store_calls=$((blob_store_calls + 1))
     blob_store_req_total=$((blob_store_req_total + CALL_REQ_CHARS))
@@ -367,7 +413,7 @@ for i in $(seq 1 "$RUNS"); do
     fi
   fi
 
-  resolve_blob_args=$(jq -cn \
+  resolve_blob_args=$(AGENT_AUTH_TOKEN="$AGENT_AUTH_TOKEN" jq -cn \
     --arg agent "$AGENT_ID" \
     --arg proposal "$proposal_blob" \
     --arg hash "$blob_hash" \
@@ -378,7 +424,8 @@ for i in $(seq 1 "$RUNS"); do
       requesting_agent:$agent,
       proposal_id:$proposal,
       votes_blob_hash:$hash,
-      response_mode:$mode
+      response_mode:$mode,
+      auth_token:env.AGENT_AUTH_TOKEN
     }
     + (if ($policy|length) > 0 then {emit_blob_ref_policy:$policy} else {emit_blob_ref:$emit} end)')
   mcp_tool_call "$SESSION_ID" resolve_consensus "$resolve_blob_args"

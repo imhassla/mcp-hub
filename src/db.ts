@@ -1,10 +1,12 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
+import { notifyStreamEvent } from './eventNotifier.js';
 import type {
   Agent,
   AgentLifecycle,
+  AgentModelProfile,
   AgentRuntimeProfile,
   AgentWorkspaceMode,
   Message,
@@ -28,6 +30,8 @@ import type {
   KpiWindowSnapshot,
   SloAlert,
   AuthCoverageSnapshot,
+  StreamEvent,
+  StreamEventName,
 } from './types.js';
 
 let db: Database.Database;
@@ -45,6 +49,9 @@ const ACTIVITY_LOG_TTL_MS = Number(process.env.MCP_HUB_ACTIVITY_LOG_TTL_MS || 24
 const PROTOCOL_BLOB_TTL_MS = Number(process.env.MCP_HUB_PROTOCOL_BLOB_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const DONE_TASK_TTL_MS = Number(process.env.MCP_HUB_DONE_TASK_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const ARTIFACT_TTL_MS = Number(process.env.MCP_HUB_ARTIFACT_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const STREAM_EVENT_TTL_MS = Number(process.env.MCP_HUB_STREAM_EVENT_TTL_MS || 24 * 60 * 60 * 1000);
+const FEED_ACK_TTL_MS = Number(process.env.MCP_HUB_FEED_ACK_TTL_MS || 30 * 24 * 60 * 60 * 1000);
+const SAVED_FILTER_TTL_MS = Number(process.env.MCP_HUB_SAVED_FILTER_TTL_MS || 0);
 const ARCHIVE_BATCH_LIMIT = Number(process.env.MCP_HUB_ARCHIVE_BATCH_LIMIT || 200);
 const AUTH_EVENTS_TTL_MS = Number(process.env.MCP_HUB_AUTH_EVENTS_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const RESOLVED_SLO_TTL_MS = Number(process.env.MCP_HUB_RESOLVED_SLO_TTL_MS || 14 * 24 * 60 * 60 * 1000);
@@ -58,8 +65,33 @@ const WATERMARK_CACHE_MS = Number.isFinite(Number(process.env.MCP_HUB_WATERMARK_
 const WATERMARK_AGENT_CACHE_MAX = Number.isFinite(Number(process.env.MCP_HUB_WATERMARK_AGENT_CACHE_MAX))
   ? Math.max(100, Math.min(50_000, Math.floor(Number(process.env.MCP_HUB_WATERMARK_AGENT_CACHE_MAX))))
   : 5_000;
+const AGENT_TOKEN_HASH_PREFIX = 'sha256:';
+const AGENT_TOKEN_LAST_USED_WRITE_INTERVAL_MS = 60_000;
+const PROTOCOL_BLOB_PUBLIC_GRANTEE = '\u0000public';
+const AUTH_EVENT_BUCKET_MS = 60_000;
+const AUTH_EVENT_FLUSH_INTERVAL_MS = 5_000;
+const AUTH_EVENT_PENDING_MAX_KEYS = 512;
+const VOLATILE_IDEMPOTENCY_TOOLS = [
+  'create_artifact_upload',
+  'create_artifact_download',
+  'create_task_artifact_downloads',
+] as const;
+const VOLATILE_IDEMPOTENCY_EXPIRED_SENTINEL = '{"v":"idempotency-volatile-expired-1"}';
+
+type AuthEventStatus = 'valid' | 'missing' | 'invalid' | 'skipped';
+type PendingAuthEvent = {
+  bucketStart: number;
+  toolName: string;
+  status: AuthEventStatus;
+  count: number;
+  lastSeenAt: number;
+  sampleAgentId: string | null;
+  mixedAgents: boolean;
+};
 
 let lastClaimCleanupAt = 0;
+let authEventLastFlushAt = Date.now();
+const pendingAuthEvents = new Map<string, PendingAuthEvent>();
 let watermarkCoreCache: {
   sampled_at: number;
   latest_task_ts: number;
@@ -71,6 +103,57 @@ let watermarkAllMessagesCache: {
   latest_message_ts: number;
 } | null = null;
 const watermarkAgentMessageCache = new Map<string, { sampled_at: number; latest_message_ts: number }>();
+
+type TaskDoneGateErrorCode = 'DONE_GATE_FAILED' | 'VERIFIER_REQUIRED' | 'EVIDENCE_REQUIRED';
+type TaskDependencyErrorCode =
+  | 'DEPENDENCIES_NOT_MET'
+  | 'TASK_DEPENDENCIES_LOCKED'
+  | 'TASK_HAS_ACTIVE_DEPENDENTS';
+
+export class TaskDoneGateError extends Error {
+  error_code: TaskDoneGateErrorCode;
+  required_confidence?: number;
+  required_evidence_refs?: number;
+  evidence_refs_total?: number;
+
+  constructor(
+    errorCode: TaskDoneGateErrorCode,
+    message: string,
+    details: {
+      required_confidence?: number;
+      required_evidence_refs?: number;
+      evidence_refs_total?: number;
+    } = {}
+  ) {
+    super(message);
+    this.name = 'TaskDoneGateError';
+    this.error_code = errorCode;
+    this.required_confidence = details.required_confidence;
+    this.required_evidence_refs = details.required_evidence_refs;
+    this.evidence_refs_total = details.evidence_refs_total;
+  }
+}
+
+export class TaskDependencyError extends Error {
+  error_code: TaskDependencyErrorCode;
+  unmet_dependencies?: number[];
+  dependent_task_ids?: number[];
+
+  constructor(
+    errorCode: TaskDependencyErrorCode,
+    message: string,
+    details: {
+      unmet_dependencies?: number[];
+      dependent_task_ids?: number[];
+    } = {},
+  ) {
+    super(message);
+    this.name = 'TaskDependencyError';
+    this.error_code = errorCode;
+    this.unmet_dependencies = details.unmet_dependencies;
+    this.dependent_task_ids = details.dependent_task_ids;
+  }
+}
 
 function resetWatermarkCaches() {
   watermarkCoreCache = null;
@@ -123,6 +206,9 @@ export function initDb(dbPath?: string): Database.Database {
 }
 
 function initSchema(d: Database.Database): void {
+  const hadProtocolBlobAccessTable = Boolean(
+    d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'protocol_blob_access'").get()
+  );
   d.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
@@ -154,6 +240,16 @@ function initSchema(d: Database.Database): void {
       read_at INTEGER NOT NULL,
       PRIMARY KEY (message_id, agent_id),
       FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS discussion_threads (
+      thread_id TEXT PRIMARY KEY,
+      root_message_id INTEGER NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      to_agent TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (root_message_id) REFERENCES messages(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS tasks (
@@ -232,6 +328,24 @@ function initSchema(d: Database.Database): void {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS stream_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      stream TEXT NOT NULL,
+      op TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      agent_id TEXT,
+      target_agent_id TEXT,
+      namespace TEXT,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS stream_event_retention (
+      stream TEXT PRIMARY KEY,
+      last_deleted_id INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS agent_quality (
       agent_id TEXT PRIMARY KEY,
       completed_count INTEGER NOT NULL DEFAULT 0,
@@ -243,6 +357,7 @@ function initSchema(d: Database.Database): void {
       agent_id TEXT NOT NULL,
       tool_name TEXT NOT NULL,
       idempotency_key TEXT NOT NULL,
+      request_hash TEXT,
       response_json TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       PRIMARY KEY (agent_id, tool_name, idempotency_key)
@@ -254,6 +369,15 @@ function initSchema(d: Database.Database): void {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       access_count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS protocol_blob_access (
+      hash TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      granted_by TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (hash, agent_id),
+      FOREIGN KEY (hash) REFERENCES protocol_blobs(hash) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS consensus_decisions (
@@ -271,6 +395,11 @@ function initSchema(d: Database.Database): void {
       token TEXT NOT NULL UNIQUE,
       created_at INTEGER NOT NULL,
       last_used_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS retired_agent_ids (
+      agent_id TEXT PRIMARY KEY,
+      retired_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS tasks_archive (
@@ -345,7 +474,37 @@ function initSchema(d: Database.Database): void {
       FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY (artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS saved_filters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      owner_agent_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      namespace TEXT,
+      filter_json TEXT NOT NULL,
+      cursor TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(owner_agent_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS feed_acks (
+      agent_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      acked_at INTEGER NOT NULL,
+      PRIMARY KEY (agent_id, source, entity_id)
+    );
   `);
+
+  migrateAgentTokenDigests(d);
+  if (!hadProtocolBlobAccessTable) migrateLegacyProtocolBlobAccess(d);
+  d.prepare(`
+    INSERT OR IGNORE INTO retired_agent_ids (agent_id, retired_at)
+    SELECT at.agent_id, ?
+    FROM agent_tokens at
+    WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = at.agent_id)
+  `).run(Date.now());
+  migrateLegacyRetiredAgentIds(d);
 
   ensureColumn(d, 'tasks', 'namespace', "ALTER TABLE tasks ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'");
   ensureColumn(d, 'tasks', 'execution_mode', "ALTER TABLE tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'any'");
@@ -364,6 +523,10 @@ function initSchema(d: Database.Database): void {
   ensureColumn(d, 'context', 'namespace', "ALTER TABLE context ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'");
   ensureColumn(d, 'context', 'trace_id', "ALTER TABLE context ADD COLUMN trace_id TEXT");
   ensureColumn(d, 'context', 'span_id', "ALTER TABLE context ADD COLUMN span_id TEXT");
+  ensureColumn(d, 'auth_events', 'event_count', "ALTER TABLE auth_events ADD COLUMN event_count INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(d, 'auth_events', 'bucket_start', "ALTER TABLE auth_events ADD COLUMN bucket_start INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(d, 'idempotency_keys', 'request_hash', "ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT");
+  scrubLegacyVolatileIdempotencyResponses(d);
 
   d.exec(`
     CREATE INDEX IF NOT EXISTS idx_task_claims_agent_id ON task_claims(agent_id);
@@ -383,13 +546,21 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_to_agent_created_at ON messages(to_agent, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_from_agent ON messages(from_agent);
     CREATE INDEX IF NOT EXISTS idx_messages_trace_created_at ON messages(trace_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_trace_id ON messages(trace_id, id);
     CREATE INDEX IF NOT EXISTS idx_message_reads_agent_id_read_at ON message_reads(agent_id, read_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_message_reads_message_agent ON message_reads(message_id, agent_id);
+    CREATE INDEX IF NOT EXISTS idx_discussion_threads_created_at ON discussion_threads(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_updated_at ON context(updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_namespace_updated_at ON context(namespace, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_trace_updated_at ON context(trace_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_activity_log_agent_id_created_at ON activity_log(agent_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_stream_id ON stream_events(stream, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_target_stream_id ON stream_events(target_agent_id, stream, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_stream_target_id ON stream_events(stream, target_agent_id, id);
+    CREATE INDEX IF NOT EXISTS idx_stream_events_created_at ON stream_events(created_at);
     CREATE INDEX IF NOT EXISTS idx_protocol_blobs_updated_at ON protocol_blobs(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_protocol_blob_access_agent_hash ON protocol_blob_access(agent_id, hash);
     CREATE INDEX IF NOT EXISTS idx_consensus_decisions_proposal_created_at ON consensus_decisions(proposal_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_consensus_decisions_created_at ON consensus_decisions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_archive_archived_at ON tasks_archive(archived_at DESC);
@@ -399,6 +570,9 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_auth_events_created_at ON auth_events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_auth_events_tool_created_at ON auth_events(tool_name, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_auth_events_agent_created_at ON auth_events(agent_id, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_events_bucket_tool_status
+      ON auth_events(tool_name, status, bucket_start)
+      WHERE bucket_start > 0;
     CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_artifacts_namespace_created_at ON artifacts(namespace, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_artifacts_created_by_created_at ON artifacts(created_by, created_at DESC);
@@ -406,7 +580,139 @@ function initSchema(d: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_artifact_shares_to_agent_created_at ON artifact_shares(to_agent, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_artifacts_task_id_created_at ON task_artifacts(task_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_task_artifacts_artifact_id ON task_artifacts(artifact_id);
+    CREATE INDEX IF NOT EXISTS idx_saved_filters_owner_updated_at ON saved_filters(owner_agent_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_saved_filters_namespace_updated_at ON saved_filters(namespace, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_feed_acks_agent_source ON feed_acks(agent_id, source, acked_at DESC);
   `);
+}
+
+function hashAgentToken(token: string): string {
+  return `${AGENT_TOKEN_HASH_PREFIX}${createHash('sha256').update(token, 'utf8').digest('hex')}`;
+}
+
+function migrateAgentTokenDigests(d: Database.Database): void {
+  const rows = d.prepare('SELECT agent_id, token FROM agent_tokens').all() as Array<{ agent_id: string; token: string }>;
+  const legacyRows = rows.filter((row) => !/^sha256:[0-9a-f]{64}$/i.test(row.token));
+  if (legacyRows.length === 0) return;
+  const update = d.prepare('UPDATE agent_tokens SET token = ? WHERE agent_id = ? AND token = ?');
+  const migrate = d.transaction(() => {
+    for (const row of legacyRows) {
+      update.run(hashAgentToken(row.token), row.agent_id, row.token);
+    }
+  });
+  migrate.immediate();
+}
+
+function parseStoredBlobRef(value: string): string | null {
+  try {
+    const row = JSON.parse(value || '{}') as Record<string, unknown>;
+    return row.v === 'caep-1' && row.k === 'blob' && typeof row.h === 'string' && /^[0-9a-f]{64}$/i.test(row.h)
+      ? row.h.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function migrateLegacyProtocolBlobAccess(d: Database.Database): void {
+  const now = Date.now();
+  const grants = new Map<string, Set<string>>();
+  const addGrant = (hash: string | null, agentId: string | null | undefined) => {
+    if (!hash || !agentId) return;
+    const targets = grants.get(hash) || new Set<string>();
+    targets.add(agentId === '*' ? PROTOCOL_BLOB_PUBLIC_GRANTEE : agentId);
+    grants.set(hash, targets);
+  };
+  const messages = d.prepare('SELECT from_agent, to_agent, content FROM messages').all() as Array<{
+    from_agent: string;
+    to_agent: string | null;
+    content: string;
+  }>;
+  for (const message of messages) {
+    const hash = parseStoredBlobRef(message.content);
+    addGrant(hash, message.from_agent);
+    addGrant(hash, message.to_agent || '*');
+  }
+  const contexts = d.prepare('SELECT agent_id, value FROM context').all() as Array<{ agent_id: string; value: string }>;
+  for (const context of contexts) {
+    const hash = parseStoredBlobRef(context.value);
+    addGrant(hash, context.agent_id);
+    addGrant(hash, '*');
+  }
+  const insert = d.prepare(`
+    INSERT OR IGNORE INTO protocol_blob_access (hash, agent_id, granted_by, created_at)
+    SELECT ?, ?, 'legacy-reference-migration', ?
+    WHERE EXISTS (SELECT 1 FROM protocol_blobs WHERE hash = ?)
+  `);
+  const migrate = d.transaction(() => {
+    for (const [hash, agentIds] of grants.entries()) {
+      for (const agentId of agentIds) insert.run(hash, agentId, now, hash);
+    }
+  });
+  migrate.immediate();
+}
+
+function migrateLegacyRetiredAgentIds(d: Database.Database): void {
+  const now = Date.now();
+  // Older releases deleted the credential row together with a stale agent. Tombstone every orphan
+  // identity still referenced by retained data or an ACL. Recipient-only IDs are intentionally
+  // fail-closed: without an identity-generation ledger they cannot be distinguished from a deleted
+  // passive agent, and allowing reuse would expose that agent's private inbox or grants.
+  d.prepare(`
+    WITH historical_principals(agent_id) AS (
+      SELECT from_agent FROM messages
+      UNION SELECT to_agent FROM messages
+      UNION SELECT agent_id FROM message_reads
+      UNION SELECT created_by FROM tasks
+      UNION SELECT assigned_to FROM tasks
+      UNION SELECT created_by FROM tasks_archive
+      UNION SELECT assigned_to FROM tasks_archive
+      UNION SELECT agent_id FROM task_claims
+      UNION SELECT added_by FROM task_evidence
+      UNION SELECT changed_by FROM task_status_history
+      UNION SELECT agent_id FROM context
+      UNION SELECT agent_id FROM activity_log
+      UNION SELECT agent_id FROM agent_quality
+      UNION SELECT agent_id FROM idempotency_keys
+      UNION SELECT requesting_agent FROM consensus_decisions
+      UNION SELECT created_by FROM artifacts
+      UNION SELECT granted_by FROM artifact_shares
+      UNION SELECT to_agent FROM artifact_shares
+      UNION SELECT added_by FROM task_artifacts
+      UNION SELECT owner_agent_id FROM saved_filters
+      UNION SELECT agent_id FROM feed_acks
+      UNION SELECT agent_id FROM protocol_blob_access
+      UNION SELECT granted_by FROM protocol_blob_access
+      UNION SELECT agent_id FROM stream_events
+      UNION SELECT target_agent_id FROM stream_events
+      UNION SELECT created_by FROM discussion_threads
+      UNION SELECT to_agent FROM discussion_threads
+      UNION SELECT agent_id FROM auth_events
+        WHERE status = 'valid' OR (tool_name = 'register_agent' AND status IN ('valid', 'skipped'))
+    )
+    INSERT OR IGNORE INTO retired_agent_ids (agent_id, retired_at)
+    SELECT hp.agent_id, ?
+    FROM historical_principals hp
+    WHERE hp.agent_id IS NOT NULL
+      AND hp.agent_id NOT IN ('', '*', 'system', 'legacy-reference-migration', ?)
+      AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = hp.agent_id)
+  `).run(now, PROTOCOL_BLOB_PUBLIC_GRANTEE);
+}
+
+function scrubLegacyVolatileIdempotencyResponses(d: Database.Database): void {
+  const placeholders = VOLATILE_IDEMPOTENCY_TOOLS.map(() => '?').join(', ');
+  d.prepare(`
+    UPDATE idempotency_keys
+    SET response_json = ?
+    WHERE tool_name IN (${placeholders})
+      AND CASE
+        WHEN json_valid(response_json) = 0 THEN 1
+        ELSE COALESCE(json_extract(response_json, '$.v'), '') NOT IN (
+          'idempotency-aes-gcm-1',
+          'idempotency-volatile-expired-1'
+        )
+      END
+  `).run(VOLATILE_IDEMPOTENCY_EXPIRED_SENTINEL, ...VOLATILE_IDEMPOTENCY_TOOLS);
 }
 
 function ensureColumn(d: Database.Database, tableName: string, columnName: string, alterSql: string): void {
@@ -414,6 +720,214 @@ function ensureColumn(d: Database.Database, tableName: string, columnName: strin
   if (!columns.some((column) => column.name === columnName)) {
     d.exec(alterSql);
   }
+}
+
+function normalizeStreamEventName(stream: string): StreamEventName {
+  if (stream === 'messages' || stream === 'tasks' || stream === 'context' || stream === 'activity' || stream === 'artifacts' || stream === 'consensus') {
+    return stream;
+  }
+  return 'activity';
+}
+
+function normalizeStreamEventPayload(payload?: unknown): string {
+  if (payload === undefined || payload === null) return '{}';
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return '{}';
+  }
+}
+
+function insertStreamEvent(d: Database.Database, args: {
+  stream: StreamEventName;
+  op: string;
+  entity_id: string | number;
+  agent_id?: string | null;
+  target_agent_id?: string | null;
+  namespace?: string | null;
+  payload?: unknown;
+  created_at?: number;
+  notify?: boolean;
+}): StreamEvent {
+  const now = Number.isFinite(args.created_at) ? Math.floor(Number(args.created_at)) : Date.now();
+  const stream = normalizeStreamEventName(args.stream);
+  const op = String(args.op || 'updated').trim() || 'updated';
+  const entityId = String(args.entity_id);
+  const payloadJson = normalizeStreamEventPayload(args.payload);
+  const result = d.prepare(`
+    INSERT INTO stream_events (stream, op, entity_id, agent_id, target_agent_id, namespace, payload_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    stream,
+    op,
+    entityId,
+    args.agent_id || null,
+    args.target_agent_id || null,
+    args.namespace || null,
+    payloadJson,
+    now,
+  );
+  const event = d.prepare('SELECT * FROM stream_events WHERE id = ?').get(result.lastInsertRowid) as StreamEvent;
+  if (args.notify !== false) notifyStreamEvent(event);
+  return event;
+}
+
+export function appendStreamEvent(args: {
+  stream: StreamEventName;
+  op: string;
+  entity_id: string | number;
+  agent_id?: string | null;
+  target_agent_id?: string | null;
+  namespace?: string | null;
+  payload?: unknown;
+  created_at?: number;
+}): StreamEvent {
+  return insertStreamEvent(getDb(), args);
+}
+
+export function listStreamEventsAfter(options: {
+  agent_id?: string;
+  after_id?: number;
+  streams?: StreamEventName[];
+  limit?: number;
+} = {}): StreamEvent[] {
+  const d = getDb();
+  const afterId = Number.isFinite(options.after_id) ? Math.max(0, Math.floor(Number(options.after_id))) : 0;
+  const limit = Number.isFinite(options.limit) ? Math.max(1, Math.min(1000, Math.floor(Number(options.limit)))) : 100;
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  let query = `
+    SELECT *
+    FROM stream_events
+    WHERE id > ?
+      AND stream IN (${placeholders})
+  `;
+  const params: unknown[] = [afterId, ...streams];
+  if (options.agent_id) {
+    query += ` AND (agent_id = ? OR target_agent_id IS NULL OR target_agent_id IN (?, '*'))`;
+    params.push(options.agent_id, options.agent_id);
+  }
+  query += ' ORDER BY id ASC LIMIT ?';
+  params.push(limit);
+  return d.prepare(query).all(...params) as StreamEvent[];
+}
+
+export function getStreamEventWatermark(options: {
+  agent_id?: string;
+  streams?: StreamEventName[];
+} = {}): number {
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  let query = `SELECT COALESCE(MAX(id), 0) AS id FROM stream_events WHERE stream IN (${placeholders})`;
+  const params: unknown[] = [...streams];
+  if (options.agent_id) {
+    query += ` AND (agent_id = ? OR target_agent_id IS NULL OR target_agent_id IN (?, '*'))`;
+    params.push(options.agent_id, options.agent_id);
+  }
+  const d = getDb();
+  const row = d.prepare(query).get(...params) as { id: number } | undefined;
+  const retention = d.prepare(`
+    SELECT COALESCE(MAX(last_deleted_id), 0) AS id
+    FROM stream_event_retention
+    WHERE stream IN (${placeholders})
+  `).get(...streams) as { id: number } | undefined;
+  return Math.max(row?.id || 0, retention?.id || 0);
+}
+
+export function getMinStreamEventId(options: {
+  agent_id?: string;
+  streams?: StreamEventName[];
+} = {}): number {
+  const streams = options.streams && options.streams.length > 0
+    ? [...new Set(options.streams.map((stream) => normalizeStreamEventName(stream)))]
+    : ['messages', 'tasks', 'context', 'activity', 'artifacts', 'consensus'] as StreamEventName[];
+  const placeholders = streams.map(() => '?').join(', ');
+  const d = getDb();
+  // A cursor is stale only when cleanup removed a selected-stream event after that cursor.
+  // The first currently visible event may legitimately be much newer, so using MIN(id) here
+  // would force unnecessary full snapshots even when no history was lost.
+  const retention = d.prepare(`
+    SELECT COALESCE(MAX(last_deleted_id), 0) AS id
+    FROM stream_event_retention
+    WHERE stream IN (${placeholders})
+  `).get(...streams) as { id: number } | undefined;
+  return retention?.id || 0;
+}
+
+export function cleanupStreamEvents(now = Date.now(), ttlMs = STREAM_EVENT_TTL_MS): number {
+  if (ttlMs <= 0) return 0;
+  const cutoff = now - ttlMs;
+  const d = getDb();
+  let deleted = 0;
+  const tx = d.transaction(() => {
+    const rows = d.prepare(`
+      SELECT stream, MAX(id) AS last_deleted_id
+      FROM stream_events
+      WHERE created_at < ?
+      GROUP BY stream
+    `).all(cutoff) as Array<{ stream: string; last_deleted_id: number }>;
+    if (rows.length === 0) return;
+    deleted = d.prepare('DELETE FROM stream_events WHERE created_at < ?').run(cutoff).changes;
+    const upsert = d.prepare(`
+      INSERT INTO stream_event_retention (stream, last_deleted_id, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(stream) DO UPDATE SET
+        last_deleted_id = MAX(stream_event_retention.last_deleted_id, excluded.last_deleted_id),
+        updated_at = excluded.updated_at
+    `);
+    for (const row of rows) {
+      upsert.run(row.stream, row.last_deleted_id, now);
+    }
+  });
+  tx.immediate();
+  return deleted;
+}
+
+export function cleanupFeedAcks(now = Date.now(), ttlMs = FEED_ACK_TTL_MS): number {
+  const d = getDb();
+  const statements = [
+    `DELETE FROM feed_acks
+      WHERE source = 'messages'
+        AND NOT EXISTS (SELECT 1 FROM messages m WHERE CAST(m.id AS TEXT) = feed_acks.entity_id)`,
+    `DELETE FROM feed_acks
+      WHERE source = 'tasks'
+        AND NOT EXISTS (SELECT 1 FROM tasks t WHERE CAST(t.id AS TEXT) = feed_acks.entity_id AND t.status IN ('pending', 'in_progress', 'blocked'))`,
+    `DELETE FROM feed_acks
+      WHERE source = 'artifacts'
+        AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.id = feed_acks.entity_id AND a.storage_path IS NOT NULL)`,
+    `DELETE FROM feed_acks
+      WHERE source = 'slo'
+        AND NOT EXISTS (SELECT 1 FROM slo_alerts s WHERE CAST(s.id AS TEXT) = feed_acks.entity_id AND s.resolved_at IS NULL)`,
+  ];
+  let cleaned = 0;
+  const tx = d.transaction(() => {
+    for (const statement of statements) cleaned += d.prepare(statement).run().changes;
+    if (ttlMs > 0) {
+      cleaned += d.prepare('DELETE FROM feed_acks WHERE acked_at < ?').run(now - ttlMs).changes;
+    }
+  });
+  tx();
+  return cleaned;
+}
+
+export function cleanupSavedFilters(now = Date.now(), ttlMs = SAVED_FILTER_TTL_MS): number {
+  const d = getDb();
+  let cleaned = 0;
+  const tx = d.transaction(() => {
+    cleaned += d.prepare(`
+      DELETE FROM saved_filters
+      WHERE NOT EXISTS (SELECT 1 FROM agents a WHERE a.id = saved_filters.owner_agent_id)
+    `).run().changes;
+    if (ttlMs > 0) {
+      cleaned += d.prepare('DELETE FROM saved_filters WHERE updated_at < ?').run(now - ttlMs).changes;
+    }
+  });
+  tx();
+  return cleaned;
 }
 
 function normalizeLeaseSeconds(leaseSeconds?: number): number {
@@ -439,6 +953,49 @@ function inferWorkspaceMode(profile: Partial<AgentRuntimeProfile>): AgentWorkspa
   return 'unknown';
 }
 
+function normalizeProfileString(value: unknown, max = 120): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim().slice(0, max)
+    : undefined;
+}
+
+function normalizeProfileStringList(value: unknown, maxItems = 12): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const cleaned = [...new Set(value
+    .map((item) => normalizeProfileString(item, 48))
+    .filter((item): item is string => Boolean(item)))].slice(0, maxItems);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function normalizeTier(value: unknown): AgentModelProfile['cost_tier'] {
+  return value === 'low' || value === 'medium' || value === 'high' || value === 'unknown'
+    ? value
+    : undefined;
+}
+
+function normalizePositiveInt(value: unknown, max: number): number | undefined {
+  return Number.isFinite(Number(value))
+    ? Math.max(1, Math.min(max, Math.floor(Number(value))))
+    : undefined;
+}
+
+function normalizeModelProfile(model?: AgentModelProfile): AgentModelProfile | undefined {
+  if (!model || typeof model !== 'object') return undefined;
+  const normalized: AgentModelProfile = {
+    provider: normalizeProfileString(model.provider, 64),
+    id: normalizeProfileString(model.id, 120),
+    family: normalizeProfileString(model.family, 80),
+    context_window: normalizePositiveInt(model.context_window, 10_000_000),
+    max_output_tokens: normalizePositiveInt(model.max_output_tokens, 1_000_000),
+    strengths: normalizeProfileStringList(model.strengths),
+    task_types: normalizeProfileStringList(model.task_types),
+    cost_tier: normalizeTier(model.cost_tier),
+    latency_tier: normalizeTier(model.latency_tier),
+  };
+  const compact = Object.fromEntries(Object.entries(normalized).filter(([, value]) => value !== undefined)) as AgentModelProfile;
+  return Object.keys(compact).length > 0 ? compact : undefined;
+}
+
 function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWorkspaceMode; json: string } {
   const normalizedInput: AgentRuntimeProfile = profile && typeof profile === 'object'
     ? {
@@ -450,6 +1007,7 @@ function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWo
       source: profile.source,
       detected_at: Number.isFinite(profile.detected_at) ? Math.floor(Number(profile.detected_at)) : undefined,
       notes: typeof profile.notes === 'string' ? profile.notes.slice(0, 512) : undefined,
+      model: normalizeModelProfile(profile.model),
     }
     : { mode: 'unknown' };
 
@@ -459,6 +1017,7 @@ function normalizeRuntimeProfile(profile?: AgentRuntimeProfile): { mode: AgentWo
     mode: inferred,
     source: normalizedInput.source || 'server_inferred',
     detected_at: normalizedInput.detected_at || Date.now(),
+    model: normalizedInput.model,
   };
   return {
     mode: normalized.mode,
@@ -481,9 +1040,12 @@ function isTaskClaimUniqueConstraint(error: unknown): boolean {
 
 function normalizeDependencyIds(taskId: number, dependencyIds?: number[]): number[] {
   if (!Array.isArray(dependencyIds)) return [];
+  if (dependencyIds.some((id) => Number(id) === taskId)) {
+    throw new Error('DEPENDENCY_CYCLE');
+  }
   const cleaned = dependencyIds
     .map((id) => Number(id))
-    .filter((id) => Number.isInteger(id) && id > 0 && id !== taskId);
+    .filter((id) => Number.isInteger(id) && id > 0);
   return [...new Set(cleaned)];
 }
 
@@ -497,28 +1059,133 @@ function assertDependenciesExist(dependencyIds: number[]): void {
   }
 }
 
+function assertNoDependencyCycle(taskId: number, dependencyIds: number[]): void {
+  if (dependencyIds.length === 0) return;
+  const seeds = dependencyIds.map(() => 'SELECT ? AS task_id').join(' UNION ');
+  const cycle = getDb().prepare(`
+    WITH RECURSIVE dependency_chain(task_id) AS (
+      ${seeds}
+      UNION
+      SELECT td.depends_on_task_id
+      FROM task_dependencies td
+      JOIN dependency_chain dc ON td.task_id = dc.task_id
+    )
+    SELECT 1 FROM dependency_chain WHERE task_id = ? LIMIT 1
+  `).get(...dependencyIds, taskId);
+  if (cycle) throw new Error('DEPENDENCY_CYCLE');
+}
+
+function getUnmetTaskDependencyIds(d: Database.Database, taskId: number): number[] {
+  const rows = d.prepare(`
+    SELECT td.depends_on_task_id AS id
+    FROM task_dependencies td
+    JOIN tasks dep ON dep.id = td.depends_on_task_id
+    WHERE td.task_id = ? AND dep.status != 'done'
+    ORDER BY td.depends_on_task_id ASC
+  `).all(taskId) as Array<{ id: number }>;
+  return rows.map((row) => row.id);
+}
+
+function assertTaskDependenciesMet(d: Database.Database, taskId: number): void {
+  const unmetDependencies = getUnmetTaskDependencyIds(d, taskId);
+  if (unmetDependencies.length === 0) return;
+  throw new TaskDependencyError(
+    'DEPENDENCIES_NOT_MET',
+    'Task dependencies are not completed',
+    { unmet_dependencies: unmetDependencies },
+  );
+}
+
+function assertTaskRollbackDoesNotInvalidateDependents(
+  d: Database.Database,
+  taskId: number,
+  now: number,
+): void {
+  const rows = d.prepare(`
+    SELECT DISTINCT dependent.id
+    FROM task_dependencies td
+    JOIN tasks dependent ON dependent.id = td.task_id
+    LEFT JOIN task_claims claim ON claim.task_id = dependent.id AND claim.lease_expires_at > ?
+    WHERE td.depends_on_task_id = ?
+      AND (dependent.status IN ('in_progress', 'done') OR claim.task_id IS NOT NULL)
+    ORDER BY dependent.id ASC
+  `).all(now, taskId) as Array<{ id: number }>;
+  if (rows.length === 0) return;
+  throw new TaskDependencyError(
+    'TASK_HAS_ACTIVE_DEPENDENTS',
+    'Completed task cannot be rolled back while active or completed tasks depend on it',
+    { dependent_task_ids: rows.map((row) => row.id) },
+  );
+}
+
+function assertTaskDependencyMutationAllowed(d: Database.Database, taskId: number, now: number): void {
+  const row = d.prepare(`
+    SELECT
+      t.status,
+      EXISTS (
+        SELECT 1
+        FROM task_claims tc
+        WHERE tc.task_id = t.id AND tc.lease_expires_at > ?
+      ) AS has_active_claim
+    FROM tasks t
+    WHERE t.id = ?
+  `).get(now, taskId) as { status: string; has_active_claim: number } | undefined;
+  if (!row) return;
+  if (row.status === 'in_progress' || row.status === 'done' || row.has_active_claim === 1) {
+    throw new TaskDependencyError(
+      'TASK_DEPENDENCIES_LOCKED',
+      `Task dependencies cannot change while task status is "${row.status}" or it has an active claim`,
+    );
+  }
+}
+
 export function cleanupExpiredTaskClaims(now = Date.now(), options: { force?: boolean } = {}): number {
   if (!options.force && now - lastClaimCleanupAt < CLAIM_CLEANUP_THROTTLE_MS) {
     return 0;
   }
   lastClaimCleanupAt = now;
   const d = getDb();
-  const expired = d.prepare('SELECT task_id, agent_id FROM task_claims WHERE lease_expires_at <= ?').all(now) as Array<{ task_id: number; agent_id: string }>;
+  const expired = d.prepare(`
+    SELECT task_id, agent_id, claim_id
+    FROM task_claims
+    WHERE lease_expires_at <= ?
+  `).all(now) as Array<{ task_id: number; agent_id: string; claim_id: string }>;
   if (expired.length === 0) return 0;
 
+  let cleaned = 0;
   const tx = d.transaction(() => {
     for (const row of expired) {
-      d.prepare(`
+      const removed = d.prepare(`
+        DELETE FROM task_claims
+        WHERE task_id = ? AND agent_id = ? AND claim_id = ? AND lease_expires_at <= ?
+      `).run(row.task_id, row.agent_id, row.claim_id, now);
+      if (removed.changes !== 1) continue;
+      cleaned += 1;
+      const result = d.prepare(`
         UPDATE tasks
-        SET status = 'pending', assigned_to = NULL, updated_at = ?
+        SET status = 'pending', assigned_to = NULL, updated_at = MAX(updated_at + 1, ?)
         WHERE id = ? AND status = 'in_progress' AND assigned_to = ?
       `).run(now, row.task_id, row.agent_id);
+      if (result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.claim.expired',
+          entity_id: row.task_id,
+          agent_id: row.agent_id,
+          target_agent_id: null,
+          payload: {
+            status: 'pending',
+            assigned_to: null,
+            expired_agent_id: row.agent_id,
+          },
+          created_at: now,
+        });
+      }
     }
-    d.prepare('DELETE FROM task_claims WHERE lease_expires_at <= ?').run(now);
   });
 
   tx();
-  return expired.length;
+  return cleaned;
 }
 
 // --- Agents ---
@@ -530,29 +1197,35 @@ export function registerAgent(agent: {
   capabilities: string;
   lifecycle?: AgentLifecycle;
   runtime_profile?: AgentRuntimeProfile;
-}): { agent: Agent; is_new: boolean } {
+  initial_auth_token?: string;
+}): { agent: Agent; is_new: boolean; issued_token: AgentToken | null } {
   const now = Date.now();
   const lifecycle = normalizeAgentLifecycle(agent.lifecycle);
   const runtimeProfile = normalizeRuntimeProfile(agent.runtime_profile);
   const d = getDb();
   const existing = d.prepare('SELECT id FROM agents WHERE id = ?').get(agent.id) as { id: string } | undefined;
-  d.prepare(`
-    INSERT INTO agents (id, name, type, capabilities, lifecycle, runtime_mode, runtime_profile_json, status, last_seen)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      type = excluded.type,
-      capabilities = excluded.capabilities,
-      lifecycle = excluded.lifecycle,
-      runtime_mode = excluded.runtime_mode,
-      runtime_profile_json = excluded.runtime_profile_json,
-      status = 'online',
-      last_seen = excluded.last_seen
-  `).run(agent.id, agent.name, agent.type, agent.capabilities, lifecycle, runtimeProfile.mode, runtimeProfile.json, now);
-  ensureAgentToken(agent.id);
+  let issuedToken: AgentToken | null = null;
+  const write = d.transaction(() => {
+    d.prepare(`
+      INSERT INTO agents (id, name, type, capabilities, lifecycle, runtime_mode, runtime_profile_json, status, last_seen)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        type = excluded.type,
+        capabilities = excluded.capabilities,
+        lifecycle = excluded.lifecycle,
+        runtime_mode = excluded.runtime_mode,
+        runtime_profile_json = excluded.runtime_profile_json,
+        status = 'online',
+        last_seen = excluded.last_seen
+    `).run(agent.id, agent.name, agent.type, agent.capabilities, lifecycle, runtimeProfile.mode, runtimeProfile.json, now);
+    issuedToken = ensureAgentToken(agent.id, agent.initial_auth_token);
+  });
+  write.immediate();
+  const { initial_auth_token: _initialAuthToken, runtime_profile: _runtimeProfile, ...publicAgent } = agent;
   return {
     agent: {
-      ...agent,
+      ...publicAgent,
       lifecycle,
       runtime_mode: runtimeProfile.mode,
       runtime_profile_json: runtimeProfile.json,
@@ -560,7 +1233,13 @@ export function registerAgent(agent: {
       last_seen: now,
     },
     is_new: !existing,
+    issued_token: issuedToken,
   };
+}
+
+export function getAgentById(agentId: string): Agent | null {
+  const row = getDb().prepare('SELECT * FROM agents WHERE id = ?').get(agentId) as Agent | undefined;
+  return row || null;
 }
 
 export function listAgents(options: { limit?: number; offset?: number } = {}): Agent[] {
@@ -574,6 +1253,11 @@ export function listAgents(options: { limit?: number; offset?: number } = {}): A
 export function heartbeat(agentId: string): void {
   getDb().prepare('UPDATE agents SET last_seen = ?, status = ? WHERE id = ?')
     .run(Date.now(), 'online', agentId);
+}
+
+export function isRegisteredAgent(agentId: string): boolean {
+  if (!agentId) return false;
+  return Boolean(getDb().prepare('SELECT 1 FROM agents WHERE id = ?').get(agentId));
 }
 
 export function updateAgentRuntimeProfile(agentId: string, runtimeProfile: AgentRuntimeProfile): Agent | null {
@@ -620,6 +1304,7 @@ export function getAgentRuntimeProfile(agentId: string): AgentRuntimeProfile {
     source: typeof parsed.source === 'string' ? parsed.source as AgentRuntimeProfile['source'] : 'server_inferred',
     detected_at: Number.isFinite(parsed.detected_at) ? Number(parsed.detected_at) : undefined,
     notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+    model: normalizeModelProfile(parsed.model),
   };
 }
 
@@ -627,15 +1312,15 @@ export function getAgentRuntimeMode(agentId: string): AgentWorkspaceMode {
   return getAgentRuntimeProfile(agentId).mode;
 }
 
-function ensureAgentToken(agentId: string): AgentToken {
-  const existing = getDb().prepare('SELECT * FROM agent_tokens WHERE agent_id = ?').get(agentId) as AgentToken | undefined;
-  if (existing) return existing;
-  return issueAgentToken(agentId);
+function ensureAgentToken(agentId: string, initialToken?: string): AgentToken | null {
+  if (hasAgentToken(agentId)) return null;
+  return issueAgentToken(agentId, initialToken);
 }
 
-export function issueAgentToken(agentId: string): AgentToken {
+export function issueAgentToken(agentId: string, requestedToken?: string): AgentToken {
   const now = Date.now();
-  const token = `${randomUUID()}-${randomUUID()}`;
+  const token = requestedToken || `${randomUUID()}-${randomUUID()}`;
+  const tokenDigest = hashAgentToken(token);
   getDb().prepare(`
     INSERT INTO agent_tokens (agent_id, token, created_at, last_used_at)
     VALUES (?, ?, ?, ?)
@@ -643,24 +1328,50 @@ export function issueAgentToken(agentId: string): AgentToken {
       token = excluded.token,
       created_at = excluded.created_at,
       last_used_at = excluded.last_used_at
-  `).run(agentId, token, now, now);
-  return getDb().prepare('SELECT * FROM agent_tokens WHERE agent_id = ?').get(agentId) as AgentToken;
+  `).run(agentId, tokenDigest, now, now);
+  return { agent_id: agentId, token, created_at: now, last_used_at: now };
 }
 
-export function getAgentToken(agentId: string): AgentToken | null {
-  const row = getDb().prepare('SELECT * FROM agent_tokens WHERE agent_id = ?').get(agentId) as AgentToken | undefined;
-  return row || null;
+export function hasAgentToken(agentId: string): boolean {
+  if (!agentId) return false;
+  return Boolean(getDb().prepare('SELECT 1 FROM agent_tokens WHERE agent_id = ?').get(agentId));
+}
+
+export function isAgentIdRetired(agentId: string): boolean {
+  if (!agentId) return false;
+  return Boolean(getDb().prepare('SELECT 1 FROM retired_agent_ids WHERE agent_id = ?').get(agentId));
+}
+
+export function clearAgentIdRetirement(agentId: string): void {
+  getDb().prepare('DELETE FROM retired_agent_ids WHERE agent_id = ?').run(agentId);
 }
 
 export function validateAgentToken(agentId: string, token: string): boolean {
   if (!token) return false;
+  const row = getDb().prepare(`
+    SELECT token, last_used_at
+    FROM agent_tokens
+    WHERE agent_id = ?
+  `).get(agentId) as { token: string; last_used_at: number } | undefined;
+  if (!row) return false;
+
+  const expectedDigest = /^sha256:[0-9a-f]{64}$/i.test(row.token)
+    ? row.token.toLowerCase()
+    : hashAgentToken(row.token);
+  const suppliedDigest = hashAgentToken(token);
+  const expected = Buffer.from(expectedDigest.slice(AGENT_TOKEN_HASH_PREFIX.length), 'hex');
+  const supplied = Buffer.from(suppliedDigest.slice(AGENT_TOKEN_HASH_PREFIX.length), 'hex');
+  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) return false;
+
   const now = Date.now();
-  const result = getDb().prepare(`
+  if (now - row.last_used_at >= AGENT_TOKEN_LAST_USED_WRITE_INTERVAL_MS) {
+    getDb().prepare(`
     UPDATE agent_tokens
     SET last_used_at = ?
-    WHERE agent_id = ? AND token = ?
-  `).run(now, agentId, token);
-  return result.changes === 1;
+      WHERE agent_id = ? AND last_used_at = ?
+    `).run(now, agentId, row.last_used_at);
+  }
+  return true;
 }
 
 // --- Messages ---
@@ -679,7 +1390,7 @@ export function sendMessage(
     INSERT INTO messages (from_agent, to_agent, content, metadata, trace_id, span_id, created_at, read)
     VALUES (?, ?, ?, ?, ?, ?, ?, 0)
   `).run(fromAgent, toAgent, content, metadata, traceId || null, spanId || null, now);
-  return {
+  const message = {
     id: result.lastInsertRowid as number,
     from_agent: fromAgent,
     to_agent: toAgent,
@@ -690,6 +1401,22 @@ export function sendMessage(
     created_at: now,
     read: 0,
   };
+  insertStreamEvent(d, {
+    stream: 'messages',
+    op: 'message.created',
+    entity_id: message.id,
+    agent_id: fromAgent,
+    target_agent_id: toAgent,
+    payload: {
+      from_agent: fromAgent,
+      to_agent: toAgent,
+      content_chars: content.length,
+      trace_id: traceId || null,
+      span_id: spanId || null,
+    },
+    created_at: now,
+  });
+  return message;
 }
 
 export function readMessages(agentId: string, options: {
@@ -699,6 +1426,7 @@ export function readMessages(agentId: string, options: {
   offset?: number;
   since_ts?: number;
   cursor?: { ts: number; id: number };
+  mark_read?: boolean;
 } = {}): Message[] {
   const d = getDb();
   let query = `
@@ -743,7 +1471,7 @@ export function readMessages(agentId: string, options: {
 
   // Mark as read per-agent
   const ids = messages.filter((m) => m.read === 0).map((m) => m.id);
-  if (ids.length > 0) {
+  if (ids.length > 0 && options.mark_read !== false) {
     const now = Date.now();
     const tx = d.transaction((messageIds: number[]) => {
       const insert = d.prepare('INSERT OR IGNORE INTO message_reads (message_id, agent_id, read_at) VALUES (?, ?, ?)');
@@ -755,6 +1483,26 @@ export function readMessages(agentId: string, options: {
   }
 
   return messages;
+}
+
+// Mark a specific set of messages read for an agent. Used by the read_messages handler so that
+// only the rows actually returned to the caller are marked — never an over-fetched limit+1 peek
+// row, which would otherwise be lost under unread_only + delta pagination (T77-F1).
+export function markMessagesRead(agentId: string, messageIds: number[]): number {
+  if (!Array.isArray(messageIds) || messageIds.length === 0) return 0;
+  const ids = [...new Set(messageIds.filter((id) => Number.isFinite(id)))];
+  if (ids.length === 0) return 0;
+  const d = getDb();
+  const now = Date.now();
+  let marked = 0;
+  const tx = d.transaction((rows: number[]) => {
+    const insert = d.prepare('INSERT OR IGNORE INTO message_reads (message_id, agent_id, read_at) VALUES (?, ?, ?)');
+    for (const messageId of rows) {
+      marked += insert.run(messageId, agentId, now).changes;
+    }
+  });
+  tx(ids);
+  return marked;
 }
 
 export function getMessageForAgent(agentId: string, messageId: number): Message | null {
@@ -770,9 +1518,9 @@ export function getMessageForAgent(agentId: string, messageId: number): Message 
       ON mr.message_id = m.id AND mr.agent_id = ?
     WHERE
       m.id = ?
-      AND (m.to_agent = ? OR m.to_agent IS NULL)
+      AND (m.to_agent = ? OR m.to_agent IS NULL OR m.from_agent = ?)
     LIMIT 1
-  `).get(agentId, normalizedMessageId, agentId) as Message | undefined;
+  `).get(agentId, normalizedMessageId, agentId, agentId) as Message | undefined;
   if (!row) return null;
   if (row.read === 0) {
     d.prepare('INSERT OR IGNORE INTO message_reads (message_id, agent_id, read_at) VALUES (?, ?, ?)')
@@ -787,7 +1535,7 @@ export function createTask(task: {
   title: string;
   description?: string;
   created_by: string;
-  assigned_to?: string;
+  assigned_to?: string | null;
   priority?: string;
   depends_on?: number[];
   namespace?: string;
@@ -831,6 +1579,22 @@ export function createTask(task: {
         insertDep.run(taskId, depId, now);
       }
     }
+    insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.created',
+      entity_id: taskId,
+      agent_id: task.created_by,
+      target_agent_id: null,
+      namespace,
+      payload: {
+        status: 'pending',
+        priority: task.priority || 'medium',
+        execution_mode: executionMode,
+        consistency_mode: consistencyMode,
+        depends_on_count: deps.length,
+      },
+      created_at: now,
+    });
     return taskId;
   });
 
@@ -853,9 +1617,105 @@ export function createTask(task: {
   } as Task;
 }
 
+function normalizeTaskEvidenceRefs(evidenceRefs?: string[]): string[] {
+  if (!Array.isArray(evidenceRefs)) return [];
+  return [...new Set(
+    evidenceRefs
+      .map((ref) => (typeof ref === 'string' ? ref.trim() : ''))
+      .filter((ref) => ref.length > 0)
+  )];
+}
+
+function assertDoneGateCommit(args: {
+  agentId: string;
+  confidence?: number;
+  requiredConfidence?: number;
+  confidenceFloor?: number;
+  verificationPassed?: boolean;
+  verifiedBy?: string;
+  requireIndependentVerifier?: boolean;
+  evidenceRefs: string[];
+  existingEvidenceRefs: string[];
+  existingEvidenceAddedBy: string[];
+  minEvidenceRefs?: number;
+}) {
+  const confidence = Number(args.confidence);
+  const requiredConfidence = Number(args.requiredConfidence);
+  const confidenceFloor = Number(args.confidenceFloor);
+  if (!Number.isFinite(confidence)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing confidence for done transition');
+  }
+  if (!Number.isFinite(requiredConfidence)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing required confidence for done transition');
+  }
+  if (!Number.isFinite(confidenceFloor)) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing confidence floor for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  if (confidence < 0 || confidence > 1) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Confidence must be between 0 and 1', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  if (confidence < confidenceFloor) {
+    throw new TaskDoneGateError(
+      'DONE_GATE_FAILED',
+      `Confidence ${confidence.toFixed(2)} below floor ${confidenceFloor.toFixed(2)} for done transition`,
+      { required_confidence: requiredConfidence }
+    );
+  }
+  if (args.verificationPassed !== true) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'verification_passed must be true for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+
+  const verifiedBy = (args.verifiedBy || '').trim();
+  const hasIndependentVerifier = verifiedBy.length > 0
+    && verifiedBy !== args.agentId
+    && isRegisteredAgent(verifiedBy);
+  if (args.requireIndependentVerifier === true && !hasIndependentVerifier) {
+    throw new TaskDoneGateError('VERIFIER_REQUIRED', 'Independent verifier is required for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  if (confidence < requiredConfidence && !hasIndependentVerifier) {
+    throw new TaskDoneGateError(
+      'VERIFIER_REQUIRED',
+      `Independent verifier required when confidence (${confidence.toFixed(2)}) is below threshold ${requiredConfidence.toFixed(2)}`,
+      { required_confidence: requiredConfidence }
+    );
+  }
+  const verifierRequired = args.requireIndependentVerifier === true || confidence < requiredConfidence;
+  if (verifierRequired && !args.existingEvidenceAddedBy.includes(verifiedBy)) {
+    throw new TaskDoneGateError(
+      'VERIFIER_REQUIRED',
+      `Verifier "${verifiedBy}" must add task evidence before the done transition`,
+      { required_confidence: requiredConfidence }
+    );
+  }
+
+  if (!Number.isFinite(Number(args.minEvidenceRefs))) {
+    throw new TaskDoneGateError('DONE_GATE_FAILED', 'Missing required evidence count for done transition', {
+      required_confidence: requiredConfidence,
+    });
+  }
+  const minEvidenceRefs = Math.max(0, Math.floor(Number(args.minEvidenceRefs)));
+  const allEvidence = new Set(args.existingEvidenceRefs);
+  for (const ref of args.evidenceRefs) allEvidence.add(ref);
+  if (allEvidence.size < minEvidenceRefs) {
+    throw new TaskDoneGateError('EVIDENCE_REQUIRED', `done transition requires at least ${minEvidenceRefs} evidence ref(s)`, {
+      required_confidence: requiredConfidence,
+      required_evidence_refs: minEvidenceRefs,
+      evidence_refs_total: allEvidence.size,
+    });
+  }
+}
+
 export function updateTask(id: number, updates: {
   status?: string;
-  assigned_to?: string;
+  assigned_to?: string | null;
   title?: string;
   description?: string;
   priority?: string;
@@ -865,42 +1725,118 @@ export function updateTask(id: number, updates: {
   trace_id?: string;
   span_id?: string;
   depends_on?: number[];
-}): Task | null {
+}, options: {
+  evidenceRefs?: string[];
+  minEvidenceRefs?: number;
+  addedBy?: string;
+  confidence?: number;
+  requiredConfidence?: number;
+  confidenceFloor?: number;
+  verificationPassed?: boolean;
+  verifiedBy?: string;
+  requireIndependentVerifier?: boolean;
+} = {}): Task | null {
   const d = getDb();
   const existing = d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task | undefined;
   if (!existing) return null;
+
+  // F6: when this update transitions the task to `done`, evidence must be inserted in the SAME
+  // transaction as the status flip (and the minimum-evidence invariant enforced there) so a crash
+  // can never leave a task done with fewer than the required evidence refs.
+  const willBeDone = updates.status === 'done';
+  const evidenceRefs = normalizeTaskEvidenceRefs(options.evidenceRefs);
+  const minEvidenceRefs = willBeDone && Number.isFinite(Number(options.minEvidenceRefs))
+    ? Math.max(0, Math.floor(Number(options.minEvidenceRefs)))
+    : undefined;
+  const evidenceAddedBy = options.addedBy || existing.assigned_to || existing.created_by;
 
   const fields: string[] = [];
   const params: unknown[] = [];
 
   if (updates.status !== undefined) { fields.push('status = ?'); params.push(updates.status); }
-  if (updates.assigned_to !== undefined) { fields.push('assigned_to = ?'); params.push(updates.assigned_to); }
+  const hasAssignmentUpdate = Object.prototype.hasOwnProperty.call(updates, 'assigned_to');
+  if (hasAssignmentUpdate) { fields.push('assigned_to = ?'); params.push(updates.assigned_to || null); }
   if (updates.title !== undefined) { fields.push('title = ?'); params.push(updates.title); }
   if (updates.description !== undefined) { fields.push('description = ?'); params.push(updates.description); }
   if (updates.priority !== undefined) { fields.push('priority = ?'); params.push(updates.priority); }
   if (updates.namespace !== undefined) { fields.push('namespace = ?'); params.push((updates.namespace || 'default').trim() || 'default'); }
   if (updates.execution_mode !== undefined) { fields.push('execution_mode = ?'); params.push(normalizeTaskExecutionMode(updates.execution_mode)); }
-  if (updates.consistency_mode !== undefined) { fields.push('consistency_mode = ?'); params.push(normalizeTaskConsistencyMode(updates.consistency_mode)); }
+  if (updates.consistency_mode !== undefined) {
+    fields.push('consistency_mode = ?');
+    params.push(existing.consistency_mode === 'strict' ? 'strict' : normalizeTaskConsistencyMode(updates.consistency_mode));
+  }
   if (updates.trace_id !== undefined) { fields.push('trace_id = ?'); params.push(updates.trace_id || null); }
   if (updates.span_id !== undefined) { fields.push('span_id = ?'); params.push(updates.span_id || null); }
   const hasDependencyUpdate = updates.depends_on !== undefined;
 
-  if (fields.length === 0 && !hasDependencyUpdate) return existing;
+  if (fields.length === 0 && !hasDependencyUpdate && evidenceRefs.length === 0 && minEvidenceRefs === undefined) return existing;
 
   const now = Date.now();
   if (fields.length > 0) {
-    fields.push('updated_at = ?');
+    fields.push('updated_at = MAX(updated_at + 1, ?)');
     params.push(now);
     params.push(id);
   }
 
+  const readinessEvents: StreamEvent[] = [];
+  let primaryEvent: StreamEvent | null = null;
+  let updatedTask: Task | null = null;
   const tx = d.transaction(() => {
+    if (existing.status === 'done' && updates.status !== undefined && updates.status !== 'done') {
+      assertTaskRollbackDoesNotInvalidateDependents(d, id, now);
+    }
+    if (hasDependencyUpdate) {
+      assertTaskDependencyMutationAllowed(d, id, now);
+    }
     if (fields.length > 0) {
       d.prepare(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`).run(...params);
+    } else {
+      d.prepare('UPDATE tasks SET updated_at = MAX(updated_at + 1, ?) WHERE id = ?').run(now, id);
+    }
+    // F5: reconcile task_claims when status/assignment is changed out-of-band. Leaving a
+    // stale claim row lets renew_task_claim reopen a finished task, blocks re-claim of a
+    // task reverted to pending (UNIQUE collision), and makes the task undeletable.
+    const statusBreaksClaim = updates.status !== undefined && updates.status !== 'in_progress';
+    const assignmentChanged = hasAssignmentUpdate;
+    if (statusBreaksClaim || assignmentChanged) {
+      d.prepare('DELETE FROM task_claims WHERE task_id = ?').run(id);
+    }
+    // F6: atomic done-evidence. Enforce the minimum evidence count for a done transition INSIDE
+    // this transaction (a violation throws and rolls back the whole update), and insert any
+    // provided evidence rows in the same transaction as the status flip. Evidence may also be
+    // accumulated on non-done updates, so the insert runs regardless of status; only the
+    // minimum-evidence invariant is gated on the done transition.
+    if (willBeDone) {
+      const currentTask = d.prepare('SELECT consistency_mode FROM tasks WHERE id = ?').get(id) as { consistency_mode: string } | undefined;
+      const existingEvidence = d.prepare(`
+        SELECT evidence_ref, added_by
+        FROM task_evidence
+        WHERE task_id = ?
+      `).all(id) as Array<{ evidence_ref: string; added_by: string }>;
+      assertDoneGateCommit({
+        agentId: evidenceAddedBy,
+        confidence: options.confidence,
+        requiredConfidence: options.requiredConfidence,
+        confidenceFloor: options.confidenceFloor,
+        verificationPassed: options.verificationPassed,
+        verifiedBy: options.verifiedBy,
+        requireIndependentVerifier: options.requireIndependentVerifier === true || currentTask?.consistency_mode === 'strict',
+        evidenceRefs,
+        existingEvidenceRefs: existingEvidence.map((row) => row.evidence_ref),
+        existingEvidenceAddedBy: existingEvidence.map((row) => row.added_by),
+        minEvidenceRefs,
+      });
+    }
+    if (evidenceRefs.length > 0) {
+      const insertEvidence = d.prepare('INSERT OR IGNORE INTO task_evidence (task_id, evidence_ref, added_by, created_at) VALUES (?, ?, ?, ?)');
+      for (const ref of evidenceRefs) {
+        insertEvidence.run(id, ref, evidenceAddedBy, now);
+      }
     }
     if (hasDependencyUpdate) {
       const deps = normalizeDependencyIds(id, updates.depends_on);
       assertDependenciesExist(deps);
+      assertNoDependencyCycle(id, deps);
       d.prepare('DELETE FROM task_dependencies WHERE task_id = ?').run(id);
       if (deps.length > 0) {
         const insertDep = d.prepare('INSERT INTO task_dependencies (task_id, depends_on_task_id, created_at) VALUES (?, ?, ?)');
@@ -909,10 +1845,42 @@ export function updateTask(id: number, updates: {
         }
       }
     }
+    if (updates.status === 'in_progress' || willBeDone) {
+      assertTaskDependenciesMet(d, id);
+    }
+    if (updates.status !== undefined
+      && existing.status !== updates.status
+      && (existing.status === 'done' || updates.status === 'done')) {
+      readinessEvents.push(...touchTaskDependentsForReadiness(d, id, now));
+    }
+    updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task;
+    primaryEvent = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: fields.length > 0
+        ? 'task.updated'
+        : (hasDependencyUpdate ? 'task.dependencies.updated' : 'task.evidence.updated'),
+      entity_id: id,
+      agent_id: updatedTask.assigned_to || updatedTask.created_by,
+      target_agent_id: null,
+      namespace: updatedTask.namespace,
+      payload: {
+        status: updatedTask.status,
+        assigned_to: updatedTask.assigned_to,
+        fields: [
+          ...Object.keys(updates).filter((key) => key !== 'depends_on'),
+          ...(hasDependencyUpdate ? ['depends_on'] : []),
+        ],
+      },
+      created_at: updatedTask.updated_at,
+      notify: false,
+    });
   });
 
   tx();
-  return d.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as Task;
+  for (const event of readinessEvents) notifyStreamEvent(event);
+  if (primaryEvent) notifyStreamEvent(primaryEvent);
+  if (!updatedTask) throw new Error('TASK_UPDATE_FAILED');
+  return updatedTask;
 }
 
 export function getTaskById(id: number): Task | null {
@@ -991,6 +1959,35 @@ export function recordTaskStatusTransition(args: {
   `).run(args.task_id, args.from_status, args.to_status, args.changed_by, args.source, now);
 }
 
+function touchTaskDependentsForReadiness(d: Database.Database, dependencyTaskId: number, now: number): StreamEvent[] {
+  const dependents = d.prepare(`
+    SELECT t.*
+    FROM task_dependencies td
+    JOIN tasks t ON t.id = td.task_id
+    WHERE td.depends_on_task_id = ?
+  `).all(dependencyTaskId) as Task[];
+  const update = d.prepare('UPDATE tasks SET updated_at = ? WHERE id = ?');
+  const events: StreamEvent[] = [];
+
+  for (const task of dependents) {
+    // Put the readiness change strictly after both cursors that could already expose this row.
+    const touchedAt = Math.max(now, task.updated_at + 1);
+    update.run(touchedAt, task.id);
+    events.push(insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.readiness.changed',
+      entity_id: task.id,
+      agent_id: task.assigned_to || task.created_by,
+      target_agent_id: null,
+      namespace: task.namespace,
+      payload: { dependency_task_id: dependencyTaskId },
+      created_at: touchedAt,
+      notify: false,
+    }));
+  }
+  return events;
+}
+
 export function listTasks(options: {
   status?: string;
   assigned_to?: string;
@@ -1067,7 +2064,7 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
   claim: TaskClaim;
 } | {
   success: false;
-  error_code: 'TASK_NOT_FOUND' | 'TASK_ALREADY_DONE' | 'ALREADY_CLAIMED' | 'DEPENDENCIES_NOT_MET' | 'NAMESPACE_MISMATCH' | 'PROFILE_MISMATCH';
+  error_code: 'TASK_NOT_FOUND' | 'TASK_ALREADY_DONE' | 'TASK_ASSIGNED_TO_OTHER' | 'ALREADY_CLAIMED' | 'DEPENDENCIES_NOT_MET' | 'NAMESPACE_MISMATCH' | 'PROFILE_MISMATCH';
   error: string;
   task?: Task;
   current_claim?: TaskClaim;
@@ -1103,20 +2100,14 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
     };
   }
 
-  const unmetDependencies = d.prepare(`
-    SELECT td.depends_on_task_id AS id
-    FROM task_dependencies td
-    JOIN tasks dep ON dep.id = td.depends_on_task_id
-    WHERE td.task_id = ? AND dep.status != 'done'
-    ORDER BY td.depends_on_task_id ASC
-  `).all(taskId) as Array<{ id: number }>;
+  const unmetDependencies = getUnmetTaskDependencyIds(d, taskId);
   if (unmetDependencies.length > 0) {
     return {
       success: false,
       error_code: 'DEPENDENCIES_NOT_MET',
       error: 'Task dependencies are not completed',
       task,
-      unmet_dependencies: unmetDependencies.map((row) => row.id),
+      unmet_dependencies: unmetDependencies,
     };
   }
 
@@ -1124,10 +2115,22 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
   if (existing && existing.agent_id !== agentId && existing.lease_expires_at > now) {
     return { success: false, error_code: 'ALREADY_CLAIMED', error: 'Task already claimed by another agent', task, current_claim: existing };
   }
+  if (task.assigned_to && task.assigned_to !== agentId && (!existing || existing.lease_expires_at > now)) {
+    return {
+      success: false,
+      error_code: 'TASK_ASSIGNED_TO_OTHER',
+      error: `Task is assigned to agent "${task.assigned_to}"`,
+      task,
+      current_claim: existing,
+    };
+  }
 
   const normalizedLease = normalizeLeaseSeconds(leaseSeconds);
   const leaseExpiresAt = now + normalizedLease * 1000;
 
+  let committedTask: Task | null = null;
+  let committedClaim: TaskClaim | null = null;
+  let primaryEvent: StreamEvent | null = null;
   const tx = d.transaction(() => {
     if (existing?.agent_id === agentId) {
       const nextClaimId = randomUUID();
@@ -1140,17 +2143,43 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
         throw new Error('CLAIM_STOLEN');
       }
     } else {
+      // F3: an expired lease must not block takeover. The throttled cleanupExpiredTaskClaims
+      // may have left the stale row in place, so remove any expired claim for this task before
+      // inserting. A still-valid foreign claim was already rejected above; a concurrent fresh
+      // claim is caught by the task_id UNIQUE/PK constraint (handled in the catch below).
+      d.prepare('DELETE FROM task_claims WHERE task_id = ? AND lease_expires_at <= ?').run(taskId, now);
       d.prepare(`
         INSERT INTO task_claims (task_id, agent_id, claim_id, claimed_at, lease_expires_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(taskId, agentId, randomUUID(), now, leaseExpiresAt, now);
     }
 
-    const updatedTask = d.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
+    assertTaskDependenciesMet(d, taskId);
+    const updatedTask = d.prepare(`
+      UPDATE tasks
+      SET status = ?, assigned_to = ?, updated_at = MAX(updated_at + 1, ?)
+      WHERE id = ? AND status != 'done'
+    `)
       .run('in_progress', agentId, now, taskId);
     if (updatedTask.changes !== 1) {
       throw new Error('TASK_UPDATE_FAILED');
     }
+    committedClaim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
+    committedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+    primaryEvent = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: existing?.agent_id === agentId ? 'task.claim.refreshed' : 'task.claimed',
+      entity_id: taskId,
+      agent_id: agentId,
+      namespace: committedTask.namespace,
+      payload: {
+        status: committedTask.status,
+        assigned_to: committedTask.assigned_to,
+        lease_expires_at: committedClaim.lease_expires_at,
+      },
+      created_at: committedTask.updated_at,
+      notify: false,
+    });
   });
 
   try {
@@ -1167,11 +2196,21 @@ export function claimTask(taskId: number, agentId: string, leaseSeconds?: number
         current_claim: currentClaim,
       };
     }
+    if (error instanceof TaskDependencyError) {
+      if (error.error_code !== 'DEPENDENCIES_NOT_MET') throw error;
+      return {
+        success: false,
+        error_code: 'DEPENDENCIES_NOT_MET',
+        error: error.message,
+        task: d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined,
+        unmet_dependencies: error.unmet_dependencies,
+      };
+    }
     throw error;
   }
-  const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
-  const updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
-  return { success: true, task: updatedTask, claim };
+  if (primaryEvent) notifyStreamEvent(primaryEvent);
+  if (!committedTask || !committedClaim) throw new Error('TASK_UPDATE_FAILED');
+  return { success: true, task: committedTask, claim: committedClaim };
 }
 
 export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: number, claimId?: string): {
@@ -1180,7 +2219,7 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
   claim: TaskClaim;
 } | {
   success: false;
-  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN';
+  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN' | 'TASK_NOT_RENEWABLE';
   error: string;
   current_claim?: TaskClaim;
 } {
@@ -1190,35 +2229,87 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
 
   const existing = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim | undefined;
   if (!existing) return { success: false, error_code: 'CLAIM_EXPIRED', error: 'Task has no active claim' };
+  if (existing.lease_expires_at <= now) {
+    return { success: false, error_code: 'CLAIM_EXPIRED', error: 'Task claim lease has expired', current_claim: existing };
+  }
   if (existing.agent_id !== agentId) {
     return { success: false, error_code: 'NOT_CLAIM_OWNER', error: 'Task claim owned by another agent', current_claim: existing };
   }
   if (claimId && existing.claim_id !== claimId) {
     return { success: false, error_code: 'CLAIM_ID_MISMATCH', error: 'Claim ID does not match active claim', current_claim: existing };
   }
+  // F5: refuse to renew a terminal task. The renew tx unconditionally sets status='in_progress',
+  // so renewing a claim left on a done task would silently reopen it. A claim on a done task is
+  // stale (it should have been reconciled); reject instead of resurrecting the task.
+  const currentTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;
+  if (currentTask && currentTask.status === 'done') {
+    return { success: false, error_code: 'TASK_NOT_RENEWABLE', error: 'Task is already done; claim cannot be renewed', current_claim: existing };
+  }
   const expectedClaimId = claimId || existing.claim_id;
 
   const normalizedLease = normalizeLeaseSeconds(leaseSeconds);
   const leaseExpiresAt = now + normalizedLease * 1000;
 
+  let committedTask: Task | null = null;
+  let committedClaim: TaskClaim | null = null;
+  let primaryEvent: StreamEvent | null = null;
   const tx = d.transaction(() => {
     const updatedClaim = d.prepare(`
       UPDATE task_claims
       SET lease_expires_at = ?, updated_at = ?
-      WHERE task_id = ? AND agent_id = ? AND claim_id = ?
-    `).run(leaseExpiresAt, now, taskId, agentId, expectedClaimId);
+      WHERE task_id = ? AND agent_id = ? AND claim_id = ? AND lease_expires_at > ?
+    `).run(leaseExpiresAt, now, taskId, agentId, expectedClaimId, now);
     if (updatedClaim.changes !== 1) {
-      throw new Error('CLAIM_STOLEN');
+      throw new Error('CLAIM_NOT_ACTIVE');
     }
-    d.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
-      .run('in_progress', agentId, now, taskId);
+    const updatedTask = d.prepare(`
+      UPDATE tasks
+      SET status = ?, assigned_to = ?, updated_at = MAX(updated_at + 1, ?)
+      WHERE id = ? AND status != 'done'
+    `).run('in_progress', agentId, now, taskId);
+    if (updatedTask.changes !== 1) {
+      throw new Error('TASK_NOT_RENEWABLE');
+    }
+    committedClaim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
+    committedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+    primaryEvent = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.claim.renewed',
+      entity_id: taskId,
+      agent_id: agentId,
+      namespace: committedTask.namespace,
+      payload: {
+        status: committedTask.status,
+        assigned_to: committedTask.assigned_to,
+        lease_expires_at: committedClaim.lease_expires_at,
+      },
+      created_at: committedTask.updated_at,
+      notify: false,
+    });
   });
 
   try {
     tx();
   } catch (error) {
-    if (error instanceof Error && error.message === 'CLAIM_STOLEN') {
+    if (error instanceof Error && error.message === 'TASK_NOT_RENEWABLE') {
       const current = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim | undefined;
+      return {
+        success: false,
+        error_code: 'TASK_NOT_RENEWABLE',
+        error: 'Task is already done; claim cannot be renewed',
+        current_claim: current,
+      };
+    }
+    if (error instanceof Error && error.message === 'CLAIM_NOT_ACTIVE') {
+      const current = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim | undefined;
+      if (!current || current.lease_expires_at <= now) {
+        return {
+          success: false,
+          error_code: 'CLAIM_EXPIRED',
+          error: 'Task claim lease has expired',
+          current_claim: current,
+        };
+      }
       return {
         success: false,
         error_code: 'CLAIM_STOLEN',
@@ -1228,19 +2319,41 @@ export function renewTaskClaim(taskId: number, agentId: string, leaseSeconds?: n
     }
     throw error;
   }
-  const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim;
-  const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
-  return { success: true, task, claim };
+  if (primaryEvent) notifyStreamEvent(primaryEvent);
+  if (!committedTask || !committedClaim) throw new Error('TASK_NOT_RENEWABLE');
+  return { success: true, task: committedTask, claim: committedClaim };
 }
 
-export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: string, claimId?: string): {
+export function releaseTaskClaim(
+  taskId: number,
+  agentId: string,
+  nextStatus?: string,
+  claimId?: string,
+  options: {
+    evidenceRefs?: string[];
+    minEvidenceRefs?: number;
+    confidence?: number;
+    requiredConfidence?: number;
+    confidenceFloor?: number;
+    verificationPassed?: boolean;
+    verifiedBy?: string;
+    requireIndependentVerifier?: boolean;
+    preserveAssignment?: boolean;
+  } = {}
+): {
   success: true;
   task: Task;
+  evidence_added: number;
+  evidence_total: number;
 } | {
   success: false;
-  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN';
+  error_code: 'CLAIM_EXPIRED' | 'NOT_CLAIM_OWNER' | 'CLAIM_ID_MISMATCH' | 'CLAIM_STOLEN' | 'DONE_GATE_FAILED' | 'VERIFIER_REQUIRED' | 'EVIDENCE_REQUIRED' | 'DEPENDENCIES_NOT_MET';
   error: string;
   current_claim?: TaskClaim;
+  unmet_dependencies?: number[];
+  required_confidence?: number;
+  required_evidence_refs?: number;
+  evidence_refs_total?: number;
 } {
   const d = getDb();
   const now = Date.now();
@@ -1248,6 +2361,9 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
 
   const existing = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim | undefined;
   if (!existing) return { success: false, error_code: 'CLAIM_EXPIRED', error: 'Task has no active claim' };
+  if (existing.lease_expires_at <= now) {
+    return { success: false, error_code: 'CLAIM_EXPIRED', error: 'Task claim lease has expired', current_claim: existing };
+  }
   if (existing.agent_id !== agentId) {
     return { success: false, error_code: 'NOT_CLAIM_OWNER', error: 'Task claim owned by another agent', current_claim: existing };
   }
@@ -1257,25 +2373,92 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
   const expectedClaimId = claimId || existing.claim_id;
 
   const effectiveStatus = nextStatus || 'pending';
-  const assignedTo = effectiveStatus === 'done' ? agentId : null;
+  const preserveAssignment = options.preserveAssignment === true
+    && (effectiveStatus === 'pending' || effectiveStatus === 'blocked');
+  const assignedTo = effectiveStatus === 'done' || preserveAssignment ? agentId : null;
+  // F6: persist evidence and the done-status flip atomically. The minEvidenceRefs invariant is
+  // enforced INSIDE the transaction so a process crash can never leave a task `done` with fewer
+  // than the required evidence refs, and direct db-layer callers cannot bypass the minimum.
+  const evidenceRefs = normalizeTaskEvidenceRefs(options.evidenceRefs);
+  const minEvidenceRefs = effectiveStatus === 'done' && Number.isFinite(Number(options.minEvidenceRefs))
+    ? Math.max(0, Math.floor(Number(options.minEvidenceRefs)))
+    : undefined;
+  let evidenceAdded = 0;
 
+  const readinessEvents: StreamEvent[] = [];
+  let committedTask: Task | null = null;
+  let primaryEvent: StreamEvent | null = null;
   const tx = d.transaction(() => {
     const removed = d.prepare(`
       DELETE FROM task_claims
-      WHERE task_id = ? AND agent_id = ? AND claim_id = ?
-    `).run(taskId, agentId, expectedClaimId);
+      WHERE task_id = ? AND agent_id = ? AND claim_id = ? AND lease_expires_at > ?
+    `).run(taskId, agentId, expectedClaimId, now);
     if (removed.changes !== 1) {
-      throw new Error('CLAIM_STOLEN');
+      throw new Error('CLAIM_NOT_ACTIVE');
     }
-    d.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ?')
+    if (effectiveStatus === 'done') {
+      assertTaskDependenciesMet(d, taskId);
+      const currentTask = d.prepare('SELECT consistency_mode FROM tasks WHERE id = ?').get(taskId) as { consistency_mode: string } | undefined;
+      const existingEvidence = d.prepare(`
+        SELECT evidence_ref, added_by
+        FROM task_evidence
+        WHERE task_id = ?
+      `).all(taskId) as Array<{ evidence_ref: string; added_by: string }>;
+      assertDoneGateCommit({
+        agentId,
+        confidence: options.confidence,
+        requiredConfidence: options.requiredConfidence,
+        confidenceFloor: options.confidenceFloor,
+        verificationPassed: options.verificationPassed,
+        verifiedBy: options.verifiedBy,
+        requireIndependentVerifier: options.requireIndependentVerifier === true || currentTask?.consistency_mode === 'strict',
+        evidenceRefs,
+        existingEvidenceRefs: existingEvidence.map((row) => row.evidence_ref),
+        existingEvidenceAddedBy: existingEvidence.map((row) => row.added_by),
+        minEvidenceRefs,
+      });
+    }
+    if (evidenceRefs.length > 0) {
+      const insert = d.prepare('INSERT OR IGNORE INTO task_evidence (task_id, evidence_ref, added_by, created_at) VALUES (?, ?, ?, ?)');
+      for (const ref of evidenceRefs) {
+        evidenceAdded += insert.run(taskId, ref, agentId, now).changes;
+      }
+    }
+    d.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ?')
       .run(effectiveStatus, assignedTo, now, taskId);
+    if (effectiveStatus === 'done') {
+      readinessEvents.push(...touchTaskDependentsForReadiness(d, taskId, now));
+    }
+    committedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
+    primaryEvent = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.claim.released',
+      entity_id: taskId,
+      agent_id: agentId,
+      namespace: committedTask.namespace,
+      payload: {
+        status: committedTask.status,
+        assigned_to: committedTask.assigned_to,
+      },
+      created_at: committedTask.updated_at,
+      notify: false,
+    });
   });
 
   try {
     tx();
+    for (const event of readinessEvents) notifyStreamEvent(event);
   } catch (error) {
-    if (error instanceof Error && error.message === 'CLAIM_STOLEN') {
+    if (error instanceof Error && error.message === 'CLAIM_NOT_ACTIVE') {
       const current = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(taskId) as TaskClaim | undefined;
+      if (!current || current.lease_expires_at <= now) {
+        return {
+          success: false,
+          error_code: 'CLAIM_EXPIRED',
+          error: 'Task claim lease has expired',
+          current_claim: current,
+        };
+      }
       return {
         success: false,
         error_code: 'CLAIM_STOLEN',
@@ -1283,10 +2466,30 @@ export function releaseTaskClaim(taskId: number, agentId: string, nextStatus?: s
         current_claim: current,
       };
     }
+    if (error instanceof TaskDoneGateError) {
+      return {
+        success: false,
+        error_code: error.error_code,
+        error: error.message,
+        required_confidence: error.required_confidence,
+        required_evidence_refs: error.required_evidence_refs,
+        evidence_refs_total: error.evidence_refs_total ?? countTaskEvidence(taskId),
+      };
+    }
+    if (error instanceof TaskDependencyError) {
+      return {
+        success: false,
+        error_code: 'DEPENDENCIES_NOT_MET',
+        error: error.message,
+        unmet_dependencies: error.unmet_dependencies,
+      };
+    }
     throw error;
   }
-  const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task;
-  return { success: true, task };
+  const evidenceTotal = countTaskEvidence(taskId);
+  if (primaryEvent) notifyStreamEvent(primaryEvent);
+  if (!committedTask) throw new Error('TASK_UPDATE_FAILED');
+  return { success: true, task: committedTask, evidence_added: evidenceAdded, evidence_total: evidenceTotal };
 }
 
 export function listTaskClaims(options: { agent_id?: string } = {}): TaskClaimWithTask[] {
@@ -1335,12 +2538,15 @@ export function pollAndClaim(agentId: string, leaseSeconds?: number, namespace?:
 
   const txn = d.transaction(() => {
     const namespaceClause = namespace ? 'AND namespace = ?' : '';
-    const taskParams: unknown[] = namespace ? [namespace] : [];
+    const taskParams: unknown[] = [agentId];
+    if (namespace) taskParams.push(namespace);
+    taskParams.push(now);
+    taskParams.push(agentId);
     // Find highest-priority pending task that is dependency-ready.
     // Tie-break with unblock_count to favor tasks that unlock more downstream work.
     const task = d.prepare(`
       SELECT * FROM tasks
-      WHERE status = 'pending' AND assigned_to IS NULL
+      WHERE status = 'pending' AND (assigned_to IS NULL OR assigned_to = ?)
         ${namespaceClause}
         ${executionClause}
         AND NOT EXISTS (
@@ -1349,7 +2555,13 @@ export function pollAndClaim(agentId: string, leaseSeconds?: number, namespace?:
           JOIN tasks dep ON dep.id = td.depends_on_task_id
           WHERE td.task_id = tasks.id AND dep.status != 'done'
         )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM task_claims active_claim
+          WHERE active_claim.task_id = tasks.id AND active_claim.lease_expires_at > ?
+        )
       ORDER BY
+        CASE WHEN assigned_to = ? THEN 0 ELSE 1 END ASC,
         CASE priority
           WHEN 'critical' THEN 0
           WHEN 'high' THEN 1
@@ -1370,9 +2582,9 @@ export function pollAndClaim(agentId: string, leaseSeconds?: number, namespace?:
 
     // Atomically assign and set in_progress
     const updated = d.prepare(`
-      UPDATE tasks SET assigned_to = ?, status = 'in_progress', updated_at = ?
-      WHERE id = ? AND status = 'pending' AND assigned_to IS NULL
-    `).run(agentId, now, task.id);
+      UPDATE tasks SET assigned_to = ?, status = 'in_progress', updated_at = MAX(updated_at + 1, ?)
+      WHERE id = ? AND status = 'pending' AND (assigned_to IS NULL OR assigned_to = ?)
+    `).run(agentId, now, task.id, agentId);
 
     if (updated.changes === 0) return null;
 
@@ -1383,11 +2595,28 @@ export function pollAndClaim(agentId: string, leaseSeconds?: number, namespace?:
 
     const updatedTask = d.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as Task;
     const claim = d.prepare('SELECT * FROM task_claims WHERE task_id = ?').get(task.id) as TaskClaim;
-    return { task: updatedTask, claim };
+    const event = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: 'task.polled_and_claimed',
+      entity_id: task.id,
+      agent_id: agentId,
+      namespace: updatedTask.namespace,
+      payload: {
+        status: updatedTask.status,
+        assigned_to: updatedTask.assigned_to,
+        lease_expires_at: claim.lease_expires_at,
+      },
+      created_at: updatedTask.updated_at,
+      notify: false,
+    });
+    return { task: updatedTask, claim, event };
   });
 
   try {
-    return txn();
+    const result = txn();
+    if (!result) return null;
+    notifyStreamEvent(result.event);
+    return { task: result.task, claim: result.claim };
   } catch (error) {
     if (isTaskClaimUniqueConstraint(error)) {
       return null;
@@ -1420,6 +2649,20 @@ export function shareContext(
       updated_at = excluded.updated_at
   `).run(agentId, key, value, contextNamespace, traceId || null, spanId || null, now);
   const row = d.prepare('SELECT * FROM context WHERE agent_id = ? AND key = ?').get(agentId, key) as Context;
+  insertStreamEvent(d, {
+    stream: 'context',
+    op: 'context.upserted',
+    entity_id: row.id,
+    agent_id: agentId,
+    namespace: row.namespace,
+    payload: {
+      key,
+      value_chars: value.length,
+      trace_id: traceId || null,
+      span_id: spanId || null,
+    },
+    created_at: now,
+  });
   return row;
 }
 
@@ -1430,6 +2673,7 @@ export function getContext(options: {
   limit?: number;
   offset?: number;
   updated_after?: number;
+  cursor?: { ts: number; id: number };
 } = {}): Context[] {
   const d = getDb();
   let query = 'SELECT * FROM context WHERE 1=1';
@@ -1447,13 +2691,18 @@ export function getContext(options: {
     query += ' AND namespace = ?';
     params.push(options.namespace);
   }
-  if (Number.isFinite(options.updated_after)) {
+  const hasCursor = Boolean(options.cursor && Number.isFinite(options.cursor.ts) && Number.isFinite(options.cursor.id));
+  const hasUpdatedAfter = Number.isFinite(options.updated_after);
+  if (hasCursor) {
+    query += ' AND (updated_at > ? OR (updated_at = ? AND id > ?))';
+    params.push(options.cursor!.ts, options.cursor!.ts, options.cursor!.id);
+  } else if (hasUpdatedAfter) {
     query += ' AND updated_at > ?';
     params.push(Math.floor(Number(options.updated_after)));
   }
-  query += ' ORDER BY updated_at DESC';
+  query += (hasCursor || hasUpdatedAfter) ? ' ORDER BY updated_at ASC, id ASC' : ' ORDER BY updated_at DESC, id DESC';
   const limit = Number.isFinite(options.limit) ? Math.max(1, Math.floor(Number(options.limit))) : 100;
-  const offset = Number.isFinite(options.offset) ? Math.max(0, Math.floor(Number(options.offset))) : 0;
+  const offset = hasCursor || hasUpdatedAfter ? 0 : (Number.isFinite(options.offset) ? Math.max(0, Math.floor(Number(options.offset))) : 0);
   query += ' LIMIT ? OFFSET ?';
   params.push(limit, offset);
 
@@ -1527,48 +2776,106 @@ export function getIdempotencyRecord(agentId: string, toolName: string, idempote
   return row || null;
 }
 
-export function saveIdempotencyRecord(agentId: string, toolName: string, idempotencyKey: string, response: unknown): void {
+export function saveIdempotencyRecord(
+  agentId: string,
+  toolName: string,
+  idempotencyKey: string,
+  response: unknown,
+  requestHash: string | null = null,
+): boolean {
   const now = Date.now();
   const responseJson = JSON.stringify(response);
-  getDb().prepare(`
-    INSERT OR IGNORE INTO idempotency_keys (agent_id, tool_name, idempotency_key, response_json, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(agentId, toolName, idempotencyKey, responseJson, now);
+  const result = getDb().prepare(`
+    INSERT OR IGNORE INTO idempotency_keys (
+      agent_id, tool_name, idempotency_key, request_hash, response_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(agentId, toolName, idempotencyKey, requestHash, responseJson, now);
+  return result.changes === 1;
 }
 
 // --- Protocol Blobs ---
 
-export function putProtocolBlob(hash: string, value: string): { blob: ProtocolBlob; created: boolean } {
+export function putProtocolBlob(hash: string, value: string, ownerAgentId: string): { blob: ProtocolBlob; created: boolean } {
+  if (!ownerAgentId || ownerAgentId === '*') throw new Error('INVALID_BLOB_OWNER');
   const d = getDb();
   const now = Date.now();
-  const inserted = d.prepare(`
-    INSERT OR IGNORE INTO protocol_blobs (hash, value, created_at, updated_at, access_count)
-    VALUES (?, ?, ?, ?, 0)
-  `).run(hash, value, now, now);
-
-  if (inserted.changes === 0) {
-    d.prepare('UPDATE protocol_blobs SET updated_at = ? WHERE hash = ?').run(now, hash);
-  }
+  let created = false;
+  const write = d.transaction(() => {
+    const inserted = d.prepare(`
+      INSERT OR IGNORE INTO protocol_blobs (hash, value, created_at, updated_at, access_count)
+      VALUES (?, ?, ?, ?, 0)
+    `).run(hash, value, now, now);
+    created = inserted.changes > 0;
+    if (!created) d.prepare('UPDATE protocol_blobs SET updated_at = ? WHERE hash = ?').run(now, hash);
+    if (ownerAgentId) {
+      d.prepare(`
+        INSERT OR IGNORE INTO protocol_blob_access (hash, agent_id, granted_by, created_at)
+        VALUES (?, ?, ?, ?)
+      `).run(hash, ownerAgentId, ownerAgentId, now);
+    }
+  });
+  write.immediate();
 
   const blob = d.prepare('SELECT * FROM protocol_blobs WHERE hash = ?').get(hash) as ProtocolBlob;
-  return { blob, created: inserted.changes > 0 };
+  return { blob, created };
 }
 
-export function getProtocolBlob(hash: string): ProtocolBlob | null {
+export function grantProtocolBlobAccess(hash: string, agentIds: string[], grantedBy: string): number {
+  const normalized = [...new Set(agentIds
+    .map((id) => String(id || '').trim())
+    .filter(Boolean)
+    .map((id) => id === '*' ? PROTOCOL_BLOB_PUBLIC_GRANTEE : id))];
+  if (normalized.length === 0) return 0;
+  const d = getDb();
+  const now = Date.now();
+  let granted = 0;
+  const insert = d.prepare(`
+    INSERT OR IGNORE INTO protocol_blob_access (hash, agent_id, granted_by, created_at)
+    SELECT ?, ?, ?, ?
+    WHERE EXISTS (SELECT 1 FROM protocol_blobs WHERE hash = ?)
+  `);
+  const tx = d.transaction(() => {
+    for (const agentId of normalized) granted += insert.run(hash, agentId, grantedBy, now, hash).changes;
+  });
+  tx.immediate();
+  return granted;
+}
+
+function readProtocolBlob(hash: string): ProtocolBlob | null {
   const d = getDb();
   const existing = d.prepare('SELECT * FROM protocol_blobs WHERE hash = ?').get(hash) as ProtocolBlob | undefined;
   if (!existing) return null;
-
   d.prepare('UPDATE protocol_blobs SET access_count = access_count + 1, updated_at = ? WHERE hash = ?').run(Date.now(), hash);
   return d.prepare('SELECT * FROM protocol_blobs WHERE hash = ?').get(hash) as ProtocolBlob;
 }
 
-export function listProtocolBlobs(limit = 100, offset = 0): ProtocolBlob[] {
+export function getProtocolBlob(hash: string, agentId: string): ProtocolBlob | null {
+  if (!agentId) return null;
+  const allowed = getDb().prepare(`
+    SELECT 1
+    FROM protocol_blob_access
+    WHERE hash = ? AND agent_id IN (?, ?)
+    LIMIT 1
+  `).get(hash, agentId, PROTOCOL_BLOB_PUBLIC_GRANTEE);
+  return allowed ? readProtocolBlob(hash) : null;
+}
+
+export function listProtocolBlobs(agentId: string, limit = 100, offset = 0): ProtocolBlob[] {
+  if (!agentId) return [];
   const capped = Math.max(1, Math.min(1000, Math.floor(limit)));
   const safeOffset = Math.max(0, Math.floor(offset));
   return getDb()
-    .prepare('SELECT * FROM protocol_blobs ORDER BY updated_at DESC LIMIT ? OFFSET ?')
-    .all(capped, safeOffset) as ProtocolBlob[];
+    .prepare(`
+      SELECT pb.*
+      FROM protocol_blobs pb
+      WHERE EXISTS (
+        SELECT 1 FROM protocol_blob_access pba
+        WHERE pba.hash = pb.hash AND pba.agent_id IN (?, ?)
+      )
+      ORDER BY pb.updated_at DESC
+      LIMIT ? OFFSET ?
+    `)
+    .all(agentId, PROTOCOL_BLOB_PUBLIC_GRANTEE, capped, safeOffset) as ProtocolBlob[];
 }
 
 // --- Consensus Decisions ---
@@ -1592,7 +2899,19 @@ export function saveConsensusDecision(args: {
     JSON.stringify(args.reasons ?? []),
     now
   );
-  return getDb().prepare('SELECT * FROM consensus_decisions WHERE id = ?').get(result.lastInsertRowid) as ConsensusDecision;
+  const decision = getDb().prepare('SELECT * FROM consensus_decisions WHERE id = ?').get(result.lastInsertRowid) as ConsensusDecision;
+  appendStreamEvent({
+    stream: 'consensus',
+    op: 'consensus.decision.saved',
+    entity_id: decision.id,
+    agent_id: args.requesting_agent,
+    payload: {
+      proposal_id: args.proposal_id,
+      outcome: args.outcome,
+    },
+    created_at: now,
+  });
+  return decision;
 }
 
 export function listConsensusDecisions(options: { proposal_id?: string; limit?: number; offset?: number } = {}): ConsensusDecision[] {
@@ -1611,12 +2930,82 @@ export function listConsensusDecisions(options: { proposal_id?: string; limit?: 
 
 // --- Auth Coverage ---
 
-export function recordAuthEvent(agentId: string | null, toolName: string, status: 'valid' | 'missing' | 'invalid' | 'skipped'): void {
+function authEventBucketStart(now: number): number {
+  return Math.floor(now / AUTH_EVENT_BUCKET_MS) * AUTH_EVENT_BUCKET_MS;
+}
+
+function flushPendingAuthEvents(d: Database.Database, now = Date.now()): number {
+  if (pendingAuthEvents.size === 0) {
+    authEventLastFlushAt = now;
+    return 0;
+  }
+
+  const entries = [...pendingAuthEvents.entries()];
+  const upsert = d.prepare(`
+    INSERT INTO auth_events (
+      agent_id, tool_name, status, created_at, event_count, bucket_start
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(tool_name, status, bucket_start) WHERE bucket_start > 0 DO UPDATE SET
+      event_count = auth_events.event_count + excluded.event_count,
+      created_at = MAX(auth_events.created_at, excluded.created_at),
+      agent_id = CASE
+        WHEN auth_events.agent_id IS excluded.agent_id THEN auth_events.agent_id
+        ELSE NULL
+      END
+  `);
+  const write = d.transaction(() => {
+    for (const [, entry] of entries) {
+      upsert.run(
+        entry.mixedAgents ? null : entry.sampleAgentId,
+        entry.toolName,
+        entry.status,
+        entry.lastSeenAt,
+        entry.count,
+        entry.bucketStart,
+      );
+    }
+  });
+  write.immediate();
+
+  let flushed = 0;
+  for (const [key, entry] of entries) {
+    if (pendingAuthEvents.get(key) !== entry) continue;
+    pendingAuthEvents.delete(key);
+    flushed += entry.count;
+  }
+  authEventLastFlushAt = now;
+  return flushed;
+}
+
+export function recordAuthEvent(agentId: string | null, toolName: string, status: AuthEventStatus): void {
   const now = Date.now();
-  getDb().prepare(`
-    INSERT INTO auth_events (agent_id, tool_name, status, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(agentId, toolName, status, now);
+  const bucketStart = authEventBucketStart(now);
+  const normalizedToolName = String(toolName || 'unknown').trim().slice(0, 120) || 'unknown';
+  const normalizedAgentId = typeof agentId === 'string' && agentId.length > 0 ? agentId.slice(0, 120) : null;
+  const key = `${bucketStart}\u0000${normalizedToolName}\u0000${status}`;
+  const existing = pendingAuthEvents.get(key);
+  if (existing) {
+    existing.count += 1;
+    existing.lastSeenAt = now;
+    if (existing.sampleAgentId !== normalizedAgentId) existing.mixedAgents = true;
+  } else {
+    pendingAuthEvents.set(key, {
+      bucketStart,
+      toolName: normalizedToolName,
+      status,
+      count: 1,
+      lastSeenAt: now,
+      sampleAgentId: normalizedAgentId,
+      mixedAgents: false,
+    });
+  }
+
+  if (
+    now - authEventLastFlushAt >= AUTH_EVENT_FLUSH_INTERVAL_MS
+    || pendingAuthEvents.size >= AUTH_EVENT_PENDING_MAX_KEYS
+  ) {
+    flushPendingAuthEvents(getDb(), now);
+  }
 }
 
 export function getAuthCoverageSnapshot(windowMs = 24 * 60 * 60 * 1000, now = Date.now()): AuthCoverageSnapshot & {
@@ -1624,14 +3013,21 @@ export function getAuthCoverageSnapshot(windowMs = 24 * 60 * 60 * 1000, now = Da
 } {
   const fromTs = now - Math.max(1, Math.floor(windowMs));
   const d = getDb();
+  const fromBucket = authEventBucketStart(fromTs);
   const counts = d.prepare(`
-    SELECT status, COUNT(*) AS c
+    SELECT status, SUM(event_count) AS c
     FROM auth_events
-    WHERE created_at >= ?
+    WHERE (bucket_start = 0 AND created_at >= ?)
+       OR bucket_start >= ?
     GROUP BY status
-  `).all(fromTs) as Array<{ status: string; c: number }>;
+  `).all(fromTs, fromBucket) as Array<{ status: string; c: number }>;
   const tally = new Map<string, number>();
   for (const row of counts) tally.set(row.status, row.c);
+  const pendingForWindow = [...pendingAuthEvents.values()]
+    .filter((entry) => entry.bucketStart >= fromBucket);
+  for (const entry of pendingForWindow) {
+    tally.set(entry.status, (tally.get(entry.status) || 0) + entry.count);
+  }
 
   const valid = tally.get('valid') || 0;
   const missing = tally.get('missing') || 0;
@@ -1644,25 +3040,42 @@ export function getAuthCoverageSnapshot(windowMs = 24 * 60 * 60 * 1000, now = Da
   const byToolRaw = d.prepare(`
     SELECT
       tool_name,
-      COUNT(*) AS total,
-      SUM(CASE WHEN status = 'valid' THEN 1 ELSE 0 END) AS valid,
-      SUM(CASE WHEN status = 'missing' THEN 1 ELSE 0 END) AS missing,
-      SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) AS invalid,
-      SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped
+      SUM(event_count) AS total,
+      SUM(CASE WHEN status = 'valid' THEN event_count ELSE 0 END) AS valid,
+      SUM(CASE WHEN status = 'missing' THEN event_count ELSE 0 END) AS missing,
+      SUM(CASE WHEN status = 'invalid' THEN event_count ELSE 0 END) AS invalid,
+      SUM(CASE WHEN status = 'skipped' THEN event_count ELSE 0 END) AS skipped
     FROM auth_events
-    WHERE created_at >= ?
+    WHERE (bucket_start = 0 AND created_at >= ?)
+       OR bucket_start >= ?
     GROUP BY tool_name
     ORDER BY total DESC
-    LIMIT 20
-  `).all(fromTs) as Array<{ tool_name: string; total: number; valid: number; missing: number; invalid: number; skipped: number }>;
+  `).all(fromTs, fromBucket) as Array<{ tool_name: string; total: number; valid: number; missing: number; invalid: number; skipped: number }>;
 
-  const byTool = byToolRaw.map((row) => {
+  const byToolCounts = new Map(byToolRaw.map((row) => [row.tool_name, row]));
+  for (const entry of pendingForWindow) {
+    const existing = byToolCounts.get(entry.toolName) || {
+      tool_name: entry.toolName,
+      total: 0,
+      valid: 0,
+      missing: 0,
+      invalid: 0,
+      skipped: 0,
+    };
+    existing.total += entry.count;
+    existing[entry.status] += entry.count;
+    byToolCounts.set(entry.toolName, existing);
+  }
+  const byTool = [...byToolCounts.values()]
+    .sort((a, b) => (b.total - a.total) || a.tool_name.localeCompare(b.tool_name))
+    .slice(0, 20)
+    .map((row) => {
     const denom = row.valid + row.missing + row.invalid;
     return {
       ...row,
       valid_coverage_pct: denom === 0 ? 100 : Math.round((10000 * row.valid) / denom) / 100,
     };
-  });
+    });
 
   return {
     window_ms: windowMs,
@@ -1680,8 +3093,12 @@ export function getAuthCoverageSnapshot(windowMs = 24 * 60 * 60 * 1000, now = Da
 
 export function cleanupAuthEvents(now = Date.now(), ttlMs = AUTH_EVENTS_TTL_MS): number {
   if (ttlMs <= 0) return 0;
+  const d = getDb();
+  if (now - authEventLastFlushAt >= AUTH_EVENT_FLUSH_INTERVAL_MS) {
+    flushPendingAuthEvents(d, now);
+  }
   const cutoff = now - ttlMs;
-  const result = getDb().prepare('DELETE FROM auth_events WHERE created_at < ?').run(cutoff);
+  const result = d.prepare('DELETE FROM auth_events WHERE created_at < ?').run(cutoff);
   return result.changes;
 }
 
@@ -1701,13 +3118,29 @@ export function createArtifactRecord(args: {
   const mimeType = (args.mime_type || 'application/octet-stream').trim() || 'application/octet-stream';
   const summary = (args.summary || '').trim();
   const ttlExpiresAt = Number.isFinite(args.ttl_expires_at) ? Math.floor(Number(args.ttl_expires_at)) : null;
-  getDb().prepare(`
+  const d = getDb();
+  d.prepare(`
     INSERT INTO artifacts (
       id, created_by, name, mime_type, size_bytes, sha256, storage_path, namespace, summary,
       created_at, updated_at, access_count, ttl_expires_at
     ) VALUES (?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, 0, ?)
   `).run(args.id, args.created_by, args.name, mimeType, namespace, summary, now, now, ttlExpiresAt);
-  return getDb().prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.created',
+    entity_id: artifact.id,
+    agent_id: artifact.created_by,
+    target_agent_id: artifact.created_by,
+    namespace: artifact.namespace,
+    payload: {
+      name: artifact.name,
+      mime_type: artifact.mime_type,
+      summary_chars: artifact.summary.length,
+    },
+    created_at: now,
+  });
+  return artifact;
 }
 
 export function finalizeArtifactUpload(args: {
@@ -1718,7 +3151,8 @@ export function finalizeArtifactUpload(args: {
   mime_type?: string;
 }): Artifact | null {
   const now = Date.now();
-  const updated = getDb().prepare(`
+  const d = getDb();
+  const updated = d.prepare(`
     UPDATE artifacts
     SET size_bytes = ?, sha256 = ?, storage_path = ?, mime_type = COALESCE(?, mime_type), updated_at = ?
     WHERE id = ?
@@ -1731,7 +3165,22 @@ export function finalizeArtifactUpload(args: {
     args.id,
   );
   if (updated.changes !== 1) return null;
-  return getDb().prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.id) as Artifact;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.upload.finalized',
+    entity_id: artifact.id,
+    agent_id: artifact.created_by,
+    target_agent_id: artifact.created_by,
+    namespace: artifact.namespace,
+    payload: {
+      size_bytes: artifact.size_bytes,
+      sha256: artifact.sha256,
+      mime_type: artifact.mime_type,
+    },
+    created_at: now,
+  });
+  return artifact;
 }
 
 export function getArtifactById(artifactId: string): Artifact | null {
@@ -1782,10 +3231,24 @@ export function grantArtifactAccess(args: {
   granted_by: string;
 }): void {
   const now = Date.now();
-  getDb().prepare(`
+  const d = getDb();
+  d.prepare(`
     INSERT OR REPLACE INTO artifact_shares (artifact_id, to_agent, granted_by, created_at)
     VALUES (?, ?, ?, ?)
   `).run(args.artifact_id, args.to_agent, args.granted_by, now);
+  const artifact = d.prepare('SELECT * FROM artifacts WHERE id = ?').get(args.artifact_id) as Artifact | undefined;
+  insertStreamEvent(d, {
+    stream: 'artifacts',
+    op: 'artifact.shared',
+    entity_id: args.artifact_id,
+    agent_id: args.granted_by,
+    target_agent_id: args.to_agent,
+    namespace: artifact?.namespace || null,
+    payload: {
+      to_agent: args.to_agent,
+    },
+    created_at: now,
+  });
 }
 
 export function hasArtifactAccess(agentId: string, artifactId: string): boolean {
@@ -1807,15 +3270,31 @@ export function hasArtifactAccess(agentId: string, artifactId: string): boolean 
 
 export function attachTaskArtifact(taskId: number, artifactId: string, addedBy: string): { created: boolean; row: TaskArtifact | null } {
   const now = Date.now();
-  const insertResult = getDb().prepare(`
+  const d = getDb();
+  const insertResult = d.prepare(`
     INSERT OR IGNORE INTO task_artifacts (task_id, artifact_id, added_by, created_at)
     VALUES (?, ?, ?, ?)
   `).run(taskId, artifactId, addedBy, now);
-  const row = getDb().prepare(`
+  const row = d.prepare(`
     SELECT task_id, artifact_id, added_by, created_at
     FROM task_artifacts
     WHERE task_id = ? AND artifact_id = ?
   `).get(taskId, artifactId) as TaskArtifact | undefined;
+  if (insertResult.changes === 1) {
+    const task = d.prepare('SELECT namespace FROM tasks WHERE id = ?').get(taskId) as { namespace?: string } | undefined;
+    insertStreamEvent(d, {
+      stream: 'artifacts',
+      op: 'task_artifact.attached',
+      entity_id: `${taskId}:${artifactId}`,
+      agent_id: addedBy,
+      namespace: task?.namespace || null,
+      payload: {
+        task_id: taskId,
+        artifact_id: artifactId,
+      },
+      created_at: now,
+    });
+  }
   return {
     created: insertResult.changes === 1,
     row: row || null,
@@ -1855,14 +3334,15 @@ export function incrementArtifactAccess(artifactId: string): void {
 
 export function cleanupArtifacts(now = Date.now(), ttlMs = ARTIFACT_TTL_MS): { deleted: number; paths: string[] } {
   const d = getDb();
-  const cutoff = now - Math.max(1, ttlMs);
+  const includeFallbackTtl = ttlMs > 0;
+  const cutoff = includeFallbackTtl ? now - ttlMs : now;
   const rows = d.prepare(`
     SELECT id, storage_path
     FROM artifacts
     WHERE
       (ttl_expires_at IS NOT NULL AND ttl_expires_at < ?)
-      OR (ttl_expires_at IS NULL AND updated_at < ?)
-  `).all(now, cutoff) as Array<{ id: string; storage_path: string | null }>;
+      ${includeFallbackTtl ? 'OR (ttl_expires_at IS NULL AND updated_at < ?)' : ''}
+  `).all(...(includeFallbackTtl ? [now, cutoff] : [now])) as Array<{ id: string; storage_path: string | null }>;
   if (rows.length === 0) return { deleted: 0, paths: [] };
 
   const tx = d.transaction((ids: string[]) => {
@@ -2022,6 +3502,7 @@ export function getKpiWindows(windowsMs: number[], now = Date.now()): {
 
   const windows = uniqueWindows.map((windowMs) => {
     const cutoff = now - windowMs;
+    const authCutoffBucket = authEventBucketStart(cutoff);
     const activityEvents = (d.prepare('SELECT COUNT(*) AS c FROM activity_log WHERE created_at >= ?').get(cutoff) as { c: number }).c;
     const messagesCreated = (d.prepare('SELECT COUNT(*) AS c FROM messages WHERE created_at >= ?').get(cutoff) as { c: number }).c;
     const tasksUpdated = (d.prepare('SELECT COUNT(*) AS c FROM tasks WHERE updated_at >= ?').get(cutoff) as { c: number }).c;
@@ -2111,12 +3592,19 @@ export function getKpiWindows(windowsMs: number[], now = Date.now()): {
       WHERE created_at >= ?
         AND action = 'wait_for_updates_hit'
     `).get(cutoff) as { c: number }).c;
-    const waitCalls = (d.prepare(`
-      SELECT COUNT(*) AS c
+    const persistedWaitCalls = (d.prepare(`
+      SELECT COALESCE(SUM(event_count), 0) AS c
       FROM auth_events
-      WHERE created_at >= ?
-        AND tool_name = 'wait_for_updates'
-    `).get(cutoff) as { c: number }).c;
+      WHERE tool_name = 'wait_for_updates'
+        AND (
+          (bucket_start = 0 AND created_at >= ?)
+          OR bucket_start >= ?
+        )
+    `).get(cutoff, authCutoffBucket) as { c: number }).c;
+    const pendingWaitCalls = [...pendingAuthEvents.values()]
+      .filter((entry) => entry.toolName === 'wait_for_updates' && entry.bucketStart >= authCutoffBucket)
+      .reduce((sum, entry) => sum + entry.count, 0);
+    const waitCalls = persistedWaitCalls + pendingWaitCalls;
     const waitTimeoutRows = d.prepare(`
       SELECT details
       FROM activity_log
@@ -2480,23 +3968,49 @@ export function cleanupStaleOfflineAgents(
       UPDATE tasks
       SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END,
           assigned_to = NULL,
-          updated_at = ?
+          updated_at = MAX(updated_at + 1, ?)
       WHERE assigned_to = ?
         AND status IN ('pending', 'in_progress')
     `);
     const deleteAgent = d.prepare('DELETE FROM agents WHERE id = ?');
+    const retireAgentId = d.prepare(`
+      INSERT INTO retired_agent_ids (agent_id, retired_at)
+      VALUES (?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET retired_at = excluded.retired_at
+    `);
 
     for (const id of ids) {
+      const tasksToRelease = d.prepare(`
+        SELECT id, namespace, status
+        FROM tasks
+        WHERE assigned_to = ?
+          AND status IN ('pending', 'in_progress')
+      `).all(id) as Array<{ id: number; namespace: string; status: string }>;
       clearClaims.run(id);
       releaseAssignedTasks.run(now, id);
+      for (const task of tasksToRelease) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.agent_deleted_requeued',
+          entity_id: task.id,
+          agent_id: id,
+          target_agent_id: null,
+          namespace: task.namespace,
+          payload: {
+            previous_status: task.status,
+            status: task.status === 'in_progress' ? 'pending' : task.status,
+            assigned_to: null,
+            deleted_agent_id: id,
+          },
+          created_at: now,
+        });
+      }
+      retireAgentId.run(id, now);
       deleteAgent.run(id);
     }
 
-    // Keep token table in sync when stale agents are purged.
-    d.prepare(`
-      DELETE FROM agent_tokens
-      WHERE agent_id NOT IN (SELECT id FROM agents)
-    `).run();
+    // Keep the credential digest as an identity tombstone. A later registration with the same
+    // id must prove ownership before it can see data still retained under that identity.
   });
 
   tx(deletedRows.map((row) => row.id));
@@ -2508,13 +4022,14 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
   const cutoff = now - Math.max(1_000, reapAfterMs);
   const d = getDb();
   const rows = d.prepare(`
-    SELECT tc.task_id AS task_id
+    SELECT tc.task_id AS task_id, t.namespace AS namespace, tc.agent_id AS agent_id
     FROM task_claims tc
     JOIN agents a ON a.id = tc.agent_id
+    JOIN tasks t ON t.id = tc.task_id
     WHERE a.lifecycle = 'ephemeral'
       AND a.status = 'offline'
       AND tc.updated_at < ?
-  `).all(cutoff) as Array<{ task_id: number }>;
+  `).all(cutoff) as Array<{ task_id: number; namespace: string; agent_id: string }>;
 
   if (rows.length === 0) return 0;
   const taskIds = [...new Set(rows.map((row) => row.task_id))];
@@ -2522,13 +4037,30 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
   const tx = d.transaction((ids: number[]) => {
     const releaseTask = d.prepare(`
       UPDATE tasks
-      SET status = 'pending', assigned_to = NULL, updated_at = ?
+      SET status = 'pending', assigned_to = NULL, updated_at = MAX(updated_at + 1, ?)
       WHERE id = ? AND status = 'in_progress'
     `);
     const deleteClaim = d.prepare('DELETE FROM task_claims WHERE task_id = ?');
     for (const taskId of ids) {
-      releaseTask.run(now, taskId);
+      const result = releaseTask.run(now, taskId);
       deleteClaim.run(taskId);
+      const row = rows.find((candidate) => candidate.task_id === taskId);
+      if (row && result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.ephemeral_claim_reaped',
+          entity_id: taskId,
+          agent_id: row.agent_id,
+          target_agent_id: null,
+          namespace: row.namespace,
+          payload: {
+            status: 'pending',
+            assigned_to: null,
+            reaped_agent_id: row.agent_id,
+          },
+          created_at: now,
+        });
+      }
     }
   });
 
@@ -2537,11 +4069,10 @@ export function reapOfflineEphemeralClaims(now = Date.now(), reapAfterMs = EPHEM
 }
 
 export function requeueOrphanedAssignments(now = Date.now()): number {
-  const result = getDb().prepare(`
-    UPDATE tasks
-    SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END,
-        assigned_to = NULL,
-        updated_at = ?
+  const d = getDb();
+  const rows = d.prepare(`
+    SELECT id, namespace, status, assigned_to
+    FROM tasks
     WHERE assigned_to IS NOT NULL
       AND status IN ('pending', 'in_progress')
       AND (
@@ -2552,8 +4083,40 @@ export function requeueOrphanedAssignments(now = Date.now()): number {
           WHERE lifecycle = 'ephemeral' AND status = 'offline'
         )
       )
-  `).run(now);
-  return result.changes;
+  `).all() as Array<{ id: number; namespace: string; status: string; assigned_to: string | null }>;
+  if (rows.length === 0) return 0;
+
+  const tx = d.transaction((tasksToRequeue: typeof rows) => {
+    const update = d.prepare(`
+    UPDATE tasks
+    SET status = CASE WHEN status = 'in_progress' THEN 'pending' ELSE status END,
+        assigned_to = NULL,
+        updated_at = MAX(updated_at + 1, ?)
+    WHERE id = ?
+  `);
+    for (const task of tasksToRequeue) {
+      const result = update.run(now, task.id);
+      if (result.changes > 0) {
+        insertStreamEvent(d, {
+          stream: 'tasks',
+          op: 'task.orphan_requeued',
+          entity_id: task.id,
+          agent_id: task.assigned_to,
+          target_agent_id: null,
+          namespace: task.namespace,
+          payload: {
+            previous_status: task.status,
+            status: task.status === 'in_progress' ? 'pending' : task.status,
+            assigned_to: null,
+            previous_assigned_to: task.assigned_to,
+          },
+          created_at: now,
+        });
+      }
+    }
+  });
+  tx(rows);
+  return rows.length;
 }
 
 export function cleanupMessages(now = Date.now(), ttlMs = MESSAGE_TTL_MS): number {
@@ -2637,6 +4200,19 @@ export function archiveDoneTasks(now = Date.now(), ttlMs = DONE_TASK_TTL_MS, lim
         now,
         'ttl_cleanup'
       );
+      insertStreamEvent(d, {
+        stream: 'tasks',
+        op: 'task.archived',
+        entity_id: task.id,
+        agent_id: 'system',
+        target_agent_id: null,
+        namespace: task.namespace,
+        payload: {
+          status: task.status,
+          archive_reason: 'ttl_cleanup',
+        },
+        created_at: now,
+      });
       del.run(task.id);
     }
   });
@@ -2650,22 +4226,45 @@ export function deleteTask(taskId: number, options: { archive?: boolean; reason?
   archived: boolean;
 } | {
   success: false;
-  error_code: 'TASK_NOT_FOUND' | 'TASK_CLAIMED';
+  error_code: 'TASK_NOT_FOUND' | 'TASK_CLAIMED' | 'TASK_HAS_DEPENDENTS';
   error: string;
+  dependent_task_ids?: number[];
 } {
   const d = getDb();
-  const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;
-  if (!task) {
-    return { success: false, error_code: 'TASK_NOT_FOUND', error: 'Task not found' };
-  }
-  const activeClaim = d.prepare('SELECT 1 FROM task_claims WHERE task_id = ?').get(taskId);
-  if (activeClaim) {
-    return { success: false, error_code: 'TASK_CLAIMED', error: 'Task has an active claim' };
-  }
-
   const archive = options.archive !== false;
   const now = Date.now();
   const tx = d.transaction(() => {
+    const task = d.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as Task | undefined;
+    if (!task) {
+      return {
+        result: { success: false as const, error_code: 'TASK_NOT_FOUND' as const, error: 'Task not found' },
+        event: null,
+      };
+    }
+    const activeClaim = d.prepare('SELECT 1 FROM task_claims WHERE task_id = ?').get(taskId);
+    if (activeClaim) {
+      return {
+        result: { success: false as const, error_code: 'TASK_CLAIMED' as const, error: 'Task has an active claim' },
+        event: null,
+      };
+    }
+    const dependents = d.prepare(`
+      SELECT task_id
+      FROM task_dependencies
+      WHERE depends_on_task_id = ?
+      ORDER BY task_id ASC
+    `).all(taskId) as Array<{ task_id: number }>;
+    if (dependents.length > 0) {
+      return {
+        result: {
+          success: false as const,
+          error_code: 'TASK_HAS_DEPENDENTS' as const,
+          error: 'Task cannot be deleted while other tasks depend on it',
+          dependent_task_ids: dependents.map((row) => row.task_id),
+        },
+        event: null,
+      };
+    }
     if (archive) {
       d.prepare(`
         INSERT OR REPLACE INTO tasks_archive (
@@ -2692,10 +4291,26 @@ export function deleteTask(taskId: number, options: { archive?: boolean; reason?
         options.reason || 'manual_delete'
       );
     }
+    const event = insertStreamEvent(d, {
+      stream: 'tasks',
+      op: archive ? 'task.archived' : 'task.deleted',
+      entity_id: task.id,
+      agent_id: 'system',
+      target_agent_id: null,
+      namespace: task.namespace,
+      payload: {
+        status: task.status,
+        archive_reason: archive ? (options.reason || 'manual_delete') : null,
+      },
+      created_at: now,
+      notify: false,
+    });
     d.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+    return { result: { success: true as const, archived: archive }, event };
   });
-  tx();
-  return { success: true, archived: archive };
+  const committed = tx.immediate();
+  if (committed.event) notifyStreamEvent(committed.event);
+  return committed.result;
 }
 
 export function runMaintenance(now = Date.now()): {
@@ -2708,10 +4323,13 @@ export function runMaintenance(now = Date.now()): {
   messages_cleaned: number;
   activity_log_cleaned: number;
   protocol_blobs_cleaned: number;
-  artifacts_cleaned: number;
-  tasks_archived: number;
-  auth_events_cleaned: number;
-  resolved_slo_cleaned: number;
+	  artifacts_cleaned: number;
+	  tasks_archived: number;
+	  auth_events_cleaned: number;
+	  stream_events_cleaned: number;
+	  feed_acks_cleaned: number;
+	  saved_filters_cleaned: number;
+	  resolved_slo_cleaned: number;
   slo: {
     evaluated_at: number;
     triggered: number;
@@ -2731,10 +4349,13 @@ export function runMaintenance(now = Date.now()): {
     messages_cleaned: cleanupMessages(now),
     activity_log_cleaned: cleanupActivityLog(now),
     protocol_blobs_cleaned: cleanupProtocolBlobs(now),
-    artifacts_cleaned: artifacts.deleted,
-    tasks_archived: archiveDoneTasks(now),
-    auth_events_cleaned: cleanupAuthEvents(now),
-    resolved_slo_cleaned: cleanupResolvedSloAlerts(now),
+	    artifacts_cleaned: artifacts.deleted,
+	    tasks_archived: archiveDoneTasks(now),
+	    auth_events_cleaned: cleanupAuthEvents(now),
+	    stream_events_cleaned: cleanupStreamEvents(now),
+	    feed_acks_cleaned: cleanupFeedAcks(now),
+	    saved_filters_cleaned: cleanupSavedFilters(now),
+	    resolved_slo_cleaned: cleanupResolvedSloAlerts(now),
     slo: {
       evaluated_at: slo.evaluated_at,
       triggered: slo.triggered,
@@ -2746,20 +4367,39 @@ export function runMaintenance(now = Date.now()): {
 
 // --- Activity Log ---
 
-export function logActivity(agentId: string, action: string, details: string = ''): ActivityLogEntry {
+export function logActivity(
+  agentId: string,
+  action: string,
+  details: string = '',
+  options: { emit_stream_event?: boolean } = {}
+): ActivityLogEntry {
   const now = Date.now();
   const d = getDb();
   const result = d.prepare(`
     INSERT INTO activity_log (agent_id, action, details, created_at)
     VALUES (?, ?, ?, ?)
   `).run(agentId, action, details, now);
-  return {
+  const entry = {
     id: result.lastInsertRowid as number,
     agent_id: agentId,
     action,
     details,
     created_at: now,
   };
+  if (options.emit_stream_event !== false) {
+    insertStreamEvent(d, {
+      stream: 'activity',
+      op: 'activity.logged',
+      entity_id: entry.id,
+      agent_id: agentId,
+      payload: {
+        action,
+        details_chars: details.length,
+      },
+      created_at: now,
+    });
+  }
+  return entry;
 }
 
 export function getActivityLog(options: { agent_id?: string; limit?: number; offset?: number } = {}): ActivityLogEntry[] {
@@ -2782,8 +4422,14 @@ export function getActivityLog(options: { agent_id?: string; limit?: number; off
 
 export function closeDb(): void {
   if (db) {
-    db.close();
-    db = undefined!;
-    resetWatermarkCaches();
+    try {
+      flushPendingAuthEvents(db);
+    } finally {
+      pendingAuthEvents.clear();
+      authEventLastFlushAt = Date.now();
+      db.close();
+      db = undefined!;
+      resetWatermarkCaches();
+    }
   }
 }

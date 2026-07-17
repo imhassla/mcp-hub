@@ -3,6 +3,18 @@ export type AgentWorkspaceMode = 'repo' | 'isolated' | 'unknown';
 export type TaskExecutionMode = 'any' | 'repo' | 'isolated';
 export type TaskConsistencyMode = 'cheap' | 'strict';
 
+export interface AgentModelProfile {
+  provider?: string;
+  id?: string;
+  family?: string;
+  context_window?: number;
+  max_output_tokens?: number;
+  strengths?: string[];
+  task_types?: string[];
+  cost_tier?: 'low' | 'medium' | 'high' | 'unknown';
+  latency_tier?: 'low' | 'medium' | 'high' | 'unknown';
+}
+
 export interface AgentRuntimeProfile {
   mode: AgentWorkspaceMode;
   cwd?: string;
@@ -12,6 +24,7 @@ export interface AgentRuntimeProfile {
   source?: 'client_auto' | 'client_declared' | 'server_inferred';
   detected_at?: number;
   notes?: string;
+  model?: AgentModelProfile;
 }
 
 export interface Agent {
@@ -115,6 +128,20 @@ export interface ActivityLogEntry {
   created_at: number;
 }
 
+export type StreamEventName = 'messages' | 'tasks' | 'context' | 'activity' | 'artifacts' | 'consensus';
+
+export interface StreamEvent {
+  id: number;
+  stream: StreamEventName;
+  op: string;
+  entity_id: string;
+  agent_id: string | null;
+  target_agent_id: string | null;
+  namespace: string | null;
+  payload_json: string;
+  created_at: number;
+}
+
 export interface AgentQuality {
   agent_id: string;
   completed_count: number;
@@ -126,6 +153,7 @@ export interface IdempotencyRecord {
   agent_id: string;
   tool_name: string;
   idempotency_key: string;
+  request_hash: string | null;
   response_json: string;
   created_at: number;
 }

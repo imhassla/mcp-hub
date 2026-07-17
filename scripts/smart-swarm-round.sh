@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-ENDPOINT="${ENDPOINT:-http://localhost:3000/mcp}"
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:3000/mcp}"
 HEALTH_URL="${ENDPOINT%/mcp}/health"
 WORKERS="${WORKERS:-8}"
 WORKER_BACKEND="${WORKER_BACKEND:-mixed}" # claude | codex | mixed
@@ -10,7 +11,10 @@ OUT_DIR="${OUT_DIR:-/tmp/smart-swarm}"
 WORKER_TIMEOUT_SEC="${WORKER_TIMEOUT_SEC:-900}"
 ENABLE_NAMESPACE="${ENABLE_NAMESPACE:-auto}" # auto | true | false
 NAMESPACE="${NAMESPACE:-}"
+ENABLE_THREAD_FEED="${ENABLE_THREAD_FEED:-auto}" # auto | true | false
+THREAD_ID="${THREAD_ID:-}"
 USE_AUTH_TOKEN="${USE_AUTH_TOKEN:-auto}" # auto | true | false
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 SNAPSHOT_RESPONSE_MODE="${SNAPSHOT_RESPONSE_MODE:-auto}" # auto | tiny | nano
 MCP_HTTP_CONNECT_TIMEOUT_SEC="${MCP_HTTP_CONNECT_TIMEOUT_SEC:-3}"
 MCP_HTTP_TIMEOUT_SEC="${MCP_HTTP_TIMEOUT_SEC:-25}"
@@ -21,22 +25,25 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-}"
 CODEX_MODEL="${CODEX_MODEL:-}"
-SKIP_CLI_PREFLIGHT="${SKIP_CLI_PREFLIGHT:-0}" # 1 to skip local CLI MCP checks
-FORCE_WORKER_ENDPOINT_CONFIG="${FORCE_WORKER_ENDPOINT_CONFIG:-1}" # 1 to force workers to use ENDPOINT
+SKIP_CLI_PREFLIGHT="${SKIP_CLI_PREFLIGHT:-0}" # 1 to skip local CLI availability/auth checks
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MCP_CONFIG_FILE="${MCP_CONFIG_FILE:-$ROOT_DIR/.mcp.json}"
-WORKER_MCP_CONFIG_FILE="$MCP_CONFIG_FILE"
-CODEX_MCP_OVERRIDE="mcp_servers.agent-hub.url=\"$ENDPOINT\""
 
 mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR/bridge-tokens"
+chmod 700 "$OUT_DIR/bridge-tokens"
 
 if [ -z "$NAMESPACE" ]; then
-  NAMESPACE="SWARM-$(date +%s)"
+  NAMESPACE="SWARM-$(date +%s)-$$-$RANDOM"
+fi
+if ! [[ "$NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._:@-]{0,89}$ ]]; then
+  echo "NAMESPACE must be 1..90 safe identifier characters" >&2
+  exit 1
 fi
 
 EXPERIMENT_TAG="$NAMESPACE"
 ORCHESTRATOR_ID="orch-${EXPERIMENT_TAG}"
+ORCHESTRATOR_TOKEN_FILE="$OUT_DIR/bridge-tokens/${ORCHESTRATOR_ID}.token"
 TASK_PREFIX="[${EXPERIMENT_TAG}]"
 WORKER_PREFIX="sw-${EXPERIMENT_TAG}-"
 BACKEND_MODE_REQUESTED="$WORKER_BACKEND"
@@ -52,6 +59,10 @@ CODEX_UNAVAILABLE_REASON=''
 PREFLIGHT_EXECUTED=0
 SNAPSHOT_RESPONSE_MODE_EFFECTIVE='tiny'
 SNAPSHOT_NANO_SUPPORTED='false'
+THREAD_TOOLS_SUPPORTED='false'
+USE_THREAD_FEED=0
+THREAD_MESSAGE_COUNT=0
+THREAD_SNAPSHOT_BYTES=0
 
 require_cmd() {
   local bin="$1"
@@ -94,16 +105,10 @@ if ! validate_boolish "$SKIP_CLI_PREFLIGHT"; then
 fi
 SKIP_CLI_PREFLIGHT="$(normalize_boolish "$SKIP_CLI_PREFLIGHT")"
 
-if ! validate_boolish "$FORCE_WORKER_ENDPOINT_CONFIG"; then
-  echo "Invalid FORCE_WORKER_ENDPOINT_CONFIG=$FORCE_WORKER_ENDPOINT_CONFIG. Use 0|1|true|false." >&2
-  exit 1
-fi
-FORCE_WORKER_ENDPOINT_CONFIG="$(normalize_boolish "$FORCE_WORKER_ENDPOINT_CONFIG")"
-
 cli_preflight() {
   local need_claude=0
   local need_codex=0
-  local claude_list codex_list auth_status logged_in
+  local auth_status logged_in
 
   CLAUDE_AVAILABLE=1
   CODEX_AVAILABLE=1
@@ -118,18 +123,9 @@ cli_preflight() {
   fi
 
   if [ "$need_claude" -eq 1 ]; then
-    if [ ! -f "$WORKER_MCP_CONFIG_FILE" ]; then
+    if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
       CLAUDE_AVAILABLE=0
-      CLAUDE_UNAVAILABLE_REASON='missing_mcp_config'
-    elif ! jq -e '.mcpServers["agent-hub"].url | strings | length > 0' "$WORKER_MCP_CONFIG_FILE" >/dev/null 2>&1; then
-      CLAUDE_AVAILABLE=0
-      CLAUDE_UNAVAILABLE_REASON='invalid_mcp_config'
-    elif ! claude_list=$("$CLAUDE_BIN" --mcp-config "$WORKER_MCP_CONFIG_FILE" --strict-mcp-config mcp list 2>&1); then
-      CLAUDE_AVAILABLE=0
-      CLAUDE_UNAVAILABLE_REASON='mcp_preflight_failed'
-    elif ! printf '%s\n' "$claude_list" | grep -q 'agent-hub:'; then
-      CLAUDE_AVAILABLE=0
-      CLAUDE_UNAVAILABLE_REASON='agent_hub_not_listed'
+      CLAUDE_UNAVAILABLE_REASON='missing_binary'
     else
       auth_status=$("$CLAUDE_BIN" auth status 2>/dev/null || true)
       logged_in=$(printf '%s' "$auth_status" | jq -r '.loggedIn // false' 2>/dev/null || echo false)
@@ -141,12 +137,9 @@ cli_preflight() {
   fi
 
   if [ "$need_codex" -eq 1 ]; then
-    if ! codex_list=$("$CODEX_BIN" -c "$CODEX_MCP_OVERRIDE" mcp list 2>&1); then
+    if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
       CODEX_AVAILABLE=0
-      CODEX_UNAVAILABLE_REASON='mcp_preflight_failed'
-    elif ! printf '%s\n' "$codex_list" | grep -Eq '^[[:space:]]*agent-hub[[:space:]]'; then
-      CODEX_AVAILABLE=0
-      CODEX_UNAVAILABLE_REASON='agent_hub_not_listed'
+      CODEX_UNAVAILABLE_REASON='missing_binary'
     fi
   fi
 
@@ -284,12 +277,48 @@ mcp_close() {
   fi
 }
 
+payload_is_replay_safe() {
+  local payload="$1"
+  printf '%s' "$payload" | jq -e '
+    .method == "tools/list"
+    or .method == "notifications/initialized"
+    or (
+      .method == "tools/call"
+      and ((.params.name // "") as $name | (.params.arguments // {}) as $args | (
+        ((([
+          "attach_task_artifact", "claim_task", "create_artifact_download", "create_artifact_upload",
+          "create_task", "create_task_artifact_downloads", "delete_task", "poll_and_claim",
+          "release_task_claim", "renew_task_claim", "reply_thread", "send_blob_message",
+          "send_message", "share_artifact", "share_blob_context", "share_context",
+          "start_thread", "update_task", "write_memory"
+        ] | index($name)) != null) and ((($args.idempotency_key // "") | tostring | length) > 0))
+        or (
+          ($name | test("^(get_|read_|list_|search_|fetch_|suggest_)"))
+          and ($name != "read_messages" or $args.mark_read == false)
+          and ($name != "read_filter_feed" or $args.advance_cursor != true)
+          and ($name != "fetch_hub_refs" or $args.mark_messages_read != true)
+          and ($name != "get_task_handoff" or $args.include_downloads != true)
+        )
+        or ($name | test("^(hash_payload|pack_protocol_message|unpack_protocol_message|store_protocol_blob)$"))
+        or (
+          $name == "register_agent"
+          and ((($args.auth_token // "") | tostring | length) >= 32)
+        )
+      ))
+    )
+  ' >/dev/null 2>&1
+}
+
 curl_post_json() {
   local sid="$1"
   local payload="$2"
   local attempt=1
+  local max_attempts=1
   local response=''
-  while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
+  if payload_is_replay_safe "$payload"; then
+    max_attempts=$((MCP_HTTP_RETRIES + 1))
+  fi
+  while [ "$attempt" -le "$max_attempts" ]; do
     local -a args
     args=(
       -sS
@@ -302,14 +331,12 @@ curl_post_json() {
     if [ -n "$sid" ]; then
       args+=(-H "mcp-session-id: $sid")
     fi
-    args+=(--data "$payload")
-
-    if response=$(curl "${args[@]}"); then
+    if response=$(printf '%s' "$payload" | curl "${args[@]}" --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
 
-    if [ "$attempt" -le "$MCP_HTTP_RETRIES" ]; then
+    if [ "$attempt" -lt "$max_attempts" ]; then
       sleep "$MCP_HTTP_RETRY_DELAY_SEC"
     fi
     attempt=$((attempt + 1))
@@ -322,13 +349,13 @@ curl_init_post() {
   local attempt=1
   local response=''
   while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
-    if response=$(curl -i -sS \
+    if response=$(printf '%s' "$payload" | curl -i -sS \
       --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" \
       --max-time "$MCP_HTTP_TIMEOUT_SEC" \
       -X POST "$ENDPOINT" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
-      --data "$payload"); then
+      --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
@@ -455,7 +482,7 @@ with_auth_token() {
     printf '%s' "$args_json"
     return 0
   fi
-  printf '%s' "$args_json" | jq -c --arg token "$token" '. + {auth_token:$token}'
+  printf '%s' "$args_json" | AUTH_TOKEN_VALUE="$token" jq -c '. + {auth_token:env.AUTH_TOKEN_VALUE}'
 }
 
 mcp_tool_call_auth() {
@@ -537,9 +564,9 @@ timeout_wrap() {
 make_worker_prompt() {
   local worker_id="$1"
   local backend="$2"
-  local task_id="$3"
+  local _task_id="$3"
   local prompt_file="$4"
-  local auth_mode_hint="$5"
+  local _auth_mode_hint="$5"
   local namespace_line=''
 
   if [ "${USE_NAMESPACE:-0}" -eq 1 ]; then
@@ -548,77 +575,81 @@ make_worker_prompt() {
 
   cat > "$prompt_file" <<EOF
 You are $worker_id ($backend) participating in MCP protocol optimization experiment $EXPERIMENT_TAG.
-Use MCP server agent-hub only. Do not edit repository files and do not run shell commands.
+The bridge runner handles hub registration, task claim/release, context, message, auth, and evidence.
 
-Execution contract:
-1) register_agent with your id, onboarding_mode='none', lifecycle='ephemeral'.
-   Include runtime_profile auto-detected from your local working directory:
-   - mode: repo|isolated|unknown
-   - cwd, has_git, file_count, empty_dir, source='client_auto'
-2) Extract auth token from register response (.auth.token). Keep it in AUTH_TOKEN.
-3) claim_task for task_id=$task_id with lease_seconds=600 (include auth_token=AUTH_TOKEN).
-4) Produce one compact JSON proposal with exactly 3 hypotheses:
-   - token_economy
-   - latency
-   - accuracy
-   For each hypothesis include fields: idea, expected_kpi, validation.
-5) share_context key='proposal' with that JSON string (include auth_token=AUTH_TOKEN).
-6) send_blob_message to '$ORCHESTRATOR_ID' with the same JSON payload (include auth_token=AUTH_TOKEN).
-7) Capture context/message ids from steps 5-6 and release_task_claim as done with confidence >= 0.90, verification_passed=true, evidence_refs=["context_id:<id>","message_id:<id>"] (include auth_token=AUTH_TOKEN).
+Produce one compact JSON proposal with exactly 3 hypotheses and these top-level completion fields:
+- verification_passed: true only after validating the JSON shape and required categories
+- confidence: number from 0 to 1
+- verification: {"passed":true,"checks":["three required hypothesis categories present"]}
+
+Required hypotheses:
+- token_economy
+- latency
+- accuracy
+For each hypothesis include fields: idea, expected_kpi, validation.
 
 Constraints:
-- Use idempotency_key on all mutating calls.
 $namespace_line
-- Current server auth_mode is '$auth_mode_hint'. In warn/enforce modes, always pass auth_token after register_agent.
 - Keep payload under 1200 chars.
-- If a call fails, retry once with same idempotency_key.
-- Final assistant text response must be one line summary only.
+- Return only the JSON object, no markdown.
 EOF
 }
 
 execute_worker_backend() {
   local backend="$1"
-  local prompt="$2"
+  local prompt_file="$2"
   local log_file="$3"
+  local worker_id="${4:-}"
+  local task_id="${5:-0}"
+  local failure_status="${6:-blocked}"
   local exit_code
 
   set +e
-  if [ "$backend" = 'claude' ]; then
-    if [ -n "$CLAUDE_MODEL" ]; then
-      timeout_wrap "$WORKER_TIMEOUT_SEC" "$CLAUDE_BIN" -p \
-        --permission-mode bypassPermissions \
-        --mcp-config "$WORKER_MCP_CONFIG_FILE" \
-        --strict-mcp-config \
-        --model "$CLAUDE_MODEL" \
-        "$prompt" >"$log_file" 2>&1
-    else
-      timeout_wrap "$WORKER_TIMEOUT_SEC" "$CLAUDE_BIN" -p \
-        --permission-mode bypassPermissions \
-        --mcp-config "$WORKER_MCP_CONFIG_FILE" \
-        --strict-mcp-config \
-        "$prompt" >"$log_file" 2>&1
-    fi
-    exit_code=$?
-  else
-    if [ -n "$CODEX_MODEL" ]; then
-      timeout_wrap "$WORKER_TIMEOUT_SEC" "$CODEX_BIN" -c "$CODEX_MCP_OVERRIDE" exec \
-        --full-auto \
-        --skip-git-repo-check \
-        --sandbox workspace-write \
-        --model "$CODEX_MODEL" \
-        "$prompt" >"$log_file" 2>&1
-    else
-      timeout_wrap "$WORKER_TIMEOUT_SEC" "$CODEX_BIN" -c "$CODEX_MCP_OVERRIDE" exec \
-        --full-auto \
-        --skip-git-repo-check \
-        --sandbox workspace-write \
-        "$prompt" >"$log_file" 2>&1
-    fi
-    exit_code=$?
+  local bridge_timeout_ms=$((WORKER_TIMEOUT_SEC * 1000 - 5000))
+  if [ "$bridge_timeout_ms" -lt 1000 ]; then
+    bridge_timeout_ms=1000
   fi
+  local -a bridge_args
+  bridge_args=(
+    --endpoint "$ENDPOINT" \
+    --backend "$backend" \
+    --agent-id "$worker_id" \
+    --namespace "$NAMESPACE" \
+    --key "worker-${worker_id}" \
+    --task-id "$task_id" \
+    --agent-token-file "$OUT_DIR/bridge-tokens/${worker_id}.token" \
+    --failure-status "$failure_status" \
+    --memory-namespace "$NAMESPACE" \
+    --remember-key "worker-${worker_id}-proposal" \
+    --remember-tags "smart-swarm,$backend,$EXPERIMENT_TAG" \
+    --timeout-ms "$bridge_timeout_ms" \
+    --expect-json \
+    --out-dir "$OUT_DIR/bridge-reports"
+  )
+  if [ "$USE_THREAD_FEED" -eq 1 ]; then
+    bridge_args+=(--thread-id "$THREAD_ID" --thread-role "worker-result" --no-message)
+  fi
+  (
+    export BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN"
+    timeout_wrap "$WORKER_TIMEOUT_SEC" node "$ROOT_DIR/scripts/bridge-agent-runner.mjs" "${bridge_args[@]}"
+  ) <"$prompt_file" >"$log_file" 2>&1
+  exit_code=$?
   set -e
 
   printf '%s' "$exit_code"
+}
+
+detect_worker_contract_failure() {
+  local log_file="$1"
+  if [ ! -s "$log_file" ]; then
+    printf 'empty_output'
+    return
+  fi
+  if grep -Eiq 'user cancelled MCP tool call|Could not (proceed|complete)|register_agent.*cancelled|no auth token was issued|MCP tool call.*failed' "$log_file"; then
+    printf 'contract_not_completed'
+    return
+  fi
+  printf ''
 }
 
 run_single_worker() {
@@ -628,16 +659,20 @@ run_single_worker() {
   local log_file="$4"
   local prompt_file="$5"
   local result_file="$6"
-  local started ended exit_code prompt
+  local started ended exit_code
   local log_bytes=0
   local effective_backend="$backend"
   local fallback_used=0
   local fallback_reason=''
+  local contract_failure_reason=''
+  local bridge_summary='null'
 
   started=$(now_ms)
-  prompt=$(cat "$prompt_file")
-
-  exit_code=$(execute_worker_backend "$backend" "$prompt" "$log_file")
+  local first_failure_status='blocked'
+  if [ "$backend" = 'claude' ] && [ "$ALLOW_BACKEND_FALLBACK" = "1" ] && [ "$CODEX_AVAILABLE" -eq 1 ]; then
+    first_failure_status='pending'
+  fi
+  exit_code=$(execute_worker_backend "$backend" "$prompt_file" "$log_file" "$worker_id" "$task_id" "$first_failure_status")
   if [ -f "$log_file" ]; then
     log_bytes=$(wc -c < "$log_file" | tr -d ' ')
   fi
@@ -650,7 +685,7 @@ run_single_worker() {
     else
       fallback_reason='claude_empty_output'
     fi
-    exit_code=$(execute_worker_backend 'codex' "$prompt" "$log_file")
+    exit_code=$(execute_worker_backend 'codex' "$prompt_file" "$log_file" "$worker_id" "$task_id" 'blocked')
     if [ -f "$log_file" ]; then
       log_bytes=$(wc -c < "$log_file" | tr -d ' ')
     else
@@ -659,13 +694,24 @@ run_single_worker() {
   fi
 
   ended=$(now_ms)
+  contract_failure_reason="$(detect_worker_contract_failure "$log_file")"
+  if [ -s "$log_file" ]; then
+    bridge_summary=$(awk '/^\{.*\}$/{line=$0} END{print line}' "$log_file")
+    if [ -z "$bridge_summary" ] || ! printf '%s' "$bridge_summary" | jq -e . >/dev/null 2>&1; then
+      bridge_summary='null'
+    fi
+  fi
   jq -cn \
     --arg worker_id "$worker_id" \
     --arg requested_backend "$backend" \
     --arg backend "$effective_backend" \
+    --arg worker_transport "bridge" \
     --arg log_file "$log_file" \
     --arg fallback_reason "$fallback_reason" \
+    --arg contract_failure_reason "$contract_failure_reason" \
     --argjson fallback_used "$( [ "$fallback_used" -eq 1 ] && echo true || echo false )" \
+    --argjson contract_failed "$( [ -n "$contract_failure_reason" ] && echo true || echo false )" \
+    --argjson bridge "$bridge_summary" \
     --argjson task_id "$task_id" \
     --argjson exit_code "$exit_code" \
     --argjson log_bytes "$log_bytes" \
@@ -674,11 +720,15 @@ run_single_worker() {
       worker_id:$worker_id,
       requested_backend:$requested_backend,
       backend:$backend,
+      worker_transport:$worker_transport,
       task_id:$task_id,
       exit_code:$exit_code,
-      ok:(($exit_code == 0) and ($log_bytes > 0)),
+      ok:(if $bridge != null then (($bridge.ok == true) and ($contract_failed | not)) else (($exit_code == 0) and ($log_bytes > 0) and ($contract_failed | not)) end),
       fallback_used:$fallback_used,
       fallback_reason:(if $fallback_used then $fallback_reason else null end),
+      contract_failed:$contract_failed,
+      contract_failure_reason:(if $contract_failed then $contract_failure_reason else null end),
+      bridge:$bridge,
       log_bytes:$log_bytes,
       duration_ms:$duration_ms,
       log_file:$log_file
@@ -694,17 +744,6 @@ if [ "$WORKER_BACKEND" != "claude" ]; then
   require_cmd "$CODEX_BIN"
 fi
 
-if [ "$FORCE_WORKER_ENDPOINT_CONFIG" = "1" ]; then
-  WORKER_MCP_CONFIG_FILE="$OUT_DIR/mcp-workers.json"
-  jq -cn --arg endpoint "$ENDPOINT" '{
-    mcpServers: {
-      "agent-hub": {
-        url: $endpoint
-      }
-    }
-  }' > "$WORKER_MCP_CONFIG_FILE"
-fi
-
 case "$USE_AUTH_TOKEN" in
   auto|true|false) ;;
   *)
@@ -717,6 +756,14 @@ case "$SNAPSHOT_RESPONSE_MODE" in
   auto|tiny|nano) ;;
   *)
     echo "Invalid SNAPSHOT_RESPONSE_MODE=$SNAPSHOT_RESPONSE_MODE. Use auto|tiny|nano." >&2
+    exit 1
+    ;;
+esac
+
+case "$ENABLE_THREAD_FEED" in
+  auto|true|false) ;;
+  *)
+    echo "Invalid ENABLE_THREAD_FEED=$ENABLE_THREAD_FEED. Use auto|true|false." >&2
     exit 1
     ;;
 esac
@@ -747,6 +794,12 @@ SNAPSHOT_NANO_SUPPORTED=$(printf '%s' "$TOOLS_JSON" | jq -r '
 ')
 SNAPSHOT_BATCH_SUPPORTED=$(printf '%s' "$TOOLS_JSON" | jq -r '
   [(.result.tools[]?.name)] | index("read_snapshot") != null
+')
+THREAD_TOOLS_SUPPORTED=$(printf '%s' "$TOOLS_JSON" | jq -r '
+  [(.result.tools[]?.name)] as $names
+  | (($names | index("start_thread")) != null)
+    and (($names | index("reply_thread")) != null)
+    and (($names | index("read_thread")) != null)
 ')
 SNAPSHOT_BATCH_USED=0
 case "$SNAPSHOT_RESPONSE_MODE" in
@@ -793,14 +846,62 @@ case "$ENABLE_NAMESPACE" in
     ;;
 esac
 
-mcp_tool_call "$SESSION_ID" register_agent "$(jq -cn --arg id "$ORCHESTRATOR_ID" --arg n "Smart Swarm Orchestrator" '{id:$id,name:$n,type:"codex",capabilities:"orchestration,experiment",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+case "$ENABLE_THREAD_FEED" in
+  auto)
+    if [ "$THREAD_TOOLS_SUPPORTED" = "true" ]; then
+      USE_THREAD_FEED=1
+    fi
+    ;;
+  true)
+    if [ "$THREAD_TOOLS_SUPPORTED" != "true" ]; then
+      echo "ENABLE_THREAD_FEED=true requested, but server does not advertise thread tools." >&2
+      exit 1
+    fi
+    USE_THREAD_FEED=1
+    ;;
+  false)
+    USE_THREAD_FEED=0
+    ;;
+esac
+
+ORCHESTRATOR_AUTH_TOKEN="$(
+  BRIDGE_RUNTIME="$ROOT_DIR/scripts/lib/bridge-runtime.mjs" \
+  TOKEN_FILE="$ORCHESTRATOR_TOKEN_FILE" \
+  node --input-type=module -e '
+    import { randomUUID } from "node:crypto";
+    import { pathToFileURL } from "node:url";
+    const { getOrCreateAgentToken } = await import(pathToFileURL(process.env.BRIDGE_RUNTIME).href);
+    process.stdout.write(await getOrCreateAgentToken(process.env.TOKEN_FILE, `${randomUUID()}-${randomUUID()}`));
+  '
+)"
+if [ "${#ORCHESTRATOR_AUTH_TOKEN}" -lt 32 ]; then
+  echo "invalid orchestrator credential in $ORCHESTRATOR_TOKEN_FILE" >&2
+  exit 1
+fi
+
+mcp_tool_call "$SESSION_ID" register_agent "$(REGISTER_TOKEN="$REGISTER_TOKEN" AGENT_AUTH_TOKEN="$ORCHESTRATOR_AUTH_TOKEN" jq -cn --arg id "$ORCHESTRATOR_ID" --arg n "Smart Swarm Orchestrator" '{id:$id,name:$n,type:"codex",capabilities:"orchestration,experiment",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"},auth_token:env.AGENT_AUTH_TOKEN} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
 assert_success "$TOOL_RESULT" "register_orchestrator"
 ORCHESTRATOR_AUTH_TOKEN=$(printf '%s' "$TOOL_RESULT" | jq -r '.auth.token // empty')
-if [ "$USE_AUTH_TOKEN" = "true" ] && [ -z "$ORCHESTRATOR_AUTH_TOKEN" ]; then
-  echo "orchestrator auth token missing in USE_AUTH_TOKEN=true mode" >&2
+if [ -z "$ORCHESTRATOR_AUTH_TOKEN" ]; then
+  echo "register_agent did not return orchestrator auth token" >&2
   exit 1
 fi
 AUTH_MODE_HINT=$(curl -sS --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" --max-time "$MCP_HTTP_TIMEOUT_SEC" "$HEALTH_URL" 2>/dev/null | jq -r '.auth_mode // "unknown"' 2>/dev/null || echo "unknown")
+
+if [ "$USE_THREAD_FEED" -eq 1 ]; then
+  if [ -z "$THREAD_ID" ]; then
+    THREAD_ID="thread-${EXPERIMENT_TAG}"
+  fi
+  thread_args=$(jq -cn \
+    --arg from "$ORCHESTRATOR_ID" \
+    --arg thread "$THREAD_ID" \
+    --arg title "Smart swarm $EXPERIMENT_TAG" \
+    --arg content "Bridge worker results for $EXPERIMENT_TAG" \
+    --arg idem "$ORCHESTRATOR_ID:thread:$THREAD_ID:start" \
+    '{from_agent:$from,thread_id:$thread,title:$title,content:$content,idempotency_key:$idem}')
+  mcp_tool_call_auth "$SESSION_ID" start_thread "$thread_args" "$ORCHESTRATOR_AUTH_TOKEN"
+  assert_success "$TOOL_RESULT" "start_thread"
+fi
 
 declare -a WORKER_IDS
 declare -a WORKER_BACKENDS
@@ -862,6 +963,17 @@ done
 for pid in "${PIDS[@]}"; do
   wait "$pid"
 done
+
+if [ "$USE_THREAD_FEED" -eq 1 ]; then
+  thread_read_args=$(jq -cn \
+    --arg aid "$ORCHESTRATOR_ID" \
+    --arg thread "$THREAD_ID" \
+    '{agent_id:$aid,thread_id:$thread,response_mode:"tiny"}')
+  mcp_tool_call_auth "$SESSION_ID" read_thread "$thread_read_args" "$ORCHESTRATOR_AUTH_TOKEN"
+  assert_success "$TOOL_RESULT" "read_thread"
+  THREAD_SNAPSHOT_BYTES=$(printf '%s' "$TOOL_RESULT" | wc -c | tr -d ' ')
+  THREAD_MESSAGE_COUNT=$(printf '%s' "$TOOL_RESULT" | jq -r '.count // (.m | length) // 0')
+fi
 
 if [ "$SNAPSHOT_BATCH_SUPPORTED" = "true" ]; then
   SNAPSHOT_BATCH_USED=1
@@ -1002,6 +1114,7 @@ jq -cn \
   --arg orchestrator "$ORCHESTRATOR_ID" \
   --arg backend_mode_requested "$BACKEND_MODE_REQUESTED" \
   --arg backend_mode_effective "$WORKER_BACKEND" \
+  --arg worker_transport "bridge" \
   --arg snapshot_mode_requested "$SNAPSHOT_RESPONSE_MODE" \
   --arg snapshot_mode_effective "$SNAPSHOT_RESPONSE_MODE_EFFECTIVE" \
   --argjson workers "$WORKERS" \
@@ -1016,6 +1129,9 @@ jq -cn \
   --argjson namespace_supported "$( [ "$NAMESPACE_SUPPORTED" = "true" ] && echo true || echo false )" \
   --argjson namespace_used "$( [ "$USE_NAMESPACE" -eq 1 ] && echo true || echo false )" \
   --arg namespace "$NAMESPACE" \
+  --argjson thread_tools_supported "$( [ "$THREAD_TOOLS_SUPPORTED" = "true" ] && echo true || echo false )" \
+  --argjson thread_feed_used "$( [ "$USE_THREAD_FEED" -eq 1 ] && echo true || echo false )" \
+  --arg thread_id "$THREAD_ID" \
   --arg auth_token_mode "$USE_AUTH_TOKEN" \
   --arg auth_mode_hint "$AUTH_MODE_HINT" \
   --argjson orchestrator_token_present "$( [ -n "$ORCHESTRATOR_AUTH_TOKEN" ] && echo true || echo false )" \
@@ -1028,6 +1144,8 @@ jq -cn \
   --argjson inbox_chars "$INBOX_CHARS" \
   --argjson context_count "$CTX_COUNT" \
   --argjson context_chars "$CTX_CHARS" \
+  --argjson thread_message_count "$THREAD_MESSAGE_COUNT" \
+  --argjson thread_snapshot_bytes "$THREAD_SNAPSHOT_BYTES" \
   --argjson snapshot_list_tasks_bytes "$TASK_SNAPSHOT_BYTES" \
   --argjson snapshot_read_messages_bytes "$INBOX_SNAPSHOT_BYTES" \
   --argjson snapshot_get_context_bytes "$CTX_SNAPSHOT_BYTES" \
@@ -1040,6 +1158,7 @@ jq -cn \
     backend_mode: $backend_mode_effective,
     backend_mode_requested: $backend_mode_requested,
     backend_mode_effective: $backend_mode_effective,
+    worker_transport: $worker_transport,
     snapshots: {
       mode_requested: $snapshot_mode_requested,
       mode_effective: $snapshot_mode_effective,
@@ -1070,6 +1189,13 @@ jq -cn \
       supported: $namespace_supported,
       used: $namespace_used,
       value: $namespace
+    },
+    thread_feed: {
+      supported: $thread_tools_supported,
+      used: $thread_feed_used,
+      thread_id: (if $thread_feed_used then $thread_id else null end),
+      message_count: $thread_message_count,
+      snapshot_bytes: $thread_snapshot_bytes
     },
     auth: {
       token_mode: $auth_token_mode,
@@ -1106,4 +1232,4 @@ jq -cn \
 printf 'Smart swarm round finished.\n'
 printf 'Experiment: %s\n' "$EXPERIMENT_TAG"
 printf 'Report: %s\n' "$REPORT_FILE"
-jq '.auth, .snapshots, .backend_health, .backend_runtime_health, .kpi, .workers_result, .namespace' "$REPORT_FILE"
+jq '.auth, .snapshots, .backend_health, .backend_runtime_health, .kpi, .workers_result, .namespace, .thread_feed' "$REPORT_FILE"

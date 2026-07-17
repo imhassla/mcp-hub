@@ -1,5 +1,5 @@
-import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, updateAgentRuntimeProfile } from '../db.js';
-import type { AgentLifecycle, AgentRuntimeProfile, AgentWorkspaceMode } from '../types.js';
+import { registerAgent, getAgentById, listAgents, heartbeat, logActivity, hasAgentToken, isAgentIdRetired, clearAgentIdRetirement, validateAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
+import type { Agent, AgentLifecycle, AgentModelProfile, AgentRuntimeProfile, AgentWorkspaceMode, TaskExecutionMode } from '../types.js';
 
 type OnboardingMode = 'full' | 'compact' | 'none';
 type AgentRole = 'orchestrator' | 'reviewer' | 'assistant' | 'worker';
@@ -19,7 +19,7 @@ interface NegotiatedContract {
   preferred_read_mode: 'nano' | 'tiny' | 'compact';
   wait_for_updates_mode: 'nano' | 'micro';
   blob_handoff_mode: 'hash_ref' | 'inline_compact';
-  push_transport: PushTransport;
+  push_transport: 'wait_for_updates' | 'sse_events' | null;
 }
 
 const MAX_MESSAGE_CONTENT_CHARS = Number(process.env.MCP_HUB_MAX_MESSAGE_CONTENT_CHARS || 1024);
@@ -92,9 +92,11 @@ function negotiateContract(client: ClientCapabilities): NegotiatedContract {
   const preferredReadMode: 'nano' | 'tiny' | 'compact' = supportsNano
     ? 'nano'
     : (supportsTiny ? 'tiny' : 'compact');
-  const pushTransport: PushTransport = client.push_transports.includes('sse_events')
+  const serverPushTransports = buildServerCapabilities().push_transports;
+  const commonPushTransports = client.push_transports.filter((transport) => serverPushTransports.includes(transport));
+  const pushTransport: NegotiatedContract['push_transport'] = commonPushTransports.includes('sse_events')
     ? 'sse_events'
-    : (client.push_transports.includes('websocket') ? 'websocket' : 'wait_for_updates');
+    : (commonPushTransports.includes('wait_for_updates') ? 'wait_for_updates' : null);
   return {
     snapshot_tool: client.snapshot_reads ? 'read_snapshot' : 'manual_reads',
     preferred_read_mode: preferredReadMode,
@@ -110,17 +112,37 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'register_agent', purpose: 'Register and receive protocol onboarding' },
       { name: 'update_runtime_profile', purpose: 'Update runtime profile (repo/isolated/unknown) after registration' },
       { name: 'list_agents', purpose: 'View online/offline agent roster' },
+      { name: 'suggest_agents', purpose: 'Rank agents by model profile, runtime compatibility, online status, and quality metrics' },
       { name: 'get_onboarding', purpose: 'Re-fetch protocol guide and capabilities' },
     ],
     messaging: [
       { name: 'send_message', purpose: 'Direct/broadcast messaging with compression and idempotency' },
       { name: 'send_blob_message', purpose: 'Store payload as blob and send compact hash-reference message (use compression_mode=lossless_auto for strict round-trip)' },
       { name: 'read_messages', purpose: 'Read inbox with full/compact/tiny/nano response modes' },
+      { name: 'start_thread', purpose: 'Start a trace-backed discussion thread for multi-agent topic work' },
+      { name: 'reply_thread', purpose: 'Reply to a discussion thread with role metadata' },
+      { name: 'read_thread', purpose: 'Read visible thread messages without marking inbox messages read' },
+    ],
+    discovery: [
+      { name: 'search_hub', purpose: 'Text search across hub state; message/artifact visibility is enforced' },
+      { name: 'fetch_hub_refs', purpose: 'Selectively hydrate refs from search/deltas; message/artifact visibility is enforced and messages are not implicitly read' },
+      { name: 'save_filter', purpose: 'Persist reusable search/event-delta filters with optional cursor' },
+      { name: 'list_filters', purpose: 'List saved filters owned by the agent' },
+      { name: 'read_filter_feed', purpose: 'Read saved search/delta filter feed and optionally advance cursor' },
+      { name: 'delete_filter', purpose: 'Delete saved filters' },
+      { name: 'read_signal_feed', purpose: 'Read high-signal inbox refs without marking messages read' },
+      { name: 'ack_feed_items', purpose: 'Acknowledge signal refs; optionally mark message refs read' },
+      { name: 'get_hub_digest', purpose: 'Fetch a bounded cross-source summary for low-token status loops' },
+      { name: 'write_memory', purpose: 'Store durable shared memory facts/decisions/preferences in context-backed memory' },
+      { name: 'search_memory', purpose: 'Search shared memory with compact/tiny/nano low-token output' },
+      { name: 'get_memory_digest', purpose: 'Fetch highest-importance recent shared memory for startup/context refresh' },
+      { name: 'get_trace_timeline', purpose: 'Debug cross-agent handoffs by trace_id across visible hub state' },
     ],
     tasks: [
       { name: 'create_task', purpose: 'Create tasks with optional dependencies and idempotency' },
       { name: 'update_task', purpose: 'Update task fields with done-gate confidence + evidence checks' },
       { name: 'list_tasks', purpose: 'List tasks with ready_only and compact/tiny/nano output' },
+      { name: 'suggest_task_agents', purpose: 'Rank candidate agents for an existing task before explicit assignment' },
       { name: 'poll_and_claim', purpose: 'Claim next dependency-ready task with adaptive backoff' },
       { name: 'claim_task', purpose: 'Claim specific task with lease semantics' },
       { name: 'renew_task_claim', purpose: 'Renew task lease (stale-write guarded)' },
@@ -146,9 +168,9 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'pack_protocol_message', purpose: 'Pack payload into compact CAEP-v1 packet with hash' },
       { name: 'unpack_protocol_message', purpose: 'Unpack CAEP-v1 packet and validate hash' },
       { name: 'hash_payload', purpose: 'Generate deterministic payload digest for references/dedup' },
-      { name: 'store_protocol_blob', purpose: 'Store deduplicated payload blob by hash for reference exchange' },
-      { name: 'get_protocol_blob', purpose: 'Resolve hash reference and fetch blob payload' },
-      { name: 'list_protocol_blobs', purpose: 'Inspect recent protocol blobs and access counters' },
+      { name: 'store_protocol_blob', purpose: 'Store a private-by-default blob with explicit public/agent grants' },
+      { name: 'get_protocol_blob', purpose: 'Resolve an accessible hash reference and fetch its payload' },
+      { name: 'list_protocol_blobs', purpose: 'Inspect blobs visible to the current agent and access counters' },
     ],
     artifacts: [
       { name: 'create_artifact_upload', purpose: 'Issue one-time upload ticket for binary artifact transfer without token-heavy MCP payloads' },
@@ -163,6 +185,7 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'get_transport_snapshot', purpose: 'Read lightweight wait/poll transport efficiency metrics over selectable window' },
       { name: 'wait_for_updates', purpose: 'Long-poll for updates to reduce busy polling loops' },
       { name: 'read_snapshot', purpose: 'Read tasks+messages+context in one cursorized call for polling loops' },
+      { name: 'read_event_deltas', purpose: 'Read exact stream_events refs after an event cursor for selective hydration flows' },
       { name: 'evaluate_slo_alerts', purpose: 'Evaluate pending-age / claim-churn / stale in-progress SLO rules' },
       { name: 'list_slo_alerts', purpose: 'Inspect open/resolved SLO alerts with pagination' },
       { name: 'get_auth_coverage', purpose: 'Inspect auth rollout coverage by window and tool' },
@@ -196,6 +219,8 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
         'release_task_claim', 'send_message', 'send_blob_message', 'share_context', 'share_blob_context',
       ],
       recommendation: 'Use idempotency_key for all retryable mutating calls',
+      max_key_chars: 256,
+      payload_rule: 'A key can only be replayed with the same semantic arguments; changed arguments return IDEMPOTENCY_KEY_CONFLICT',
     },
     hash_blob_exchange: {
       recommendation: 'Prefer send_blob_message/share_blob_context with compression_mode=lossless_auto for strict no-loss hash-ref exchange',
@@ -204,8 +229,9 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       recommendation: 'Use create_task.namespace + poll_and_claim.namespace to isolate concurrent experiments/swarm rounds',
     },
     pagination: {
-      recommendation: 'Use delta reads with cursor/since_ts + polling=true (or fallback limit+offset) to avoid repeated full scans',
-      delta_tools: ['read_messages', 'list_tasks'],
+      recommendation: 'Use search_hub for discovery, then selective list/read/handoff tools for exact payloads; use delta cursors for polling loops',
+      delta_tools: ['read_messages', 'list_tasks', 'get_context'],
+      search_tool: 'search_hub',
     },
     event_driven: {
       recommendation: 'Use wait_for_updates(streams=["messages","tasks"], cursor=<prev_cursor>, response_mode=nano) before read_messages/list_tasks to cut empty-poll token usage; respect r (nano alias of retry_after_ms, adaptive by default)',
@@ -217,13 +243,32 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       },
     },
     push_transport: {
-      recommendation: 'For high-load swarms use SSE push channel GET /events?agent_id=...&auth_token=...&streams=messages,tasks&response_mode=nano to reduce long-poll churn.',
+      recommendation: 'For high-load swarms use SSE push channel GET /events?agent_id=...&streams=messages,tasks&response_mode=nano with Authorization: Bearer <auth.token> to reduce long-poll churn.',
       endpoint: '/events',
       modes: ['compact', 'nano'],
     },
     batch_snapshot: {
-      recommendation: 'Use read_snapshot in polling loops to fetch tasks+messages+context with one cursor and one transport round-trip.',
-      cursor_shape: '<message>.<task>.<context>.<activity> (base36)',
+      recommendation: 'Use read_snapshot for compact current state; use read_event_deltas for exact changed refs before selective fetch/handoff.',
+      cursor_shape: 'e:<stream_event_id_base36>',
+      exact_delta_tool: 'read_event_deltas',
+    },
+    signal_feed: {
+      recommendation: 'Use read_signal_feed for high-signal inbox loops (unread messages, assigned/high-priority tasks, ready artifacts, open SLO alerts), then ack_feed_items after handling refs. It does not auto-read messages.',
+      ack_tool: 'ack_feed_items',
+    },
+    digest: {
+      recommendation: 'Use get_hub_digest for periodic low-token state summaries across signals, event deltas, assigned tasks, context, shared memory, activity, artifacts, and open SLOs.',
+      default_limit_per_source: 5,
+    },
+    shared_memory: {
+      recommendation: 'Use write_memory for durable cross-agent facts and decisions; use get_memory_digest at startup and search_memory before re-solving known problems.',
+      default_namespace: 'memory',
+      key_shape: 'memory:<normalized-key> stored in context rows',
+      response_modes: ['compact', 'tiny', 'nano'],
+    },
+    discussion_threads: {
+      recommendation: 'Use start_thread/reply_thread/read_thread for topic discussions; threads are backed by messages with trace_id=thread_id, so search_hub and get_trace_timeline remain compatible.',
+      response_modes: ['compact', 'tiny', 'nano'],
     },
     capability_negotiation: {
       recommendation: 'Send register_agent.client_capabilities so server can negotiate preferred read mode, snapshot strategy, and push transport.',
@@ -427,7 +472,7 @@ function buildRuntimeGuidance(runtimeProfile: AgentRuntimeProfile) {
   if (runtimeProfile.mode === 'repo') {
     return {
       mode: 'repo',
-      strategy: 'direct_repo_execution',
+      strategy: 'repo_workspace_execution',
       recommendations: [
         'Claim tasks requiring execution_mode=repo or any',
         'Use get_task_handoff(response_mode=tiny) for fast dependency/evidence scan',
@@ -478,6 +523,9 @@ function parseRuntimeProfileJson(raw: string | undefined): AgentRuntimeProfile {
   if (!raw) return { mode: 'unknown', source: 'server_inferred' };
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const model = parsed.model && typeof parsed.model === 'object'
+      ? parsed.model as AgentRuntimeProfile['model']
+      : undefined;
     return {
       mode: normalizeWorkspaceMode(typeof parsed.mode === 'string' ? parsed.mode : undefined),
       cwd: typeof parsed.cwd === 'string' ? parsed.cwd : undefined,
@@ -487,6 +535,7 @@ function parseRuntimeProfileJson(raw: string | undefined): AgentRuntimeProfile {
       source: typeof parsed.source === 'string' ? parsed.source as AgentRuntimeProfile['source'] : 'server_inferred',
       detected_at: Number.isFinite(parsed.detected_at) ? Number(parsed.detected_at) : undefined,
       notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
+      model,
     };
   } catch {
     return { mode: 'unknown', source: 'server_inferred' };
@@ -509,18 +558,87 @@ export function handleRegisterAgent(args: {
   lifecycle?: AgentLifecycle;
   runtime_profile?: AgentRuntimeProfile;
   role?: AgentRole;
+  auth_token?: string;
+  register_token?: string;
+  registration_token?: string;
+  allow_legacy_claim?: boolean;
 }) {
-  const lifecycle = normalizeLifecycle(args.lifecycle);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,119}$/.test(args.id)) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_INVALID',
+      error: 'Agent id must be 1..120 safe characters and cannot use reserved wildcard values',
+    };
+  }
+  const requestedLifecycle = normalizeLifecycle(args.lifecycle);
   const role = normalizeRole(args.role);
-  const registrationResult = registerAgent({
-    id: args.id,
-    name: args.name,
-    type: args.type,
-    capabilities: args.capabilities || '',
-    lifecycle,
-    runtime_profile: args.runtime_profile,
-  });
+  const existingAgent = getAgentById(args.id);
+  const credentialExists = hasAgentToken(args.id);
+  const retiredIdentity = isAgentIdRetired(args.id);
+  const suppliedAuthToken = typeof args.auth_token === 'string' ? args.auth_token.trim() : '';
+  const newIdentity = !existingAgent && !credentialExists && !retiredIdentity;
+  if (newIdentity && suppliedAuthToken && (suppliedAuthToken.length < 32 || suppliedAuthToken.length > 512)) {
+    return {
+      success: false,
+      error_code: 'INITIAL_AUTH_TOKEN_INVALID',
+      error: 'A client-provided initial auth_token must contain 32..512 characters',
+    };
+  }
+  const ownershipProven = Boolean(
+    credentialExists
+      && suppliedAuthToken.length > 0
+      && validateAgentToken(args.id, suppliedAuthToken)
+  );
+  if (!existingAgent && retiredIdentity && !ownershipProven) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_RETIRED',
+      error: 'This retired agent id cannot be reused without its existing credential',
+      auth: { token: null, proof_required: credentialExists },
+    };
+  }
+  if (!existingAgent && credentialExists && !ownershipProven) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_RESERVED',
+      error: 'This retired agent id is reserved. Provide its existing auth_token to restore it.',
+      auth: { token: null, proof_required: true },
+    };
+  }
+  const legacyClaim = Boolean(existingAgent && !credentialExists && args.allow_legacy_claim === true);
+  // Existing identities are immutable until the caller proves ownership. Keep the historical
+  // no-token re-register response shape, but treat it as a read-only compatibility path.
+  const updateApplied = newIdentity || ownershipProven || legacyClaim;
+  let registrationResult: ReturnType<typeof registerAgent>;
+  try {
+    registrationResult = updateApplied
+      ? registerAgent({
+        id: args.id,
+        // A pre-token legacy row can be claimed once, but the unauthenticated migration request
+        // must not rewrite its identity metadata while obtaining the first token.
+        name: legacyClaim ? existingAgent!.name : args.name,
+        type: legacyClaim ? existingAgent!.type : args.type,
+        capabilities: legacyClaim ? existingAgent!.capabilities : (args.capabilities || ''),
+        lifecycle: legacyClaim ? normalizeLifecycle(existingAgent!.lifecycle) : requestedLifecycle,
+        runtime_profile: legacyClaim
+          ? parseRuntimeProfileJson(existingAgent!.runtime_profile_json)
+          : args.runtime_profile,
+        initial_auth_token: newIdentity && suppliedAuthToken ? suppliedAuthToken : undefined,
+      })
+      : { agent: existingAgent!, is_new: false, issued_token: null };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: agent_tokens.token')) {
+      return {
+        success: false,
+        error_code: 'INITIAL_AUTH_TOKEN_CONFLICT',
+        error: 'The client-provided auth_token is already bound to another agent id',
+      };
+    }
+    throw error;
+  }
+  if (retiredIdentity && ownershipProven) clearAgentIdRetirement(args.id);
   const agent = registrationResult.agent;
+  const lifecycle = normalizeLifecycle(agent.lifecycle);
   const inferredOnboardingMode: OnboardingMode = registrationResult.is_new
     ? (lifecycle === 'ephemeral' ? DEFAULT_EPHEMERAL_ONBOARDING_MODE : DEFAULT_ONBOARDING_MODE)
     : DEFAULT_REREGISTER_ONBOARDING_MODE;
@@ -534,13 +652,17 @@ export function handleRegisterAgent(args: {
     : runtimeProfile.mode === 'unknown'
       ? 'runtime_mode_unknown: provide runtime_profile for better task routing'
       : null;
-  logActivity(
-    args.id,
-    'register_agent',
-    `Agent "${args.name}" registered as ${args.type} role=${role} lifecycle=${lifecycle} runtime_mode=${runtimeProfile.mode} is_new=${registrationResult.is_new ? 1 : 0} onboarding_mode=${onboardingMode}`
-  );
+  if (updateApplied) {
+    logActivity(
+      args.id,
+      legacyClaim ? 'register_agent_legacy_claim' : 'register_agent',
+      `Agent "${agent.name}" registered as ${agent.type} role=${role} lifecycle=${lifecycle} runtime_mode=${runtimeProfile.mode} is_new=${registrationResult.is_new ? 1 : 0} legacy_claim=${legacyClaim ? 1 : 0} onboarding_mode=${onboardingMode}`
+    );
+  }
   const onboarding = buildOnboarding(onboardingMode);
-  const auth = getAgentToken(args.id);
+  // Security (F1): a new token is returned only on first registration, on the one-time legacy
+  // migration path, or after the caller proves ownership of an already-tokenized identity.
+  const responseToken = registrationResult.issued_token?.token || (ownershipProven ? suppliedAuthToken : null);
   const roleGuidance = buildRoleGuidance(role);
   const runtimeGuidance = buildRuntimeGuidance(runtimeProfile);
   return {
@@ -555,10 +677,14 @@ export function handleRegisterAgent(args: {
       server: serverCapabilities,
       negotiated,
     },
-    auth: auth ? {
-      token: auth.token,
+    auth: responseToken ? {
+      token: responseToken,
       note: 'Keep token private. It is used by MCP_HUB_AUTH_MODE=warn|enforce.',
-    } : null,
+    } : {
+      token: null,
+      proof_required: true,
+      note: 'This agent id already exists. No registration fields were changed. Re-register with its original auth_token to prove ownership.',
+    },
     client_runtime: {
       session_recovery: {
         error_code: -32000,
@@ -571,10 +697,18 @@ export function handleRegisterAgent(args: {
       role,
       lifecycle,
       onboarding_mode: onboardingMode,
-      is_new: registrationResult.is_new,
+      is_new: newIdentity,
+      update_applied: updateApplied,
+      legacy_claim: legacyClaim,
+      credential_source: registrationResult.issued_token
+        ? (suppliedAuthToken ? 'client_provided' : 'server_generated')
+        : (ownershipProven ? 'existing' : 'none'),
       contract_profile: negotiated,
     },
-    warnings: runtimeHint ? [runtimeHint] : [],
+    warnings: [
+      ...(runtimeHint ? [runtimeHint] : []),
+      ...(!updateApplied ? ['existing_agent_update_ignored: valid auth_token required'] : []),
+    ],
   };
 }
 
@@ -638,10 +772,18 @@ export function handleListAgents(args: {
   if (args.response_mode === 'summary') {
     const now = Date.now();
     const onlineCutoff = now - (5 * 60 * 1000);
+    const runtimeProfiles = agents.map((agent) => parseRuntimeProfileJson(agent.runtime_profile_json));
+    const modelProfiles = runtimeProfiles
+      .map((profile) => profile.model)
+      .filter((model): model is AgentModelProfile => Boolean(model));
     return {
       agents: [],
       summary: {
         total: agents.length,
+        sample_size: agents.length,
+        limit,
+        offset,
+        truncated: agents.length >= limit,
         online: agents.filter((agent) => agent.status === 'online').length,
         offline: agents.filter((agent) => agent.status !== 'online').length,
         online_5m: agents.filter((agent) => agent.last_seen >= onlineCutoff).length,
@@ -650,6 +792,13 @@ export function handleListAgents(args: {
         runtime_repo: agents.filter((agent) => agent.runtime_mode === 'repo').length,
         runtime_isolated: agents.filter((agent) => agent.runtime_mode === 'isolated').length,
         runtime_unknown: agents.filter((agent) => agent.runtime_mode === 'unknown').length,
+        model_profiles: modelProfiles.length,
+        model_providers: countTopValues(modelProfiles.map((model) => model.provider)),
+        model_families: countTopValues(modelProfiles.map((model) => model.family)),
+        model_cost_tiers: countTopValues(modelProfiles.map((model) => model.cost_tier)),
+        model_latency_tiers: countTopValues(modelProfiles.map((model) => model.latency_tier)),
+        model_strengths: countTopListValues(modelProfiles.map((model) => model.strengths)),
+        model_task_types: countTopListValues(modelProfiles.map((model) => model.task_types)),
       },
     };
   }
@@ -661,12 +810,325 @@ export function handleListAgents(args: {
         type: agent.type,
         lifecycle: agent.lifecycle,
         runtime_mode: agent.runtime_mode,
+        model: parseRuntimeProfileJson(agent.runtime_profile_json).model || null,
         status: agent.status,
         last_seen: agent.last_seen,
       })),
     };
   }
   return { agents };
+}
+
+type SuggestAgentsResponseMode = 'compact' | 'tiny' | 'nano';
+type ModelTier = 'low' | 'medium' | 'high' | 'unknown';
+
+interface AgentSuggestion {
+  agent: Agent;
+  runtime_profile: AgentRuntimeProfile;
+  model: AgentModelProfile | null;
+  score: number;
+  reasons: string[];
+  matched: {
+    task_type?: string;
+    strengths: string[];
+    provider?: string;
+    family?: string;
+    cost_tier?: ModelTier;
+    latency_tier?: ModelTier;
+  };
+  quality: ReturnType<typeof getAgentQuality>;
+  online: boolean;
+}
+
+function normalizeToken(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeTokenList(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values.map(normalizeToken).filter(Boolean))];
+}
+
+function countTopValues(values: Array<string | undefined | null>, limit = 12): Array<{ value: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const normalized = normalizeToken(value);
+    if (!normalized) continue;
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }));
+}
+
+function countTopListValues(values: Array<string[] | undefined>, limit = 12): Array<{ value: string; count: number }> {
+  const flattened: string[] = [];
+  for (const list of values) flattened.push(...normalizeTokenList(list));
+  return countTopValues(flattened, limit);
+}
+
+function splitCapabilities(capabilities: string): Set<string> {
+  return new Set(
+    String(capabilities || '')
+      .split(/[\s,;|/]+/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+function normalizeExecutionMode(mode?: string): TaskExecutionMode {
+  if (mode === 'repo' || mode === 'isolated' || mode === 'any') return mode;
+  return 'any';
+}
+
+function normalizeTier(tier?: string): ModelTier | undefined {
+  if (tier === 'low' || tier === 'medium' || tier === 'high' || tier === 'unknown') return tier;
+  return undefined;
+}
+
+function modelListHas(values: string[] | undefined, token: string): boolean {
+  return normalizeTokenList(values).includes(token);
+}
+
+function buildAgentSuggestion(agent: Agent, args: {
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  execution_mode?: TaskExecutionMode;
+  cost_tier?: ModelTier;
+  latency_tier?: ModelTier;
+}): AgentSuggestion | null {
+  const runtimeProfile = parseRuntimeProfileJson(agent.runtime_profile_json);
+  const executionMode = args.execution_mode || 'any';
+  if (executionMode !== 'any' && agent.runtime_mode !== executionMode) return null;
+
+  const model = runtimeProfile.model || null;
+  const caps = splitCapabilities(agent.capabilities);
+  const now = Date.now();
+  const online = agent.status === 'online' && agent.last_seen >= now - (5 * 60 * 1000);
+  const reasons: string[] = [];
+  const matchedStrengths: string[] = [];
+  let score = 0;
+
+  if (online) {
+    score += 12;
+    reasons.push('online_5m');
+  } else {
+    score -= 12;
+    reasons.push('not_seen_5m');
+  }
+
+  if (executionMode !== 'any') {
+    score += 12;
+    reasons.push(`runtime:${executionMode}`);
+  } else if (agent.runtime_mode === 'repo') {
+    score += 4;
+    reasons.push('runtime:repo');
+  }
+
+  const taskType = normalizeToken(args.task_type);
+  if (taskType) {
+    if (modelListHas(model?.task_types, taskType)) {
+      score += 30;
+      reasons.push(`task_type:${taskType}`);
+    } else if (caps.has(taskType)) {
+      score += 12;
+      reasons.push(`capability:${taskType}`);
+    } else if (normalizeToken(model?.id).includes(taskType) || normalizeToken(model?.family).includes(taskType)) {
+      score += 5;
+      reasons.push(`model_hint:${taskType}`);
+    }
+  }
+
+  for (const strength of normalizeTokenList(args.required_strengths)) {
+    if (modelListHas(model?.strengths, strength)) {
+      score += 18;
+      matchedStrengths.push(strength);
+      reasons.push(`strength:${strength}`);
+    } else if (caps.has(strength)) {
+      score += 8;
+      matchedStrengths.push(strength);
+      reasons.push(`capability:${strength}`);
+    } else {
+      score -= 4;
+      reasons.push(`missing_strength:${strength}`);
+    }
+  }
+
+  const provider = normalizeToken(args.preferred_provider);
+  const family = normalizeToken(args.preferred_family);
+  if (provider && normalizeToken(model?.provider) === provider) {
+    score += 10;
+    reasons.push(`provider:${provider}`);
+  }
+  if (family && normalizeToken(model?.family) === family) {
+    score += 8;
+    reasons.push(`family:${family}`);
+  }
+
+  const costTier = args.cost_tier;
+  const latencyTier = args.latency_tier;
+  if (costTier && model?.cost_tier === costTier) {
+    score += 6;
+    reasons.push(`cost:${costTier}`);
+  }
+  if (latencyTier && model?.latency_tier === latencyTier) {
+    score += 6;
+    reasons.push(`latency:${latencyTier}`);
+  }
+
+  const quality = getAgentQuality(agent.id);
+  const completed = Math.max(0, quality.completed_count || 0);
+  const rollbacks = Math.max(0, quality.rollback_count || 0);
+  if (completed > 0) {
+    score += Math.min(10, completed * 2);
+    reasons.push(`completed:${completed}`);
+  }
+  if (rollbacks > 0) {
+    score -= Math.min(20, rollbacks * 5);
+    reasons.push(`rollbacks:${rollbacks}`);
+  }
+
+  if (!model) {
+    score -= 3;
+    reasons.push('model_profile_missing');
+  }
+
+  return {
+    agent,
+    runtime_profile: runtimeProfile,
+    model,
+    score,
+    reasons,
+    matched: {
+      task_type: taskType || undefined,
+      strengths: matchedStrengths,
+      provider: provider || undefined,
+      family: family || undefined,
+      cost_tier: costTier,
+      latency_tier: latencyTier,
+    },
+    quality,
+    online,
+  };
+}
+
+export function handleSuggestAgents(args: {
+  requesting_agent?: string;
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  execution_mode?: TaskExecutionMode;
+  cost_tier?: ModelTier;
+  latency_tier?: ModelTier;
+  require_online?: boolean;
+  include_requesting_agent?: boolean;
+  exclude_agent_ids?: string[];
+  limit?: number;
+  response_mode?: SuggestAgentsResponseMode;
+}) {
+  if (args.requesting_agent) heartbeat(args.requesting_agent);
+  const limit = Number.isFinite(args.limit) ? Math.min(50, Math.max(1, Math.floor(Number(args.limit)))) : 10;
+  const executionMode = normalizeExecutionMode(args.execution_mode);
+  const costTier = normalizeTier(args.cost_tier);
+  const latencyTier = normalizeTier(args.latency_tier);
+  const requireOnline = args.require_online !== false;
+  const includeRequestingAgent = args.include_requesting_agent === true;
+  const excludedAgentIds = new Set(normalizeTokenList(args.exclude_agent_ids));
+  if (args.requesting_agent && !includeRequestingAgent) {
+    excludedAgentIds.add(normalizeToken(args.requesting_agent));
+  }
+  const responseMode = args.response_mode || 'compact';
+  const agents = listAgents({ limit: 500, offset: 0 });
+  const suggestions = agents
+    .filter((agent) => !excludedAgentIds.has(normalizeToken(agent.id)))
+    .map((agent) => buildAgentSuggestion(agent, {
+      task_type: args.task_type,
+      required_strengths: args.required_strengths,
+      preferred_provider: args.preferred_provider,
+      preferred_family: args.preferred_family,
+      execution_mode: executionMode,
+      cost_tier: costTier,
+      latency_tier: latencyTier,
+    }))
+    .filter((suggestion): suggestion is AgentSuggestion => Boolean(suggestion))
+    .filter((suggestion) => !requireOnline || suggestion.online)
+    .sort((a, b) => b.score - a.score || b.agent.last_seen - a.agent.last_seen || a.agent.id.localeCompare(b.agent.id))
+    .slice(0, limit);
+
+  logActivity(
+    args.requesting_agent || 'system',
+    'suggest_agents',
+    `Suggested ${suggestions.length} agents task_type=${normalizeToken(args.task_type) || 'none'} execution_mode=${executionMode} require_online=${requireOnline ? 1 : 0} excluded=${excludedAgentIds.size}`
+  );
+
+  if (responseMode === 'nano') {
+    return {
+      suggestions: suggestions.map((suggestion) => [
+        suggestion.agent.id,
+        suggestion.score,
+        suggestion.model?.id || null,
+        suggestion.agent.runtime_mode,
+      ]),
+      total: suggestions.length,
+    };
+  }
+
+  if (responseMode === 'tiny') {
+    return {
+      suggestions: suggestions.map((suggestion) => ({
+        id: suggestion.agent.id,
+        score: suggestion.score,
+        type: suggestion.agent.type,
+        runtime_mode: suggestion.agent.runtime_mode,
+        model: suggestion.model ? {
+          provider: suggestion.model.provider,
+          id: suggestion.model.id,
+          family: suggestion.model.family,
+        } : null,
+        online: suggestion.online,
+      })),
+      total: suggestions.length,
+    };
+  }
+
+  return {
+    suggestions: suggestions.map((suggestion) => ({
+      agent: {
+        id: suggestion.agent.id,
+        name: suggestion.agent.name,
+        type: suggestion.agent.type,
+        lifecycle: suggestion.agent.lifecycle,
+        runtime_mode: suggestion.agent.runtime_mode,
+        status: suggestion.agent.status,
+        last_seen: suggestion.agent.last_seen,
+      },
+      score: suggestion.score,
+      reasons: suggestion.reasons,
+      matched: suggestion.matched,
+      model: suggestion.model,
+      quality: {
+        completed_count: suggestion.quality.completed_count,
+        rollback_count: suggestion.quality.rollback_count,
+      },
+    })),
+    total: suggestions.length,
+    criteria: {
+      task_type: normalizeToken(args.task_type) || null,
+      required_strengths: normalizeTokenList(args.required_strengths),
+      preferred_provider: normalizeToken(args.preferred_provider) || null,
+      preferred_family: normalizeToken(args.preferred_family) || null,
+      execution_mode: executionMode,
+      cost_tier: costTier || null,
+      latency_tier: latencyTier || null,
+      require_online: requireOnline,
+      include_requesting_agent: includeRequestingAgent,
+      exclude_agent_ids: [...excludedAgentIds],
+    },
+  };
 }
 
 export const agentTools = {
@@ -678,6 +1140,9 @@ export const agentTools = {
         id: { type: 'string', description: 'Unique agent identifier' },
         name: { type: 'string', description: 'Human-readable agent name' },
         type: { type: 'string', description: 'Agent type (e.g. claude, codex, custom)' },
+        register_token: { type: 'string', description: 'Registration secret required when MCP_HUB_REGISTER_TOKEN is configured' },
+        registration_token: { type: 'string', description: 'Legacy alias for register_token' },
+        auth_token: { type: 'string', description: 'Existing ownership token, or strong client-generated initial token for response-loss recovery' },
         capabilities: { type: 'string', description: 'Comma-separated list of capabilities' },
         client_capabilities: {
           type: 'object',
@@ -713,6 +1178,10 @@ export const agentTools = {
             source: { type: 'string', enum: ['client_auto', 'client_declared', 'server_inferred'] },
             detected_at: { type: 'number' },
             notes: { type: 'string' },
+            model: {
+              type: 'object',
+              description: 'Optional model identity/capability profile for model-aware orchestration',
+            },
           },
         },
       },
@@ -738,6 +1207,10 @@ export const agentTools = {
             source: { type: 'string', enum: ['client_auto', 'client_declared', 'server_inferred'] },
             detected_at: { type: 'number' },
             notes: { type: 'string' },
+            model: {
+              type: 'object',
+              description: 'Optional model identity/capability profile for model-aware orchestration',
+            },
           },
         },
       },
@@ -753,10 +1226,41 @@ export const agentTools = {
         agent_id: { type: 'string', description: 'Your agent ID (for heartbeat)' },
         limit: { type: 'number', description: 'Max rows to return (default 100)' },
         offset: { type: 'number', description: 'Row offset for pagination (default 0)' },
-        response_mode: { type: 'string', enum: ['full', 'compact', 'summary'], description: 'compact trims agent fields; summary returns counts only' },
+        response_mode: { type: 'string', enum: ['full', 'compact', 'summary'], description: 'compact trims fields; summary returns runtime/model aggregate counts' },
       },
+      required: ['agent_id'],
     },
     handler: handleListAgents,
+  },
+  suggest_agents: {
+    description: 'Rank registered agents for a task by model profile, runtime compatibility, online status, and quality metrics.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat/activity)' },
+        task_type: { type: 'string', description: 'Desired task type, e.g. coding, review, research, planning, synthesis' },
+        required_strengths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Model strengths required or preferred for this task',
+        },
+        preferred_provider: { type: 'string', description: 'Preferred model provider/runtime, e.g. codex, claude, custom' },
+        preferred_family: { type: 'string', description: 'Preferred model family' },
+        execution_mode: { type: 'string', enum: ['any', 'repo', 'isolated'], description: 'Required workspace execution profile' },
+        cost_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model cost tier' },
+        latency_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model latency tier' },
+        require_online: { type: 'boolean', description: 'Only include agents seen online in the last 5 minutes (default true)' },
+        include_requesting_agent: { type: 'boolean', description: 'Allow the requesting agent to be returned (default false)' },
+        exclude_agent_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Additional agent IDs to exclude from suggestions',
+        },
+        limit: { type: 'number', description: 'Max suggestions to return (default 10, max 50)' },
+        response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'compact includes reasons; tiny/nano reduce tokens' },
+      },
+    },
+    handler: handleSuggestAgents,
   },
   get_onboarding: {
     description: 'Get protocol onboarding and feature guide after registration.',

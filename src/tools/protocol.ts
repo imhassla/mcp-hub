@@ -1,4 +1,4 @@
-import { heartbeat, logActivity, putProtocolBlob, getProtocolBlob, listProtocolBlobs } from '../db.js';
+import { heartbeat, logActivity, putProtocolBlob, grantProtocolBlobAccess, getProtocolBlob, listProtocolBlobs } from '../db.js';
 import { collapseWhitespace, sha256Hex, estimateTokens } from '../utils.js';
 
 type PackMode = 'auto' | 'json' | 'dictionary';
@@ -11,22 +11,28 @@ const DEFAULT_AUTO_PACK_MIN_GAIN_PCT = Number.isFinite(Number(process.env.MCP_HU
   ? Math.max(0, Math.min(100, Number(process.env.MCP_HUB_AUTO_PACK_MIN_GAIN_PCT)))
   : 3;
 
+// T78-F1: the alias mapping MUST be bijective. Previously several distinct long keys shared one
+// alias (agent/agent_id->a, task/task_id->t, timestamp/created_at->ts, refs/references->r,
+// content/text->x, experiment/experiment_id->e), so unpack decoded them to the WRONG key (e.g.
+// {agent:..} round-tripped to {agent_id:..}) while the integrity hash still validated. Each long
+// key now has a unique alias; the previously-winning alias (what ALIAS_TO_KEY decoded to) is kept
+// stable so already-packed data still decodes identically.
 const KEY_TO_ALIAS: Record<string, string> = {
   experiment: 'e',
-  experiment_id: 'e',
-  agent: 'a',
+  experiment_id: 'ei',
+  agent: 'ag',
   agent_id: 'a',
-  task: 't',
+  task: 'tk',
   task_id: 't',
   status: 's',
   confidence: 'c',
   summary: 'm',
   metadata: 'md',
   timestamp: 'ts',
-  created_at: 'ts',
+  created_at: 'ca',
   updated_at: 'tu',
   refs: 'r',
-  references: 'r',
+  references: 'rf',
   depends_on: 'd',
   priority: 'p',
   outcome: 'o',
@@ -37,20 +43,25 @@ const KEY_TO_ALIAS: Record<string, string> = {
   recommendation: 'rec',
   message: 'msg',
   content: 'x',
-  text: 'x',
+  text: 'tx',
 };
 
 const ALIAS_TO_KEY: Record<string, string> = {
   e: 'experiment',
+  ei: 'experiment_id',
   a: 'agent_id',
+  ag: 'agent',
   t: 'task_id',
+  tk: 'task',
   s: 'status',
   c: 'confidence',
   m: 'summary',
   md: 'metadata',
   ts: 'timestamp',
+  ca: 'created_at',
   tu: 'updated_at',
   r: 'refs',
+  rf: 'references',
   d: 'depends_on',
   p: 'priority',
   o: 'outcome',
@@ -61,6 +72,7 @@ const ALIAS_TO_KEY: Record<string, string> = {
   rec: 'recommendation',
   msg: 'message',
   x: 'content',
+  tx: 'text',
 };
 
 function sortKeysDeep(value: unknown): unknown {
@@ -148,6 +160,11 @@ export function handlePackProtocolMessage(args: {
   const dictEncoded = toShortKeys(normalized);
   const jsonEncodedStr = canonicalJson(jsonEncoded);
   const dictEncodedStr = canonicalJson(dictEncoded);
+  // T78-F1: guarantee dictionary encoding is losslessly reversible before ever selecting it. The
+  // bijective alias table makes this true for known keys; this round-trip check additionally
+  // protects against a payload whose literal key collides with another key's alias (and any future
+  // map regression) by forcing a JSON fallback instead of silently corrupting the payload.
+  const dictLossless = canonicalJson(toLongKeys(dictEncoded)) === canonicalJson(normalized);
   const dictionaryGainPctRaw = jsonEncodedStr.length > 0
     ? ((jsonEncodedStr.length - dictEncodedStr.length) / jsonEncodedStr.length) * 100
     : 0;
@@ -160,6 +177,11 @@ export function handlePackProtocolMessage(args: {
       return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
     }
     if (requestedMode === 'dictionary') {
+      if (!dictLossless) {
+        // Refuse to emit a lossy dictionary packet even when explicitly requested.
+        decisionReason = 'dictionary_lossy_fallback_json';
+        return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
+      }
       decisionReason = 'forced_dictionary';
       return { encoding: 'dictionary' as const, data: dictEncoded, dataStr: dictEncodedStr };
     }
@@ -170,6 +192,10 @@ export function handlePackProtocolMessage(args: {
     }
     if (dictionaryGainPct < minGainPct) {
       decisionReason = 'below_min_gain_pct';
+      return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
+    }
+    if (!dictLossless) {
+      decisionReason = 'dictionary_lossy_fallback_json';
       return { encoding: 'json' as const, data: jsonEncoded, dataStr: jsonEncodedStr };
     }
     decisionReason = 'gain_threshold_met';
@@ -239,6 +265,7 @@ export function handleUnpackProtocolMessage(args: {
 }) {
   heartbeat(args.agent_id);
 
+  let parsedPacket: unknown;
   let packet: {
     v: string;
     fmt: PayloadFormat;
@@ -248,16 +275,29 @@ export function handleUnpackProtocolMessage(args: {
     h: string;
   };
   try {
-    packet = JSON.parse(args.packet_json);
+    parsedPacket = JSON.parse(args.packet_json);
   } catch {
     return { success: false, error_code: 'INVALID_PACKET', error: 'packet_json is not valid JSON' };
   }
 
-  if (!packet || packet.v !== 'caep-1') {
+  if (!parsedPacket || typeof parsedPacket !== 'object' || Array.isArray(parsedPacket)) {
+    return { success: false, error_code: 'INVALID_PACKET', error: 'packet_json must contain an object' };
+  }
+  packet = parsedPacket as typeof packet;
+  if (packet.v !== 'caep-1') {
     return { success: false, error_code: 'UNSUPPORTED_PACKET', error: 'Unsupported packet version' };
+  }
+  if (packet.fmt !== 'json' && packet.fmt !== 'text') {
+    return { success: false, error_code: 'INVALID_PACKET', error: 'Packet format must be json or text' };
   }
   if (packet.enc !== 'json' && packet.enc !== 'dictionary') {
     return { success: false, error_code: 'UNSUPPORTED_ENCODING', error: 'Unsupported packet encoding' };
+  }
+  if (!Number.isFinite(packet.ts) || packet.ts < 0 || !Object.prototype.hasOwnProperty.call(packet, 'd')) {
+    return { success: false, error_code: 'INVALID_PACKET', error: 'Packet timestamp/data fields are invalid' };
+  }
+  if (typeof packet.h !== 'string' || !/^[0-9a-f]{64}$/i.test(packet.h)) {
+    return { success: false, error_code: 'INVALID_PACKET', error: 'Packet hash must be a 64-character SHA-256 hex string' };
   }
 
   const canonicalWithoutHash = canonicalJson({
@@ -268,15 +308,37 @@ export function handleUnpackProtocolMessage(args: {
     d: packet.d,
   });
   const computedHash = sha256Hex(canonicalWithoutHash);
-  const hashValid = computedHash === packet.h;
+  const normalizedHash = packet.h.toLowerCase();
+  const hashValid = computedHash === normalizedHash;
+
+  if (!hashValid) {
+    logActivity(args.agent_id, 'unpack_protocol_message_rejected', `Packet hash mismatch hash=${normalizedHash.slice(0, 12)}`);
+    return {
+      success: false,
+      error_code: 'HASH_MISMATCH',
+      error: 'Packet integrity check failed',
+      hash_valid: false,
+      hash: normalizedHash,
+      computed_hash: computedHash,
+    };
+  }
 
   const decoded = packet.enc === 'dictionary' ? toLongKeys(packet.d) : packet.d;
   const payloadObject = decoded;
+  if (packet.fmt === 'text' && (
+    !payloadObject
+    || typeof payloadObject !== 'object'
+    || Array.isArray(payloadObject)
+    || !Object.prototype.hasOwnProperty.call(payloadObject, 'text')
+    || typeof (payloadObject as Record<string, unknown>).text !== 'string'
+  )) {
+    return { success: false, error_code: 'INVALID_PACKET', error: 'Text packet data must contain a text field' };
+  }
   const payloadText = packet.fmt === 'text'
     ? String((payloadObject as Record<string, unknown>).text ?? '')
     : canonicalJson(payloadObject);
 
-  logActivity(args.agent_id, 'unpack_protocol_message', `Unpacked packet hash_valid=${hashValid} hash=${packet.h.slice(0, 12)}`);
+  logActivity(args.agent_id, 'unpack_protocol_message', `Unpacked packet hash_valid=${hashValid} hash=${normalizedHash.slice(0, 12)}`);
 
   if (args.response_mode === 'compact') {
     return {
@@ -284,7 +346,7 @@ export function handleUnpackProtocolMessage(args: {
       hash_valid: hashValid,
       format: packet.fmt,
       encoding: packet.enc,
-      hash: packet.h,
+      hash: normalizedHash,
       payload_chars: payloadText.length,
     };
   }
@@ -294,7 +356,7 @@ export function handleUnpackProtocolMessage(args: {
     hash_valid: hashValid,
     format: packet.fmt,
     encoding: packet.enc,
-    hash: packet.h,
+    hash: normalizedHash,
     decoded_payload: packet.fmt === 'text' ? payloadText : payloadObject,
   };
 }
@@ -348,13 +410,18 @@ export function handleStoreProtocolBlob(args: {
   payload: string;
   compression_mode?: 'none' | 'json' | 'whitespace' | 'auto';
   hash_truncate?: number;
+  visibility?: 'private' | 'public';
+  share_with_agents?: string[];
 }) {
   heartbeat(args.agent_id);
-  const mode = args.compression_mode || 'auto';
+  const mode = args.compression_mode || 'none';
   const storedValue = compressForBlob(args.payload, mode);
   const fullHash = sha256Hex(storedValue);
   const shortLen = Number.isFinite(args.hash_truncate) ? Math.max(8, Math.min(64, Math.floor(Number(args.hash_truncate)))) : 16;
-  const { blob, created } = putProtocolBlob(fullHash, storedValue);
+  const { blob, created } = putProtocolBlob(fullHash, storedValue, args.agent_id);
+  const shareWith = [...new Set((args.share_with_agents || []).map((id) => String(id || '').trim()).filter(Boolean))].slice(0, 100);
+  const grants = args.visibility === 'public' ? ['*'] : shareWith.filter((id) => id !== '*');
+  grantProtocolBlobAccess(fullHash, grants, args.agent_id);
 
   logActivity(
     args.agent_id,
@@ -369,6 +436,8 @@ export function handleStoreProtocolBlob(args: {
     short_hash: fullHash.slice(0, shortLen),
     blob_chars: storedValue.length,
     compression_mode: mode,
+    visibility: args.visibility === 'public' ? 'public' : 'private',
+    shared_with_count: grants.length,
     blob: {
       hash: blob.hash,
       created_at: blob.created_at,
@@ -384,9 +453,9 @@ export function handleGetProtocolBlob(args: {
   response_mode?: 'full' | 'compact';
 }) {
   heartbeat(args.agent_id);
-  const blob = getProtocolBlob(args.hash);
+  const blob = getProtocolBlob(args.hash, args.agent_id);
   if (!blob) {
-    return { success: false, error_code: 'BLOB_NOT_FOUND', error: 'Blob hash not found' };
+    return { success: false, error_code: 'BLOB_NOT_FOUND_OR_FORBIDDEN', error: 'Blob hash not found or not accessible' };
   }
 
   logActivity(args.agent_id, 'get_protocol_blob', `Read protocol blob hash=${args.hash.slice(0, 12)} chars=${blob.value.length}`);
@@ -413,7 +482,7 @@ export function handleListProtocolBlobs(args: {
   offset?: number;
 }) {
   heartbeat(args.agent_id);
-  const blobs = listProtocolBlobs(args.limit, args.offset);
+  const blobs = listProtocolBlobs(args.agent_id, args.limit, args.offset);
   logActivity(args.agent_id, 'list_protocol_blobs', `Listed ${blobs.length} protocol blobs`);
   return {
     success: true,
@@ -438,7 +507,7 @@ export const protocolTools = {
     description: 'Compute deterministic SHA-256 payload hash (optionally JSON-normalized) for references and dedup.',
   },
   store_protocol_blob: {
-    description: 'Store payload blob by hash (deduplicated) for hash-reference exchange between agents.',
+    description: 'Store payload blob by hash. Default visibility=private and compression_mode=none; use explicit public/share_with_agents grants for exchange.',
   },
   get_protocol_blob: {
     description: 'Get payload blob by hash for resolving hash references.',

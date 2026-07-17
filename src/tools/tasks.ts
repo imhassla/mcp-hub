@@ -1,6 +1,8 @@
 import {
   createTask,
   updateTask,
+  TaskDoneGateError,
+  TaskDependencyError,
   getTaskById,
   getTaskDependencies,
   getTaskWithDependencies,
@@ -18,6 +20,7 @@ import {
   recordTaskCompletion,
   recordTaskRollback,
   countActiveAgents,
+  isRegisteredAgent,
   getAgentRuntimeProfile,
   getArtifactById,
   hasArtifactAccess,
@@ -28,6 +31,7 @@ import {
   logActivity,
 } from '../db.js';
 import { withIdempotency } from '../utils.js';
+import { handleSuggestAgents } from './agents.js';
 import { buildTaskArtifactDownloads } from './artifacts.js';
 
 const pollMissStreak = new Map<string, number>();
@@ -115,6 +119,9 @@ function resolveTaskConsistencyMode(args: {
   existing?: string;
   priority?: string;
 }): TaskConsistencyMode {
+  if (args.existing === 'strict') {
+    return 'strict';
+  }
   if (args.requested === 'strict' || args.requested === 'cheap') {
     return args.requested;
   }
@@ -176,13 +183,24 @@ function validateDoneGate(args: {
   const confidence = Number.isFinite(args.confidence) ? Number(args.confidence) : NaN;
   const verificationPassed = args.verification_passed === true;
   const verifiedBy = (args.verified_by || '').trim();
-  const hasIndependentVerifier = verifiedBy.length > 0 && verifiedBy !== args.agent_id;
+  const hasIndependentVerifier = verifiedBy.length > 0
+    && verifiedBy !== args.agent_id
+    && isRegisteredAgent(verifiedBy);
 
   if (!Number.isFinite(confidence)) {
     return {
       ok: false,
       error_code: 'DONE_GATE_FAILED',
       error: 'Missing confidence for done transition',
+      required_confidence: requiredConfidence,
+      consistency_mode: consistencyMode,
+    };
+  }
+  if (confidence < 0 || confidence > 1) {
+    return {
+      ok: false,
+      error_code: 'DONE_GATE_FAILED',
+      error: 'Confidence must be between 0 and 1',
       required_confidence: requiredConfidence,
       consistency_mode: consistencyMode,
     };
@@ -205,6 +223,7 @@ function validateDoneGate(args: {
       consistency_mode: consistencyMode,
     };
   }
+  const verifierRequired = strictMode || confidence < requiredConfidence;
   if (strictMode && !hasIndependentVerifier) {
     return {
       ok: false,
@@ -224,9 +243,22 @@ function validateDoneGate(args: {
     };
   }
 
+  const existingEvidence = verifierRequired
+    ? listTaskEvidence(args.task_id, 1000)
+    : [];
+  if (verifierRequired && !existingEvidence.some((row) => row.added_by === verifiedBy)) {
+    return {
+      ok: false,
+      error_code: 'VERIFIER_REQUIRED',
+      error: `Verifier "${verifiedBy}" must add task evidence before the done transition`,
+      required_confidence: requiredConfidence,
+      consistency_mode: consistencyMode,
+    };
+  }
+
   if (requiredEvidenceRefs > 0) {
-    const existingEvidence = listTaskEvidence(args.task_id, 1000);
-    const allEvidence = new Set<string>(existingEvidence.map((row) => row.evidence_ref));
+    const evidenceRows = verifierRequired ? existingEvidence : listTaskEvidence(args.task_id, 1000);
+    const allEvidence = new Set<string>(evidenceRows.map((row) => row.evidence_ref));
     for (const ref of evidenceRefs) allEvidence.add(ref);
     if (allEvidence.size < requiredEvidenceRefs) {
       return {
@@ -245,8 +277,10 @@ function validateDoneGate(args: {
     ok: true,
     consistency_mode: consistencyMode,
     required_confidence: requiredConfidence,
+    confidence_floor: confidenceFloor,
     required_evidence_refs: requiredEvidenceRefs,
     evidence_refs: evidenceRefs,
+    require_independent_verifier: strictMode,
   };
 }
 
@@ -288,11 +322,52 @@ function buildTaskArtifactHints(taskId: number, agentId: string) {
   }));
 }
 
+function inferTaskRoutingCriteria(task: {
+  title: string;
+  description?: string;
+  execution_mode?: string;
+}): { task_type: string | null; required_strengths: string[]; reason: string } {
+  const text = `${task.title || ''} ${task.description || ''}`.toLowerCase();
+  const requiredStrengths = new Set<string>();
+  const repoTask = task.execution_mode === 'repo' || /\b(repo|codebase|patch|test|build|commit|runtime|код|репо)\b/i.test(text);
+  let taskType: string | null = null;
+  let reason = 'no_heuristic_match';
+
+  if (/(review|audit|ревью|провер|code review)/i.test(text)) {
+    taskType = 'review';
+    requiredStrengths.add('code_review');
+    reason = 'matched_review_terms';
+  } else if (/(research|исслед|ресерч|market|paper|compare|анализ)/i.test(text)) {
+    taskType = 'research';
+    requiredStrengths.add('research');
+    reason = 'matched_research_terms';
+  } else if (/(plan|roadmap|design|architecture|архитект|план|стратег)/i.test(text)) {
+    taskType = 'planning';
+    requiredStrengths.add('analysis');
+    reason = 'matched_planning_terms';
+  } else if (/(debug|bug|fix|regression|ошиб|баг|чин)/i.test(text)) {
+    taskType = 'debugging';
+    requiredStrengths.add('debugging');
+    reason = 'matched_debugging_terms';
+  } else if (/(implement|code|patch|test|build|код|реализ|добав|внедр)/i.test(text)) {
+    taskType = 'coding';
+    requiredStrengths.add('coding');
+    reason = 'matched_coding_terms';
+  } else if (/(summary|summarize|digest|synthesis|сводк|итог|синтез)/i.test(text)) {
+    taskType = 'synthesis';
+    requiredStrengths.add('synthesis');
+    reason = 'matched_synthesis_terms';
+  }
+
+  if (repoTask) requiredStrengths.add('repo_reasoning');
+  return { task_type: taskType, required_strengths: [...requiredStrengths], reason };
+}
+
 export function handleCreateTask(args: {
   title: string;
   description?: string;
   created_by: string;
-  assigned_to?: string;
+  assigned_to?: string | null;
   priority?: string;
   depends_on?: number[];
   namespace?: string;
@@ -303,7 +378,7 @@ export function handleCreateTask(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.created_by);
-  return withIdempotency(args.created_by, 'create_task', args.idempotency_key, () => {
+  return withIdempotency(args.created_by, 'create_task', args.idempotency_key, args, () => {
     const namespacePolicy = evaluateNamespaceGovernance({
       action: 'create_task',
       namespace: args.namespace,
@@ -342,10 +417,86 @@ export function handleCreateTask(args: {
   });
 }
 
+export function handleSuggestTaskAgents(args: {
+  requesting_agent: string;
+  task_id: number;
+  task_type?: string;
+  required_strengths?: string[];
+  preferred_provider?: string;
+  preferred_family?: string;
+  cost_tier?: 'low' | 'medium' | 'high' | 'unknown';
+  latency_tier?: 'low' | 'medium' | 'high' | 'unknown';
+  require_online?: boolean;
+  include_requesting_agent?: boolean;
+  exclude_agent_ids?: string[];
+  limit?: number;
+  response_mode?: 'compact' | 'tiny' | 'nano';
+}) {
+  const taskId = Number.isFinite(args.task_id) ? Math.floor(Number(args.task_id)) : 0;
+  const task = taskId > 0 ? getTaskById(taskId) : null;
+  if (!task) {
+    return {
+      success: false,
+      error_code: 'TASK_NOT_FOUND',
+      error: 'Task not found',
+    };
+  }
+
+  const inferred = inferTaskRoutingCriteria(task);
+  const requiredStrengths = Array.isArray(args.required_strengths) && args.required_strengths.length > 0
+    ? args.required_strengths
+    : inferred.required_strengths;
+  const taskType = args.task_type || inferred.task_type || undefined;
+  const suggestions = handleSuggestAgents({
+    requesting_agent: args.requesting_agent,
+    task_type: taskType,
+    required_strengths: requiredStrengths,
+    preferred_provider: args.preferred_provider,
+    preferred_family: args.preferred_family,
+    execution_mode: task.execution_mode,
+    cost_tier: args.cost_tier,
+    latency_tier: args.latency_tier,
+    require_online: args.require_online,
+    include_requesting_agent: args.include_requesting_agent,
+    exclude_agent_ids: args.exclude_agent_ids,
+    limit: args.limit,
+    response_mode: args.response_mode,
+  });
+  logActivity(
+    args.requesting_agent,
+    'suggest_task_agents',
+    `task_id=${task.id} inferred_task_type=${inferred.task_type || '-'} execution_mode=${task.execution_mode} response_mode=${args.response_mode || 'compact'}`
+  );
+
+  if (args.response_mode === 'nano') {
+    return {
+      task: [task.id, task.execution_mode, task.priority],
+      inferred: [inferred.task_type, inferred.required_strengths, inferred.reason],
+      ...suggestions,
+    };
+  }
+
+  return {
+    success: true,
+    task: {
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      assigned_to: task.assigned_to,
+      priority: task.priority,
+      namespace: task.namespace,
+      execution_mode: task.execution_mode,
+      consistency_mode: task.consistency_mode,
+    },
+    inferred,
+    ...suggestions,
+  };
+}
+
 export function handleUpdateTask(args: {
   id: number;
   status?: string;
-  assigned_to?: string;
+  assigned_to?: string | null;
   title?: string;
   description?: string;
   priority?: string;
@@ -363,12 +514,14 @@ export function handleUpdateTask(args: {
   agent_id: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'update_task', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'update_task', args.idempotency_key, args, () => {
     const previousTask = getTaskById(args.id);
     if (!previousTask) return { success: false, error: 'Task not found' };
 
     let requiredConfidence: number | undefined;
+    let confidenceFloor: number | undefined;
     let requiredEvidenceRefs: number | undefined;
+    let requireIndependentVerifier = false;
     let evidenceRefsTotal: number | undefined;
     const effectiveConsistencyMode = resolveTaskConsistencyMode({
       requested: args.consistency_mode,
@@ -410,6 +563,8 @@ export function handleUpdateTask(args: {
         };
       }
       requiredEvidenceRefs = gate.required_evidence_refs;
+      confidenceFloor = gate.confidence_floor;
+      requireIndependentVerifier = gate.require_independent_verifier === true;
     }
 
     const {
@@ -422,10 +577,59 @@ export function handleUpdateTask(args: {
       idempotency_key: _key,
       ...updates
     } = args;
-    const task = updateTask(args.id, updates);
+    // F6: persist evidence and the done-status flip in ONE transaction (see updateTask).
+    const evidenceBefore = listTaskEvidence(args.id, 1000).length;
+    let task: ReturnType<typeof updateTask>;
+    try {
+      task = updateTask(args.id, updates, {
+        evidenceRefs,
+        minEvidenceRefs: args.status === 'done' ? (requiredEvidenceRefs ?? 0) : 0,
+        addedBy: agent_id,
+        confidence: args.confidence,
+        requiredConfidence,
+        confidenceFloor,
+        verificationPassed: args.verification_passed,
+        verifiedBy: args.verified_by,
+        requireIndependentVerifier,
+      });
+    } catch (error) {
+      if (error instanceof TaskDoneGateError) {
+        logActivity(args.agent_id, 'update_task_done_gate_failed', `Task #${args.id}: ${error.message}`);
+        return {
+          success: false,
+          error_code: error.error_code,
+          error: error.message,
+          required_confidence: error.required_confidence ?? requiredConfidence,
+          required_evidence_refs: error.required_evidence_refs ?? requiredEvidenceRefs,
+          evidence_refs_total: error.evidence_refs_total,
+          consistency_mode: effectiveConsistencyMode,
+        };
+      }
+      if (error instanceof TaskDependencyError) {
+        logActivity(args.agent_id, 'update_task_dependency_failed', `Task #${args.id}: ${error.message}`);
+        return {
+          success: false,
+          error_code: error.error_code,
+          error: error.message,
+          unmet_dependencies: error.unmet_dependencies,
+          dependent_task_ids: error.dependent_task_ids,
+        };
+      }
+      if (error instanceof Error && (error.message === 'DEPENDENCY_CYCLE' || error.message === 'INVALID_DEPENDENCY')) {
+        return {
+          success: false,
+          error_code: error.message,
+          error: error.message === 'DEPENDENCY_CYCLE'
+            ? 'Task dependencies must form an acyclic graph'
+            : 'One or more task dependencies do not exist',
+        };
+      }
+      throw error;
+    }
     if (!task) return { success: false, error: 'Task not found' };
 
-    const evidenceWrite = addTaskEvidence(task.id, agent_id, evidenceRefs);
+    const evidenceTotalNow = listTaskEvidence(task.id, 1000).length;
+    const evidenceWrite = { added: Math.max(0, evidenceTotalNow - evidenceBefore), total: evidenceTotalNow };
     evidenceRefsTotal = evidenceWrite.total;
 
     if (previousTask.status !== task.status) {
@@ -555,7 +759,8 @@ export function handleListTasks(args: {
   logActivity(
     args.agent_id || 'system',
     'list_tasks',
-    `Listed ${slicedTasks.length} tasks (ns=${args.namespace || '*'}, offset=${offset}, limit=${limit}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'})`
+    `Listed ${slicedTasks.length} tasks (ns=${args.namespace || '*'}, offset=${offset}, limit=${limit}, updated_after=${updatedAfter ?? '-'}, cursor=${args.cursor || '-'})`,
+    { emit_stream_event: !pollingCycle }
   );
   if (responseMode === 'compact') {
     return { tasks: compactTasks, has_more: hasMore, next_cursor: nextCursor };
@@ -577,7 +782,7 @@ export function handlePollAndClaim(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'poll_and_claim', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'poll_and_claim', args.idempotency_key, args, () => {
     const namespacePolicy = evaluateNamespaceGovernance({
       action: 'poll_and_claim',
       namespace: args.namespace,
@@ -639,7 +844,7 @@ export function handleClaimTask(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'claim_task', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'claim_task', args.idempotency_key, args, () => {
     const namespacePolicy = evaluateNamespaceGovernance({
       action: 'claim_task',
       namespace: args.namespace,
@@ -676,7 +881,7 @@ export function handleClaimTask(args: {
 
 export function handleRenewTaskClaim(args: { task_id: number; agent_id: string; lease_seconds?: number; claim_id?: string; idempotency_key?: string }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'renew_task_claim', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'renew_task_claim', args.idempotency_key, args, () => {
     const result = renewTaskClaim(args.task_id, args.agent_id, args.lease_seconds, args.claim_id);
     if (!result.success) {
       logActivity(args.agent_id, 'renew_task_claim_failed', `Task #${args.task_id}: ${result.error} (${result.error_code})`);
@@ -701,12 +906,15 @@ export function handleReleaseTaskClaim(args: {
   verification_passed?: boolean;
   verified_by?: string;
   evidence_refs?: string[];
+  preserve_assignment?: boolean;
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'release_task_claim', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'release_task_claim', args.idempotency_key, args, () => {
     let requiredConfidence: number | undefined;
+    let confidenceFloor: number | undefined;
     let requiredEvidenceRefs: number | undefined;
+    let requireIndependentVerifier = false;
     let evidenceRefsTotal: number | undefined;
     const previousTask = getTaskById(args.task_id);
     const effectiveConsistencyMode = resolveTaskConsistencyMode({
@@ -749,14 +957,29 @@ export function handleReleaseTaskClaim(args: {
         };
       }
       requiredEvidenceRefs = gate.required_evidence_refs;
+      confidenceFloor = gate.confidence_floor;
+      requireIndependentVerifier = gate.require_independent_verifier === true;
     }
 
-    const result = releaseTaskClaim(args.task_id, args.agent_id, args.next_status, args.claim_id);
+    // F6: release the claim, persist evidence, and flip status in ONE transaction. The db layer
+    // re-enforces the minimum evidence count for the done transition so the status and its
+    // required evidence can never be committed separately.
+    const result = releaseTaskClaim(args.task_id, args.agent_id, args.next_status, args.claim_id, {
+      evidenceRefs,
+      minEvidenceRefs: args.next_status === 'done' ? requiredEvidenceRefs : 0,
+      confidence: args.confidence,
+      requiredConfidence,
+      confidenceFloor,
+      verificationPassed: args.verification_passed,
+      verifiedBy: args.verified_by,
+      requireIndependentVerifier,
+      preserveAssignment: args.preserve_assignment,
+    });
     if (!result.success) {
       logActivity(args.agent_id, 'release_task_claim_failed', `Task #${args.task_id}: ${result.error} (${result.error_code})`);
       return result;
     }
-    const evidenceWrite = addTaskEvidence(result.task.id, args.agent_id, evidenceRefs);
+    const evidenceWrite = { added: result.evidence_added, total: result.evidence_total };
     evidenceRefsTotal = evidenceWrite.total;
     if (previousTask && previousTask.status !== result.task.status) {
       recordTaskStatusTransition({
@@ -802,7 +1025,7 @@ export function handleDeleteTask(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'delete_task', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'delete_task', args.idempotency_key, args, () => {
     const result = deleteTask(args.id, { archive: args.archive, reason: args.reason });
     if (!result.success) {
       logActivity(args.agent_id, 'delete_task_failed', `Task #${args.id}: ${result.error} (${result.error_code})`);
@@ -821,7 +1044,7 @@ export function handleAttachTaskArtifact(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'attach_task_artifact', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'attach_task_artifact', args.idempotency_key, args, () => {
     const task = getTaskById(args.task_id);
     if (!task) {
       return {
@@ -854,10 +1077,24 @@ export function handleAttachTaskArtifact(args: {
       };
     }
 
-    const linked = attachTaskArtifact(task.id, artifactId, args.agent_id);
     const autoShareAssignee = args.auto_share_assignee !== false;
+    const assigneeNeedsAccess = Boolean(
+      autoShareAssignee
+      && task.assigned_to
+      && !hasArtifactAccess(task.assigned_to, artifactId)
+    );
+    if (assigneeNeedsAccess && artifact.created_by !== args.agent_id) {
+      return {
+        success: false,
+        error_code: 'ARTIFACT_NOT_OWNER',
+        error: 'Only the artifact owner can widen access to the task assignee; set auto_share_assignee=false to attach without sharing',
+        assignee: task.assigned_to,
+      };
+    }
+
+    const linked = attachTaskArtifact(task.id, artifactId, args.agent_id);
     let sharedToAssignee = false;
-    if (autoShareAssignee && task.assigned_to && !hasArtifactAccess(task.assigned_to, artifactId)) {
+    if (assigneeNeedsAccess && task.assigned_to) {
       grantArtifactAccess({
         artifact_id: artifactId,
         to_agent: task.assigned_to,
@@ -962,6 +1199,8 @@ export function handleGetTaskHandoff(args: {
   include_downloads?: boolean;
   download_ttl_sec?: number;
   only_ready_downloads?: boolean;
+  include_routing_suggestions?: boolean;
+  routing_limit?: number;
 }) {
   heartbeat(args.agent_id);
   const task = getTaskWithDependencies(args.task_id);
@@ -998,14 +1237,23 @@ export function handleGetTaskHandoff(args: {
       limit: artifactLimit,
     })
     : null;
+  const routingSuggestions = args.include_routing_suggestions
+    ? handleSuggestTaskAgents({
+      requesting_agent: args.agent_id,
+      task_id: task.id,
+      limit: Number.isFinite(args.routing_limit) ? Math.max(1, Math.min(20, Math.floor(Number(args.routing_limit)))) : 5,
+      response_mode: 'tiny',
+    })
+    : null;
   const evidenceRefs = evidence.map((row) => row.evidence_ref);
   const downloadMeta = downloads
     ? (downloads.success ? `downloads=${downloads.downloads.length}` : `downloads_error=${downloads.error_code}`)
     : 'downloads=off';
+  const routingMeta = routingSuggestions ? `routing=${(routingSuggestions as any).total ?? 0}` : 'routing=off';
   logActivity(
     args.agent_id,
     'get_task_handoff',
-    `task_id=${task.id} mode=${args.response_mode || 'full'} deps=${task.depends_on.length} evidence=${evidenceRefs.length} artifacts=${artifacts.length} ${downloadMeta}`
+    `task_id=${task.id} mode=${args.response_mode || 'full'} deps=${task.depends_on.length} evidence=${evidenceRefs.length} artifacts=${artifacts.length} ${downloadMeta} ${routingMeta}`
   );
 
   if (args.response_mode === 'tiny') {
@@ -1041,6 +1289,11 @@ export function handleGetTaskHandoff(args: {
       artifact_downloads_error: downloads && !downloads.success ? {
         error_code: downloads.error_code,
         error: downloads.error,
+      } : undefined,
+      routing_suggestions: routingSuggestions ? {
+        inferred: (routingSuggestions as any).inferred,
+        suggestions: (routingSuggestions as any).suggestions || [],
+        total: (routingSuggestions as any).total || 0,
       } : undefined,
     };
   }
@@ -1083,6 +1336,11 @@ export function handleGetTaskHandoff(args: {
         error_code: downloads.error_code,
         error: downloads.error,
       } : undefined,
+      routing_suggestions: routingSuggestions ? {
+        inferred: (routingSuggestions as any).inferred,
+        suggestions: (routingSuggestions as any).suggestions || [],
+        total: (routingSuggestions as any).total || 0,
+      } : undefined,
     };
   }
 
@@ -1099,6 +1357,7 @@ export function handleGetTaskHandoff(args: {
       error_code: downloads.error_code,
       error: downloads.error,
     } : undefined,
+    routing_suggestions: routingSuggestions,
   };
 }
 
@@ -1119,7 +1378,7 @@ export const taskTools = {
         trace_id: { type: 'string', description: 'Optional trace identifier for cross-tool diagnostics' },
         span_id: { type: 'string', description: 'Optional span identifier for task creation event' },
         depends_on: { type: 'array', items: { type: 'number' }, description: 'Optional dependency task IDs that must be done first' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['title', 'created_by'],
     },
@@ -1133,7 +1392,7 @@ export const taskTools = {
         id: { type: 'number', description: 'Task ID' },
         agent_id: { type: 'string', description: 'Your agent ID' },
         status: { type: 'string', enum: ['pending', 'in_progress', 'done', 'blocked'], description: 'New status' },
-        assigned_to: { type: 'string', description: 'Reassign to agent ID' },
+        assigned_to: { type: ['string', 'null'], description: 'Reassign to agent ID; null clears assignment' },
         title: { type: 'string', description: 'New title' },
         description: { type: 'string', description: 'New description' },
         priority: { type: 'string', enum: ['low', 'medium', 'high', 'critical'], description: 'New priority' },
@@ -1147,7 +1406,7 @@ export const taskTools = {
         verification_passed: { type: 'boolean', description: 'Whether verify-before-done checks passed (required for done)' },
         verified_by: { type: 'string', description: 'Independent verifier agent ID (recommended when confidence below threshold)' },
         evidence_refs: { type: 'array', items: { type: 'string' }, description: `Optional evidence references persisted with task updates (required count for done transitions: ${DONE_EVIDENCE_MIN_REFS})` },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['id', 'agent_id'],
     },
@@ -1175,6 +1434,37 @@ export const taskTools = {
     },
     handler: handleListTasks,
   },
+  suggest_task_agents: {
+    description: 'Rank candidate agents for an existing task using the task execution_mode plus explicit or inferred model-routing criteria. Does not assign the task.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requesting_agent: { type: 'string', description: 'Your agent ID (for heartbeat/activity/auth)' },
+        task_id: { type: 'number', description: 'Task ID to route' },
+        task_type: { type: 'string', description: 'Optional explicit task type override' },
+        required_strengths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional explicit strengths override',
+        },
+        preferred_provider: { type: 'string', description: 'Preferred model provider/runtime' },
+        preferred_family: { type: 'string', description: 'Preferred model family' },
+        cost_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model cost tier' },
+        latency_tier: { type: 'string', enum: ['low', 'medium', 'high', 'unknown'], description: 'Preferred model latency tier' },
+        require_online: { type: 'boolean', description: 'Only include agents seen online in the last 5 minutes (default true)' },
+        include_requesting_agent: { type: 'boolean', description: 'Allow the requesting agent to be returned (default false)' },
+        exclude_agent_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Additional agent IDs to exclude from suggestions',
+        },
+        limit: { type: 'number', description: 'Max suggestions to return (default 10, max 50)' },
+        response_mode: { type: 'string', enum: ['compact', 'tiny', 'nano'], description: 'compact includes task and reasons; tiny/nano reduce tokens' },
+      },
+      required: ['requesting_agent', 'task_id'],
+    },
+    handler: handleSuggestTaskAgents,
+  },
   poll_and_claim: {
     description: 'Atomically find a dependency-ready pending task and claim it. Prioritizes criticality and downstream unblocking impact; returns retry_after_ms when queue is empty.',
     inputSchema: {
@@ -1184,7 +1474,7 @@ export const taskTools = {
         lease_seconds: { type: 'number', description: 'Optional lease duration in seconds (default 300)' },
         namespace: { type: 'string', description: 'Optional namespace/tag filter for task isolation' },
         include_artifacts: { type: 'boolean', description: 'Include tiny task artifact refs in claim response' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['agent_id'],
     },
@@ -1200,7 +1490,7 @@ export const taskTools = {
         lease_seconds: { type: 'number', description: 'Lease duration in seconds (30..86400, default 300)' },
         namespace: { type: 'string', description: 'Optional namespace/tag guard for this task claim' },
         include_artifacts: { type: 'boolean', description: 'Include tiny task artifact refs in claim response' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['task_id', 'agent_id'],
     },
@@ -1215,7 +1505,7 @@ export const taskTools = {
         agent_id: { type: 'string', description: 'Your agent ID' },
         lease_seconds: { type: 'number', description: 'New lease duration in seconds (30..86400, default 300)' },
         claim_id: { type: 'string', description: 'Optional expected claim ID (recommended for stale-write protection)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['task_id', 'agent_id'],
     },
@@ -1229,13 +1519,14 @@ export const taskTools = {
         task_id: { type: 'number', description: 'Task ID' },
         agent_id: { type: 'string', description: 'Your agent ID' },
         next_status: { type: 'string', enum: ['pending', 'done', 'blocked'], description: 'Final status after release (default pending)' },
+        preserve_assignment: { type: 'boolean', description: 'Keep the task assigned to this agent when releasing to pending or blocked (default false)' },
         claim_id: { type: 'string', description: 'Optional expected claim ID (recommended for stale-write protection)' },
         consistency_mode: { type: 'string', enum: ['cheap', 'strict'], description: 'Override task consistency mode for done gate evaluation in this release call' },
         confidence: { type: 'number', description: 'Confidence score (0..1), required when next_status=done' },
         verification_passed: { type: 'boolean', description: 'Whether verify-before-done checks passed (required when next_status=done)' },
         verified_by: { type: 'string', description: 'Independent verifier agent ID (recommended when confidence below threshold)' },
         evidence_refs: { type: 'array', items: { type: 'string' }, description: `Optional evidence references persisted with task release (required count for done transitions: ${DONE_EVIDENCE_MIN_REFS})` },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['task_id', 'agent_id'],
     },
@@ -1261,7 +1552,7 @@ export const taskTools = {
         agent_id: { type: 'string', description: 'Your agent ID' },
         archive: { type: 'boolean', description: 'Archive before delete (default true)' },
         reason: { type: 'string', description: 'Optional archive/delete reason' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['id', 'agent_id'],
     },
@@ -1276,7 +1567,7 @@ export const taskTools = {
         artifact_id: { type: 'string', description: 'Artifact ID to attach' },
         agent_id: { type: 'string', description: 'Your agent ID' },
         auto_share_assignee: { type: 'boolean', description: 'If true (default), grant attached artifact access to task assignee' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['task_id', 'artifact_id', 'agent_id'],
     },
@@ -1310,6 +1601,8 @@ export const taskTools = {
         include_downloads: { type: 'boolean', description: 'Include one-time artifact download tickets in handoff response (default false)' },
         download_ttl_sec: { type: 'number', description: 'Optional download ticket TTL in seconds' },
         only_ready_downloads: { type: 'boolean', description: 'If true (default), emit tickets only for ready/uploaded artifacts' },
+        include_routing_suggestions: { type: 'boolean', description: 'If true, include tiny suggest_task_agents output for this task' },
+        routing_limit: { type: 'number', description: 'Max routing suggestions to include (default 5, max 20)' },
       },
       required: ['task_id', 'agent_id'],
     },

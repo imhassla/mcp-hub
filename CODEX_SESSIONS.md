@@ -22,17 +22,13 @@ codex mcp get agent-hub --json
 3. If `agent-hub` is missing, add it to Codex globally:
 
 ```bash
-MCP_HUB_DATA="${MCP_HUB_DATA:-$HOME/.mcp-hub}"
-codex mcp add agent-hub -- \
-  docker run --rm -i \
-  -v "$MCP_HUB_DATA:/data" \
-  -e MCP_HUB_DB=/data/hub.db \
-  mcp-agent-hub
+codex mcp add agent-hub --url http://127.0.0.1:3000/mcp
+codex mcp get agent-hub --json
 ```
 
 4. Restart your Codex session after MCP config changes.
 
-5. Verify MCP handshake (quick smoke test):
+5. Verify MCP handshake, registration, and an authenticated read:
 
 ```bash
 ./hub.sh smoke
@@ -47,27 +43,23 @@ cd /path/to/another/project
 codex
 ```
 
-Important: all clients must use the same DB path (for example `~/.mcp-hub/hub.db`).
+Important: all clients must connect to the same daemon URL. The daemon alone owns the shared DB
+path (for example `~/.mcp-hub/hub.db`).
 
 ## 3) One-Off Run Without Global Config (single session only)
 
 You can pass MCP config directly in startup command:
 
 ```bash
-MCP_HUB_DATA="${MCP_HUB_DATA:-$HOME/.mcp-hub}"
 cd /path/to/another/project
-codex \
-  -c 'mcp_servers.agent-hub.command="docker"' \
-  -c "mcp_servers.agent-hub.args=[\"run\",\"--rm\",\"-i\",\"-v\",\"${MCP_HUB_DATA}:/data\",\"-e\",\"MCP_HUB_DB=/data/hub.db\",\"mcp-agent-hub\"]"
+codex -c 'mcp_servers.agent-hub.url="http://127.0.0.1:3000/mcp"'
 ```
 
 Pre-launch verification:
 
 ```bash
-MCP_HUB_DATA="${MCP_HUB_DATA:-$HOME/.mcp-hub}"
 codex mcp list --json \
-  -c 'mcp_servers.agent-hub.command="docker"' \
-  -c "mcp_servers.agent-hub.args=[\"run\",\"--rm\",\"-i\",\"-v\",\"${MCP_HUB_DATA}:/data\",\"-e\",\"MCP_HUB_DB=/data/hub.db\",\"mcp-agent-hub\"]"
+  -c 'mcp_servers.agent-hub.url="http://127.0.0.1:3000/mcp"'
 ```
 
 ## 4) Working Together With Claude
