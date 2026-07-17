@@ -13,6 +13,11 @@ import {
   sendMessage,
 } from '../db.js';
 import { withIdempotency } from '../utils.js';
+import {
+  ArtifactDownloadTicketCapacityError,
+  ArtifactUploadTicketCapacityError,
+} from '../artifact-ticket-limits.js';
+import { registerTransactionRollbackEffect } from '../eventNotifier.js';
 
 type ArtifactResponseMode = 'full' | 'compact' | 'tiny';
 type ArtifactTicketKind = 'upload' | 'download';
@@ -28,6 +33,7 @@ type IssueArtifactTicketArgs = {
 type IssuedArtifactTicket = {
   token: string;
   expires_at: number;
+  rollback?: () => void;
 };
 
 type TaskArtifactDownloadEntry = {
@@ -55,6 +61,8 @@ type TaskArtifactDownloadsSuccess = {
     skipped_limit: number;
     skipped_not_ready: number;
     skipped_no_access: number;
+    skipped_capacity: number;
+    capacity_limited: boolean;
   };
 };
 
@@ -141,7 +149,7 @@ export function handleCreateArtifactUpload(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'create_artifact_upload', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'create_artifact_upload', args.idempotency_key, args, () => {
     if (!issueArtifactTicket) {
       return {
         success: false,
@@ -164,6 +172,30 @@ export function handleCreateArtifactUpload(args: {
     const retentionSec = normalizeTtlSec(args.retention_sec, DEFAULT_ARTIFACT_RETENTION_SEC);
     const artifactId = randomUUID();
 
+    let ticket: IssuedArtifactTicket;
+    try {
+      ticket = issueArtifactTicket({
+        kind: 'upload',
+        artifact_id: artifactId,
+        agent_id: args.agent_id,
+        ttl_sec: uploadTtl,
+        max_bytes: maxBytes,
+      });
+      if (ticket.rollback) registerTransactionRollbackEffect(ticket.rollback);
+    } catch (error) {
+      if (error instanceof ArtifactUploadTicketCapacityError) {
+        return {
+          success: false,
+          error_code: error.reason === 'global'
+            ? 'ARTIFACT_UPLOAD_TICKET_CAPACITY_EXCEEDED'
+            : 'ARTIFACT_UPLOAD_TICKET_AGENT_LIMIT_EXCEEDED',
+          error: error.message,
+          retryable: true,
+        };
+      }
+      throw error;
+    }
+
     const artifact = createArtifactRecord({
       id: artifactId,
       created_by: args.agent_id,
@@ -172,14 +204,6 @@ export function handleCreateArtifactUpload(args: {
       namespace: args.namespace,
       summary: normalizeSummary(args.summary),
       ttl_expires_at: Date.now() + (retentionSec * 1000),
-    });
-
-    const ticket = issueArtifactTicket({
-      kind: 'upload',
-      artifact_id: artifactId,
-      agent_id: args.agent_id,
-      ttl_sec: uploadTtl,
-      max_bytes: maxBytes,
     });
 
     logActivity(args.agent_id, 'create_artifact_upload', `artifact_id=${artifactId} name=${name} max_bytes=${maxBytes}`);
@@ -205,7 +229,7 @@ export function handleCreateArtifactDownload(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'create_artifact_download', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'create_artifact_download', args.idempotency_key, args, () => {
     if (!issueArtifactTicket) {
       return {
         success: false,
@@ -247,13 +271,29 @@ export function handleCreateArtifactDownload(args: {
     }
 
     const ttlSec = normalizeTtlSec(args.ttl_sec, DEFAULT_DOWNLOAD_TTL_SEC);
-    const ticket = issueArtifactTicket({
-      kind: 'download',
-      artifact_id: artifactId,
-      agent_id: args.agent_id,
-      ttl_sec: ttlSec,
-      max_bytes: Math.max(1024, artifact.size_bytes),
-    });
+    let ticket: IssuedArtifactTicket;
+    try {
+      ticket = issueArtifactTicket({
+        kind: 'download',
+        artifact_id: artifactId,
+        agent_id: args.agent_id,
+        ttl_sec: ttlSec,
+        max_bytes: Math.max(1024, artifact.size_bytes),
+      });
+      if (ticket.rollback) registerTransactionRollbackEffect(ticket.rollback);
+    } catch (error) {
+      if (error instanceof ArtifactDownloadTicketCapacityError) {
+        return {
+          success: false,
+          error_code: error.reason === 'global'
+            ? 'ARTIFACT_DOWNLOAD_TICKET_CAPACITY_EXCEEDED'
+            : 'ARTIFACT_DOWNLOAD_TICKET_AGENT_LIMIT_EXCEEDED',
+          error: error.message,
+          retryable: true,
+        };
+      }
+      throw error;
+    }
 
     logActivity(args.agent_id, 'create_artifact_download', `artifact_id=${artifactId}`);
 
@@ -279,7 +319,7 @@ export function handleCreateTaskArtifactDownloads(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'create_task_artifact_downloads', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'create_task_artifact_downloads', args.idempotency_key, args, () => {
     const result = buildTaskArtifactDownloads({
       agent_id: args.agent_id,
       task_id: args.task_id,
@@ -291,7 +331,7 @@ export function handleCreateTaskArtifactDownloads(args: {
       logActivity(
         args.agent_id,
         'create_task_artifact_downloads',
-        `task_id=${result.task_id} issued=${result.downloads.length} skipped_limit=${result.summary.skipped_limit} skipped_not_ready=${result.summary.skipped_not_ready} skipped_no_access=${result.summary.skipped_no_access}`
+        `task_id=${result.task_id} issued=${result.downloads.length} skipped_limit=${result.summary.skipped_limit} skipped_not_ready=${result.summary.skipped_not_ready} skipped_no_access=${result.summary.skipped_no_access} skipped_capacity=${result.summary.skipped_capacity}`
       );
     }
     return result;
@@ -331,8 +371,10 @@ export function buildTaskArtifactDownloads(args: {
   const downloads: TaskArtifactDownloadEntry[] = [];
   let skippedNotReady = 0;
   let skippedNoAccess = 0;
+  let skippedCapacity = 0;
 
-  for (const row of consideredRows) {
+  for (let index = 0; index < consideredRows.length; index += 1) {
+    const row = consideredRows[index];
     const ready = Boolean(row.artifact_sha256 && row.artifact_size_bytes > 0);
     if (onlyReady && !ready) {
       skippedNotReady += 1;
@@ -342,13 +384,21 @@ export function buildTaskArtifactDownloads(args: {
       skippedNoAccess += 1;
       continue;
     }
-    const ticket = issueArtifactTicket({
-      kind: 'download',
-      artifact_id: row.artifact_id,
-      agent_id: args.agent_id,
-      ttl_sec: ttlSec,
-      max_bytes: Math.max(1024, row.artifact_size_bytes),
-    });
+    let ticket: IssuedArtifactTicket;
+    try {
+      ticket = issueArtifactTicket({
+        kind: 'download',
+        artifact_id: row.artifact_id,
+        agent_id: args.agent_id,
+        ttl_sec: ttlSec,
+        max_bytes: Math.max(1024, row.artifact_size_bytes),
+      });
+      if (ticket.rollback) registerTransactionRollbackEffect(ticket.rollback);
+    } catch (error) {
+      if (!(error instanceof ArtifactDownloadTicketCapacityError)) throw error;
+      skippedCapacity = consideredRows.length - index;
+      break;
+    }
     downloads.push({
       artifact_id: row.artifact_id,
       name: row.artifact_name,
@@ -375,6 +425,8 @@ export function buildTaskArtifactDownloads(args: {
       skipped_limit: skippedLimit,
       skipped_not_ready: skippedNotReady,
       skipped_no_access: skippedNoAccess,
+      skipped_capacity: skippedCapacity,
+      capacity_limited: skippedCapacity > 0,
     },
   };
 }
@@ -390,7 +442,7 @@ export function handleShareArtifact(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'share_artifact', args.idempotency_key, () => {
+  return withIdempotency(args.from_agent, 'share_artifact', args.idempotency_key, args, () => {
     const artifactId = (args.artifact_id || '').trim();
     if (!artifactId) {
       return {
@@ -433,6 +485,18 @@ export function handleShareArtifact(args: {
       };
     }
     const target = toAgent;
+    const taskId = Number.isFinite(args.task_id) ? Math.floor(Number(args.task_id)) : null;
+    const task = taskId !== null ? getTaskById(taskId) : null;
+    if (taskId !== null && !task) {
+      return {
+        success: false,
+        error_code: 'TASK_NOT_FOUND',
+        error: 'Task not found',
+      };
+    }
+
+    // Validate every referenced object before widening access. A failed task binding must not
+    // leave behind a successful artifact grant.
     grantArtifactAccess({ artifact_id: artifactId, to_agent: target, granted_by: args.from_agent });
     let taskBinding:
       | {
@@ -443,16 +507,7 @@ export function handleShareArtifact(args: {
           assignee: string | null;
         }
       | undefined;
-    if (Number.isFinite(args.task_id)) {
-      const taskId = Math.floor(Number(args.task_id));
-      const task = getTaskById(taskId);
-      if (!task) {
-        return {
-          success: false,
-          error_code: 'TASK_NOT_FOUND',
-          error: 'Task not found',
-        };
-      }
+    if (taskId !== null && task) {
       const linked = attachTaskArtifact(taskId, artifactId, args.from_agent);
       const autoShareAssignee = args.auto_share_assignee !== false;
       let sharedToAssignee = false;

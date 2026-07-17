@@ -7,9 +7,10 @@ import path from 'path';
 import express from 'express';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
+import { localhostHostValidation } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js';
 import { z } from 'zod';
 import { getDb } from './db.js';
+import { MAX_IDEMPOTENCY_KEY_CHARS } from './utils.js';
 import { agentTools, handleRegisterAgent, handleListAgents, handleSuggestAgents, handleGetOnboarding, handleUpdateRuntimeProfile } from './tools/agents.js';
 import { messageTools, handleSendMessage, handleSendBlobMessage, handleReadMessages } from './tools/messages.js';
 import {
@@ -79,6 +80,15 @@ import {
   handleListArtifacts,
   handleShareArtifact,
 } from './tools/artifacts.js';
+import {
+  ArtifactDownloadTicketCapacityError,
+  ArtifactDownloadTicketLimiter,
+  ArtifactUploadReservationManager,
+  ArtifactUploadTicketCapacityError,
+  ArtifactUploadTicketLimiter,
+  type ArtifactUploadReservation,
+} from './artifact-ticket-limits.js';
+import { describeHttpError } from './http-errors.js';
 import { searchTools, handleSearchHub } from './tools/search.js';
 import { refTools, handleFetchHubRefs } from './tools/refs.js';
 import { filterTools, handleSaveFilter, handleListFilters, handleReadFilterFeed, handleDeleteFilter } from './tools/filters.js';
@@ -87,8 +97,17 @@ import { digestTools, handleGetHubDigest } from './tools/digest.js';
 import { memoryTools, handleWriteMemory, handleSearchMemory, handleGetMemoryDigest } from './tools/memory.js';
 import { traceTools, handleGetTraceTimeline } from './tools/traces.js';
 import { threadTools, handleStartThread, handleReplyThread, handleReadThread } from './tools/threads.js';
-import { validateRegisterToken } from './auth.js';
+import { extractAgentAuthPayload, resolveAuthMode, resolveOriginMode, validateRegisterToken } from './auth.js';
 import { onStreamEvent } from './eventNotifier.js';
+import {
+  evaluateSessionInitializationAdmission,
+  getSessionExpiryReason,
+  pruneIdleRefilledTokenBuckets,
+  requestHasPromotableAgentAuth,
+} from './session-lifecycle.js';
+
+// Tokens, SQLite journals, and artifact payloads must not inherit a permissive host umask.
+process.umask(0o077);
 
 function createServer() {
   return new McpServer({
@@ -137,30 +156,6 @@ function jsonRpcErrorResponse(id: unknown, code: number, message: string, data?:
   };
 }
 
-function extractAgentAuthPayload(args: Record<string, unknown>): { agentId: string | null; authToken: string | null } {
-  const candidateAgentKeys = ['agent_id', 'from_agent', 'created_by', 'requesting_agent'] as const;
-  const candidateTokenKeys = ['auth_token'] as const;
-  let agentId: string | null = null;
-  let authToken: string | null = null;
-
-  for (const key of candidateAgentKeys) {
-    const value = args[key];
-    if (typeof value === 'string' && value.trim().length > 0) {
-      agentId = value.trim();
-      break;
-    }
-  }
-  for (const key of candidateTokenKeys) {
-    const value = args[key];
-    if (typeof value === 'string' && value.trim().length > 0) {
-      authToken = value.trim();
-      break;
-    }
-  }
-
-  return { agentId, authToken };
-}
-
 type TokenBucket = {
   tokens: number;
   lastRefillAt: number;
@@ -184,12 +179,18 @@ const RATE_LIMIT_BUCKET_IDLE_TTL_MS = Number.isFinite(Number(process.env.MCP_HUB
   ? Math.max(60_000, Math.min(24 * 60 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_RATE_LIMIT_BUCKET_IDLE_TTL_MS))))
   : 10 * 60 * 1000;
 const REQUIRE_AUTH = String(process.env.MCP_HUB_REQUIRE_AUTH || '').toLowerCase() === 'true';
-const AUTH_MODE = (() => {
-  const configured = String(process.env.MCP_HUB_AUTH_MODE || '').toLowerCase().trim();
-  if (configured === 'observe' || configured === 'warn' || configured === 'enforce') return configured;
-  return REQUIRE_AUTH ? 'enforce' : 'observe';
-})();
+const AUTH_MODE = resolveAuthMode(process.env.MCP_HUB_AUTH_MODE, REQUIRE_AUTH);
 const REGISTER_TOKEN = String(process.env.MCP_HUB_REGISTER_TOKEN || '').trim();
+const ALLOW_LEGACY_AGENT_CLAIM = String(process.env.MCP_HUB_ALLOW_LEGACY_AGENT_CLAIM || '').toLowerCase() === 'true';
+if (ALLOW_LEGACY_AGENT_CLAIM && !REGISTER_TOKEN) {
+  throw new Error('MCP_HUB_ALLOW_LEGACY_AGENT_CLAIM=true requires MCP_HUB_REGISTER_TOKEN');
+}
+const REGISTER_RATE_LIMIT_RPS = Number.isFinite(Number(process.env.MCP_HUB_REGISTER_RATE_LIMIT_RPS))
+  ? Math.max(0.1, Math.min(1_000, Number(process.env.MCP_HUB_REGISTER_RATE_LIMIT_RPS)))
+  : 5;
+const REGISTER_RATE_LIMIT_BURST = Number.isFinite(Number(process.env.MCP_HUB_REGISTER_RATE_LIMIT_BURST))
+  ? Math.max(1, Math.min(10_000, Math.floor(Number(process.env.MCP_HUB_REGISTER_RATE_LIMIT_BURST))))
+  : 20;
 const MAINTENANCE_INTERVAL_MS = Number(process.env.MCP_HUB_MAINTENANCE_INTERVAL_MS || 30_000);
 const SESSION_IDLE_TIMEOUT_MS = (() => {
   const raw = Number(process.env.MCP_HUB_SESSION_IDLE_TIMEOUT_MS);
@@ -200,15 +201,45 @@ const SESSION_IDLE_TIMEOUT_MS = (() => {
 })();
 const SESSION_GC_ENABLED = SESSION_IDLE_TIMEOUT_MS > 0;
 const SESSION_IDLE_TIMEOUT_LABEL = SESSION_GC_ENABLED ? String(SESSION_IDLE_TIMEOUT_MS) : 'disabled';
+const SESSION_PROVISIONAL_TTL_MS = Number.isFinite(Number(process.env.MCP_HUB_SESSION_PROVISIONAL_TTL_MS))
+  ? Math.max(1_000, Math.min(10 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_SESSION_PROVISIONAL_TTL_MS))))
+  : 60_000;
 const SESSION_GC_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_HUB_SESSION_GC_INTERVAL_MS))
   ? Math.max(1_000, Math.min(30 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_SESSION_GC_INTERVAL_MS))))
   : 60_000;
+const MAX_SESSIONS = Number.isFinite(Number(process.env.MCP_HUB_MAX_SESSIONS))
+  ? Math.max(1, Math.min(100_000, Math.floor(Number(process.env.MCP_HUB_MAX_SESSIONS))))
+  : 500;
+const MAX_SESSIONS_PER_SOURCE = Number.isFinite(Number(process.env.MCP_HUB_MAX_SESSIONS_PER_SOURCE))
+  ? Math.max(1, Math.min(MAX_SESSIONS, Math.floor(Number(process.env.MCP_HUB_MAX_SESSIONS_PER_SOURCE))))
+  : Math.min(100, MAX_SESSIONS);
+const SESSION_INITIALIZE_RPS = Number.isFinite(Number(process.env.MCP_HUB_SESSION_INITIALIZE_RPS))
+  ? Math.max(0.1, Math.min(1_000, Number(process.env.MCP_HUB_SESSION_INITIALIZE_RPS)))
+  : 10;
+const SESSION_INITIALIZE_BURST = Number.isFinite(Number(process.env.MCP_HUB_SESSION_INITIALIZE_BURST))
+  ? Math.max(1, Math.min(10_000, Math.floor(Number(process.env.MCP_HUB_SESSION_INITIALIZE_BURST))))
+  : 20;
 const ARTIFACT_TICKET_TTL_SEC = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_TICKET_TTL_SEC))
   ? Math.max(30, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_TICKET_TTL_SEC)))
   : 300;
 const ARTIFACT_MAX_BYTES = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_MAX_BYTES))
   ? Math.max(1024, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_MAX_BYTES)))
   : 50 * 1024 * 1024;
+const ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE))
+  ? Math.max(1, Math.min(1_000_000, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE))))
+  : 10_000;
+const ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT))
+  ? Math.max(1, Math.min(ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT))))
+  : Math.min(100, ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE);
+const ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE))
+  ? Math.max(1, Math.min(1_000_000, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE))))
+  : 20_000;
+const ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT))
+  ? Math.max(1, Math.min(ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT))))
+  : Math.min(200, ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE);
+const ARTIFACT_UPLOAD_RESERVATION_TTL_MS = Number.isFinite(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_RESERVATION_TTL_MS))
+  ? Math.max(1_000, Math.min(30 * 60 * 1000, Math.floor(Number(process.env.MCP_HUB_ARTIFACT_UPLOAD_RESERVATION_TTL_MS))))
+  : 5 * 60 * 1000;
 const ARTIFACTS_DIR = process.env.MCP_HUB_ARTIFACTS_DIR || '/data/artifacts';
 const EVENT_STREAM_DEFAULT_INTERVAL_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_INTERVAL_MS))
   ? Math.max(250, Math.min(10_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_INTERVAL_MS))))
@@ -228,10 +259,7 @@ const EVENT_STREAM_MAX_BUFFER_BYTES = Number.isFinite(Number(process.env.MCP_HUB
 const EVENT_STREAM_DRAIN_TIMEOUT_MS = Number.isFinite(Number(process.env.MCP_HUB_EVENT_STREAM_DRAIN_TIMEOUT_MS))
   ? Math.max(500, Math.min(60_000, Math.floor(Number(process.env.MCP_HUB_EVENT_STREAM_DRAIN_TIMEOUT_MS))))
   : 5_000;
-const ORIGIN_MODE = (() => {
-  const configured = String(process.env.MCP_HUB_ORIGIN_MODE || 'warn').toLowerCase().trim();
-  return configured === 'enforce' ? 'enforce' : 'warn';
-})();
+const ORIGIN_MODE = resolveOriginMode(process.env.MCP_HUB_ORIGIN_MODE);
 const STRICT_SESSION_STATUS = String(process.env.MCP_HUB_STRICT_SESSION_STATUS || '').toLowerCase() === 'true';
 
 type ArtifactTicket = {
@@ -241,11 +269,45 @@ type ArtifactTicket = {
   agent_id: string;
   expires_at: number;
   max_bytes: number;
+  state: 'issued' | 'reserved';
+  reservation_id: string | null;
+  reservation_expires_at: number | null;
 };
 
+type ActiveArtifactUploadReservation = ArtifactUploadReservation<ArtifactTicket>;
+
 const artifactTickets = new Map<string, ArtifactTicket>();
+const artifactUploadTicketLimiter = new ArtifactUploadTicketLimiter(
+  ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE,
+  ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT,
+);
+const artifactDownloadTicketLimiter = new ArtifactDownloadTicketLimiter(
+  ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE,
+  ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT,
+);
+const artifactUploadReservationManager = new ArtifactUploadReservationManager(
+  artifactTickets,
+  deleteArtifactTicket,
+  ARTIFACT_UPLOAD_RESERVATION_TTL_MS,
+  randomUUID,
+);
 const eventStreamCountsByAgent = new Map<string, number>();
 let activeEventStreamCount = 0;
+let registrationRateBucket: TokenBucket | null = null;
+
+function consumeRegistrationRateLimit(now = Date.now()): boolean {
+  const bucket = registrationRateBucket || { tokens: REGISTER_RATE_LIMIT_BURST, lastRefillAt: now };
+  const elapsedMs = Math.max(0, now - bucket.lastRefillAt);
+  bucket.tokens = Math.min(REGISTER_RATE_LIMIT_BURST, bucket.tokens + ((elapsedMs / 1000) * REGISTER_RATE_LIMIT_RPS));
+  bucket.lastRefillAt = now;
+  if (bucket.tokens < 1) {
+    registrationRateBucket = bucket;
+    return false;
+  }
+  bucket.tokens -= 1;
+  registrationRateBucket = bucket;
+  return true;
+}
 
 function consumeRateLimit(agentId: string, now = Date.now()): boolean {
   if (!Number.isFinite(RATE_LIMIT_RPS) || RATE_LIMIT_RPS <= 0 || !Number.isFinite(RATE_LIMIT_BURST) || RATE_LIMIT_BURST <= 0) {
@@ -328,14 +390,12 @@ function consumeNamespaceTokenBudget(namespace: string, tokenCost: number, now =
 function cleanupRateLimitState(now = Date.now()): number {
   let cleaned = 0;
   const cleanupBuckets = (buckets: Map<string, TokenBucket>, burst: number, rps: number) => {
-    for (const [key, bucket] of buckets.entries()) {
-      if ((now - bucket.lastRefillAt) < RATE_LIMIT_BUCKET_IDLE_TTL_MS) continue;
-      const elapsedMs = Math.max(0, now - bucket.lastRefillAt);
-      const effectiveTokens = Math.min(burst, bucket.tokens + (elapsedMs / 1000) * rps);
-      if (effectiveTokens < burst) continue;
-      buckets.delete(key);
-      cleaned += 1;
-    }
+    cleaned += pruneIdleRefilledTokenBuckets(buckets, {
+      now,
+      idleTtlMs: RATE_LIMIT_BUCKET_IDLE_TTL_MS,
+      burst,
+      rps,
+    });
   };
 
   if (Number.isFinite(RATE_LIMIT_RPS) && RATE_LIMIT_RPS > 0 && Number.isFinite(RATE_LIMIT_BURST) && RATE_LIMIT_BURST > 0) {
@@ -344,6 +404,7 @@ function cleanupRateLimitState(now = Date.now()): number {
   if (Number.isFinite(NAMESPACE_QUOTA_RPS) && NAMESPACE_QUOTA_RPS > 0 && Number.isFinite(NAMESPACE_QUOTA_BURST) && NAMESPACE_QUOTA_BURST > 0) {
     cleanupBuckets(namespaceRateBuckets, NAMESPACE_QUOTA_BURST, NAMESPACE_QUOTA_RPS);
   }
+  cleanupBuckets(sessionInitializeBuckets, SESSION_INITIALIZE_BURST, SESSION_INITIALIZE_RPS);
 
   for (const [key, window] of namespaceTokenBudgetWindows.entries()) {
     if ((now - window.windowStartAt) < Math.max(2 * 60_000, RATE_LIMIT_BUCKET_IDLE_TTL_MS)) continue;
@@ -509,6 +570,11 @@ function sanitizeArtifactId(value: string): string {
   return (value || '').replace(/[^a-zA-Z0-9-_]/g, '');
 }
 
+function firstStringValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] || '';
+  return typeof value === 'string' ? value : '';
+}
+
 function artifactPathForId(artifactId: string): string {
   const safeId = sanitizeArtifactId(artifactId);
   return path.join(ARTIFACTS_DIR, safeId);
@@ -528,46 +594,109 @@ function issueArtifactTicket(args: {
   agent_id: string;
   ttl_sec: number;
   max_bytes: number;
-}): { token: string; expires_at: number } {
+}): { token: string; expires_at: number; rollback: () => void } {
   const ttlSec = Number.isFinite(args.ttl_sec)
     ? Math.max(30, Math.min(24 * 60 * 60, Math.floor(Number(args.ttl_sec))))
     : ARTIFACT_TICKET_TTL_SEC;
   const maxBytes = Number.isFinite(args.max_bytes)
     ? Math.max(1024, Math.min(ARTIFACT_MAX_BYTES, Math.floor(Number(args.max_bytes))))
     : ARTIFACT_MAX_BYTES;
-  const token = `${randomUUID()}-${randomUUID()}`;
+  let token = `${randomUUID()}-${randomUUID()}`;
+  while (artifactTickets.has(token)) token = `${randomUUID()}-${randomUUID()}`;
   const expiresAt = Date.now() + ttlSec * 1000;
-  artifactTickets.set(token, {
+  const limiter = args.kind === 'upload' ? artifactUploadTicketLimiter : artifactDownloadTicketLimiter;
+  try {
+    limiter.acquire(args.agent_id);
+  } catch (error) {
+    const capacityError = args.kind === 'upload'
+      ? error instanceof ArtifactUploadTicketCapacityError
+      : error instanceof ArtifactDownloadTicketCapacityError;
+    if (!capacityError) throw error;
+    cleanupExpiredArtifactTickets();
+    limiter.acquire(args.agent_id);
+  }
+  try {
+    artifactTickets.set(token, {
+      token,
+      kind: args.kind,
+      artifact_id: args.artifact_id,
+      agent_id: args.agent_id,
+      expires_at: expiresAt,
+      max_bytes: maxBytes,
+      state: 'issued',
+      reservation_id: null,
+      reservation_expires_at: null,
+    });
+  } catch (error) {
+    limiter.release(args.agent_id);
+    throw error;
+  }
+  return {
     token,
-    kind: args.kind,
-    artifact_id: args.artifact_id,
-    agent_id: args.agent_id,
     expires_at: expiresAt,
-    max_bytes: maxBytes,
-  });
-  return { token, expires_at: expiresAt };
+    rollback: () => {
+      deleteArtifactTicket(token);
+    },
+  };
+}
+
+function deleteArtifactTicket(token: string): boolean {
+  const ticket = artifactTickets.get(token);
+  if (!ticket || !artifactTickets.delete(token)) return false;
+  if (ticket.kind === 'upload') artifactUploadTicketLimiter.release(ticket.agent_id);
+  else artifactDownloadTicketLimiter.release(ticket.agent_id);
+  return true;
 }
 
 function consumeArtifactTicket(token: string, kind: 'upload' | 'download', artifactId: string): ArtifactTicket | null {
   const ticket = artifactTickets.get(token);
   if (!ticket) return null;
+  if (ticket.state !== 'issued') return null;
   if (ticket.kind !== kind || ticket.artifact_id !== artifactId) return null;
   if (ticket.expires_at < Date.now()) {
-    artifactTickets.delete(token);
+    deleteArtifactTicket(token);
     return null;
   }
-  artifactTickets.delete(token);
+  deleteArtifactTicket(token);
   return ticket;
 }
 
-function cleanupExpiredArtifactTickets(now = Date.now()): number {
-  let cleaned = 0;
+function reserveArtifactUploadTicket(token: string, artifactId: string): ActiveArtifactUploadReservation | null {
+  return artifactUploadReservationManager.reserve(token, artifactId);
+}
+
+function releaseArtifactUploadReservation(reservation: ActiveArtifactUploadReservation | undefined) {
+  artifactUploadReservationManager.release(reservation);
+}
+
+function commitArtifactUploadReservation(reservation: ActiveArtifactUploadReservation): boolean {
+  return artifactUploadReservationManager.commit(reservation);
+}
+
+function cleanupExpiredArtifactTickets(now = Date.now()): { deleted: number; reservations_expired: number } {
+  const reservationsExpired = artifactUploadReservationManager.consumeExpired(now);
+  let deleted = reservationsExpired;
   for (const [token, ticket] of artifactTickets.entries()) {
-    if (ticket.expires_at >= now) continue;
-    artifactTickets.delete(token);
-    cleaned += 1;
+    if (ticket.expires_at > now) continue;
+    if (deleteArtifactTicket(token)) deleted += 1;
   }
-  return cleaned;
+  return { deleted, reservations_expired: reservationsExpired };
+}
+
+function artifactTicketStateSnapshot() {
+  let uploadsIssued = 0;
+  let uploadsReserved = 0;
+  let downloadsIssued = 0;
+  for (const ticket of artifactTickets.values()) {
+    if (ticket.kind === 'download') downloadsIssued += 1;
+    else if (ticket.state === 'reserved') uploadsReserved += 1;
+    else uploadsIssued += 1;
+  }
+  return {
+    uploads_issued: uploadsIssued,
+    uploads_reserved: uploadsReserved,
+    downloads_issued: downloadsIssued,
+  };
 }
 
 type ToolGuardResult =
@@ -598,7 +727,7 @@ const runtimeModelProfileSchema = z.object({
 }).optional();
 
 function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGuardResult {
-  const { agentId, authToken } = extractAgentAuthPayload(args);
+  const { agentId, authToken } = extractAgentAuthPayload(toolName, args);
   const now = Date.now();
   const warnings: string[] = [];
   let quotaNamespace: string | undefined;
@@ -649,6 +778,19 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
 
   if (shouldBypassAuth(toolName)) {
     const registerAgentId = typeof args.id === 'string' && args.id.trim().length > 0 ? args.id.trim() : agentId;
+    // Apply admission before token validation/audit so invalid bootstrap-token floods cannot turn
+    // synchronous auth_events writes into an unbounded disk/CPU amplifier.
+    if (!consumeRegistrationRateLimit(now)) {
+      return {
+        allowed: false,
+        response: {
+          success: false,
+          error_code: 'REGISTER_RATE_LIMIT_EXCEEDED',
+          error: 'Registration rate limit exceeded. Retry shortly.',
+          retry_after_ms: 1000,
+        },
+      };
+    }
     if (REGISTER_TOKEN) {
       const registerAuth = validateRegisterToken(REGISTER_TOKEN, args);
       if (!registerAuth.ok) {
@@ -668,8 +810,8 @@ function guardToolCall(toolName: string, args: Record<string, unknown>): ToolGua
     } else {
       recordAuthEvent(registerAgentId, toolName, 'skipped');
     }
-    const quotaRejection = applyQuotas();
-    if (quotaRejection) return quotaRejection;
+    // Registration has no authenticated caller yet. Never debit the caller-supplied id's normal
+    // bucket: doing so lets an unauthenticated registrant exhaust another agent's quota.
     return allow();
   }
 
@@ -814,11 +956,12 @@ function registerTools(server: McpServer) {
     'register_agent',
     agentTools.register_agent.description,
     {
-      id: z.string().describe('Unique agent identifier'),
+      id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,119}$/).describe('Unique safe agent identifier (1..120 characters; wildcard values are reserved)'),
       name: z.string().describe('Human-readable agent name'),
       type: z.string().describe('Agent type (e.g. claude, codex, custom)'),
       register_token: z.string().optional().describe('Registration secret required when MCP_HUB_REGISTER_TOKEN is configured'),
-      auth_token: z.string().optional().describe('Existing auth token for this agent id; required to retrieve the token when re-registering an agent that already exists (proof of ownership)'),
+      registration_token: z.string().optional().describe('Legacy alias for register_token'),
+      auth_token: z.string().max(512).optional().describe('Existing ownership token, or a strong 32..512 character client-generated token on first registration for response-loss recovery'),
       capabilities: z.string().optional().describe('Comma-separated list of capabilities'),
       client_capabilities: z.object({
         response_modes: z.array(z.enum(['full', 'compact', 'tiny', 'nano'])).optional(),
@@ -842,7 +985,10 @@ function registerTools(server: McpServer) {
         model: runtimeModelProfileSchema.describe('Optional model identity/capability profile for model-aware orchestration'),
       }).optional().describe('Optional runtime profile used for execution-mode task routing'),
     },
-    guardedTool('register_agent', (args) => handleRegisterAgent(args as any))
+    guardedTool('register_agent', (args) => handleRegisterAgent({
+      ...(args as any),
+      allow_legacy_claim: ALLOW_LEGACY_AGENT_CLAIM && Boolean(REGISTER_TOKEN),
+    }))
   );
 
   server.tool(
@@ -870,7 +1016,7 @@ function registerTools(server: McpServer) {
     'list_agents',
     agentTools.list_agents.description,
     {
-      agent_id: z.string().optional().describe('Your agent ID (for heartbeat)'),
+      agent_id: z.string().describe('Authenticated caller agent ID'),
       limit: z.number().optional().describe('Max rows to return (default 100)'),
       offset: z.number().optional().describe('Row offset for pagination (default 0)'),
       response_mode: z.enum(['full', 'compact', 'summary']).optional().describe('compact trims fields, summary returns runtime/model aggregate counts'),
@@ -927,8 +1073,8 @@ function registerTools(server: McpServer) {
       metadata: z.string().optional().describe('JSON metadata string'),
       trace_id: z.string().optional().describe('Optional trace identifier for cross-tool diagnostics'),
       span_id: z.string().optional().describe('Optional span identifier for this message emission'),
-      compression_mode: z.enum(['none', 'whitespace', 'auto']).optional().describe('Optional token-saving compression mode (default auto)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      compression_mode: z.enum(['none', 'whitespace', 'auto']).optional().describe('Optional lossy whitespace compression (default none preserves content exactly)'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('send_message', (args) => handleSendMessage(args as any))
@@ -946,7 +1092,7 @@ function registerTools(server: McpServer) {
       span_id: z.string().optional().describe('Optional span identifier for this message emission'),
       compression_mode: z.enum(['none', 'json', 'whitespace', 'auto', 'lossless_auto']).optional().describe('Compression mode before hashing/storage (lossless_auto is strict and reversible)'),
       hash_truncate: z.number().optional().describe('Optional short hash length in response (8..64)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('send_blob_message', (args) => handleSendBlobMessage(args as any))
@@ -981,7 +1127,7 @@ function registerTools(server: McpServer) {
       title: z.string().describe('Thread title'),
       content: z.string().describe('Initial message content'),
       thread_id: z.string().optional().describe('Optional stable thread id; generated if omitted'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('start_thread', (args) => handleStartThread(args as any))
@@ -997,7 +1143,7 @@ function registerTools(server: McpServer) {
       to_agent: z.string().optional().describe('Optional target agent; omit for broadcast reply'),
       parent_message_id: z.number().optional().describe('Optional parent message id'),
       role: z.string().optional().describe('Optional role label, e.g. hypothesis/review/decision'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('reply_thread', (args) => handleReplyThread(args as any))
@@ -1178,7 +1324,7 @@ function registerTools(server: McpServer) {
       namespace: z.string().optional().describe('Memory namespace (default memory)'),
       tags: z.array(z.string()).optional().describe('Optional tags'),
       importance: z.number().optional().describe('Importance 0..1 for digest ordering'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('write_memory', (args) => handleWriteMemory(args as any))
@@ -1245,7 +1391,7 @@ function registerTools(server: McpServer) {
       trace_id: z.string().optional().describe('Optional trace identifier for cross-tool diagnostics'),
       span_id: z.string().optional().describe('Optional span identifier for task creation event'),
       depends_on: z.array(z.number()).optional().describe('Optional dependency task IDs that must be done first'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('create_task', (args) => handleCreateTask(args as any))
@@ -1258,7 +1404,7 @@ function registerTools(server: McpServer) {
       id: z.number().describe('Task ID'),
       agent_id: z.string().describe('Your agent ID'),
       status: z.enum(['pending', 'in_progress', 'done', 'blocked']).optional().describe('New status'),
-      assigned_to: z.string().optional().describe('Reassign to agent ID'),
+      assigned_to: z.string().nullable().optional().describe('Reassign to agent ID; null clears assignment'),
       title: z.string().optional().describe('New title'),
       description: z.string().optional().describe('New description'),
       priority: z.enum(['low', 'medium', 'high', 'critical']).optional().describe('New priority'),
@@ -1272,7 +1418,7 @@ function registerTools(server: McpServer) {
       verification_passed: z.boolean().optional().describe('Whether verify-before-done checks passed (required for done)'),
       verified_by: z.string().optional().describe('Independent verifier agent ID (recommended when confidence below threshold)'),
       evidence_refs: z.array(z.string()).optional().describe('Optional evidence references persisted with task update; done transitions require evidence_refs coverage'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('update_task', (args) => handleUpdateTask(args as any))
@@ -1330,7 +1476,7 @@ function registerTools(server: McpServer) {
       lease_seconds: z.number().optional().describe('Optional lease duration in seconds (default 300)'),
       namespace: z.string().optional().describe('Optional namespace/tag filter'),
       include_artifacts: z.boolean().optional().describe('Include tiny task artifact refs in claim response'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('poll_and_claim', (args) => handlePollAndClaim(args as any))
@@ -1345,7 +1491,7 @@ function registerTools(server: McpServer) {
       lease_seconds: z.number().optional().describe('Lease duration in seconds (30..86400, default 300)'),
       namespace: z.string().optional().describe('Optional namespace/tag guard'),
       include_artifacts: z.boolean().optional().describe('Include tiny task artifact refs in claim response'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('claim_task', (args) => handleClaimTask(args as any))
@@ -1359,7 +1505,7 @@ function registerTools(server: McpServer) {
       agent_id: z.string().describe('Your agent ID'),
       lease_seconds: z.number().optional().describe('New lease duration in seconds (30..86400, default 300)'),
       claim_id: z.string().optional().describe('Optional expected claim ID (recommended for stale-write protection)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('renew_task_claim', (args) => handleRenewTaskClaim(args as any))
@@ -1372,13 +1518,14 @@ function registerTools(server: McpServer) {
       task_id: z.number().describe('Task ID'),
       agent_id: z.string().describe('Your agent ID'),
       next_status: z.enum(['pending', 'done', 'blocked']).optional().describe('Final status after release (default pending)'),
+      preserve_assignment: z.boolean().optional().describe('Keep the task assigned to this agent when releasing to pending or blocked (default false)'),
       claim_id: z.string().optional().describe('Optional expected claim ID (recommended for stale-write protection)'),
       consistency_mode: z.enum(['cheap', 'strict']).optional().describe('Override task consistency mode for done gate evaluation in this release call'),
       confidence: z.number().optional().describe('Confidence score (0..1), required when next_status=done'),
       verification_passed: z.boolean().optional().describe('Whether verify-before-done checks passed (required when next_status=done)'),
       verified_by: z.string().optional().describe('Independent verifier agent ID (recommended when confidence below threshold)'),
       evidence_refs: z.array(z.string()).optional().describe('Optional evidence references persisted with claim release; done transitions require evidence_refs coverage'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('release_task_claim', (args) => handleReleaseTaskClaim(args as any))
@@ -1403,7 +1550,7 @@ function registerTools(server: McpServer) {
       agent_id: z.string().describe('Your agent ID'),
       archive: z.boolean().optional().describe('Archive before delete (default true)'),
       reason: z.string().optional().describe('Optional reason'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('delete_task', (args) => handleDeleteTask(args as any))
@@ -1417,7 +1564,7 @@ function registerTools(server: McpServer) {
       artifact_id: z.string().describe('Artifact ID to attach'),
       agent_id: z.string().describe('Your agent ID'),
       auto_share_assignee: z.boolean().optional().describe('If true (default), grant artifact access to current task assignee'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('attach_task_artifact', (args) => handleAttachTaskArtifact(args as any))
@@ -1468,8 +1615,8 @@ function registerTools(server: McpServer) {
       namespace: z.string().optional().describe('Optional context namespace/tag (default "default")'),
       trace_id: z.string().optional().describe('Optional trace identifier for cross-tool diagnostics'),
       span_id: z.string().optional().describe('Optional span identifier for this context update'),
-      compression_mode: z.enum(['none', 'json', 'whitespace', 'auto']).optional().describe('Optional token-saving compression mode (default auto)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      compression_mode: z.enum(['none', 'json', 'whitespace', 'auto']).optional().describe('Optional normalization/compression (default none preserves value exactly)'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('share_context', (args) => handleShareContext(args as any))
@@ -1487,7 +1634,7 @@ function registerTools(server: McpServer) {
       span_id: z.string().optional().describe('Optional span identifier for this context update'),
       compression_mode: z.enum(['none', 'json', 'whitespace', 'auto', 'lossless_auto']).optional().describe('Compression mode before hashing/storage (lossless_auto is strict and reversible)'),
       hash_truncate: z.number().optional().describe('Optional short hash length in response (8..64)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('share_blob_context', (args) => handleShareBlobContext(args as any))
@@ -1646,8 +1793,10 @@ function registerTools(server: McpServer) {
     {
       agent_id: z.string().describe('Your agent ID'),
       payload: z.string().describe('Payload text or JSON string'),
-      compression_mode: z.enum(['none', 'json', 'whitespace', 'auto']).optional().describe('Optional compression mode before blob hashing/storage'),
+      compression_mode: z.enum(['none', 'json', 'whitespace', 'auto']).optional().describe('Optional compression mode before blob hashing/storage (default none preserves payload exactly)'),
       hash_truncate: z.number().optional().describe('Optional short hash length in response (8..64)'),
+      visibility: z.enum(['private', 'public']).optional().describe('Blob ACL visibility (default private)'),
+      share_with_agents: z.array(z.string()).max(100).optional().describe('Explicit agents allowed to get/list this blob'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('store_protocol_blob', (args) => handleStoreProtocolBlob(args as any))
@@ -1691,7 +1840,7 @@ function registerTools(server: McpServer) {
       ttl_sec: z.number().optional().describe('Upload ticket TTL in seconds'),
       retention_sec: z.number().optional().describe('Artifact retention time in seconds'),
       max_bytes: z.number().optional().describe('Upload size cap in bytes (server max applies)'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('create_artifact_upload', (args) => handleCreateArtifactUpload(args as any))
@@ -1704,7 +1853,7 @@ function registerTools(server: McpServer) {
       agent_id: z.string().describe('Your agent ID'),
       artifact_id: z.string().describe('Artifact ID to download'),
       ttl_sec: z.number().optional().describe('Download ticket TTL in seconds'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('create_artifact_download', (args) => handleCreateArtifactDownload(args as any))
@@ -1719,7 +1868,7 @@ function registerTools(server: McpServer) {
       ttl_sec: z.number().optional().describe('Optional download ticket TTL in seconds'),
       only_ready: z.boolean().optional().describe('If true (default), include only uploaded/ready artifacts'),
       limit: z.number().optional().describe('Optional max number of attached artifacts to scan for ticket emission'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('create_task_artifact_downloads', (args) => handleCreateTaskArtifactDownloads(args as any))
@@ -1736,7 +1885,7 @@ function registerTools(server: McpServer) {
       auto_share_assignee: z.boolean().optional().describe('If task_id is set, auto-share artifact to current task assignee (default true)'),
       note: z.string().optional().describe('Optional short note attached to notification'),
       notify: z.boolean().optional().describe('If false, only grant access without message notification'),
-      idempotency_key: z.string().optional().describe('Optional idempotency key for safe retries'),
+      idempotency_key: z.string().max(MAX_IDEMPOTENCY_KEY_CHARS).optional().describe('Optional idempotency key for safe retries'),
       auth_token: z.string().optional().describe('Optional auth token from register_agent'),
     },
     guardedTool('share_artifact', (args) => handleShareArtifact(args as any))
@@ -1917,30 +2066,91 @@ const PORT = parseInt(process.env.MCP_HUB_PORT || '3000');
 const HOST = process.env.MCP_HUB_HOST || '0.0.0.0';
 const ALLOWED_ORIGINS = parseAllowedOrigins(PORT);
 
-const app = createMcpExpressApp({ host: HOST });
+const app = express();
+if (HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1') {
+  app.use(localhostHostValidation());
+}
 app.use(originGuard(ALLOWED_ORIGINS));
-fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
-const artifactUploadRaw = express.raw({ type: '*/*', limit: ARTIFACT_MAX_BYTES });
+fs.mkdirSync(ARTIFACTS_DIR, { recursive: true, mode: 0o700 });
+try {
+  fs.chmodSync(ARTIFACTS_DIR, 0o700);
+} catch {
+  console.warn(`[security] Could not enforce mode 0700 on artifact directory "${ARTIFACTS_DIR}".`);
+}
+function setArtifactPrivateResponseHeaders(res: express.Response) {
+  res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Surrogate-Control', 'no-store');
+  res.setHeader('Vary', 'X-Artifact-Token');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+}
 
-app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) => {
-  try {
-    const artifactId = sanitizeArtifactId(req.params.artifactId || '');
-    if (typeof req.query.token === 'string' && req.query.token.trim().length > 0) {
-      res.status(401).json({
+const artifactUploadTicketGuard: express.RequestHandler = (req, res, next) => {
+  setArtifactPrivateResponseHeaders(res);
+  const artifactId = sanitizeArtifactId(firstStringValue(req.params.artifactId));
+  if (Object.prototype.hasOwnProperty.call(req.query, 'token')) {
+    res.status(401).json({
+      success: false,
+      error_code: 'QUERY_ARTIFACT_TOKEN_DENIED',
+      error: 'artifact ticket query parameter is disabled; use X-Artifact-Token header',
+    });
+    return;
+  }
+  const tokenCandidate = firstStringValue(req.headers['x-artifact-token']).trim();
+  if (!artifactId || !tokenCandidate) {
+    res.status(400).json({ success: false, error: 'artifactId and X-Artifact-Token are required' });
+    return;
+  }
+  // Reserve before the raw body parser runs. Invalid large bodies are rejected without allocation,
+  // while parser/disconnect failures can release the same one-time ticket for a safe retry.
+  const reservation = reserveArtifactUploadTicket(tokenCandidate, artifactId);
+  if (!reservation) {
+    res.status(401).json({ success: false, error: 'Invalid or expired upload ticket' });
+    return;
+  }
+  res.locals.artifactUploadReservation = reservation;
+  next();
+};
+
+const artifactUploadBodyParser: express.RequestHandler = (req, res, next) => {
+  const reservation = res.locals.artifactUploadReservation as ActiveArtifactUploadReservation | undefined;
+  const ticket = reservation?.ticket;
+  const rawParser = express.raw({ type: '*/*', limit: Math.min(ticket?.max_bytes || ARTIFACT_MAX_BYTES, ARTIFACT_MAX_BYTES) });
+  const release = () => {
+    if (res.locals.artifactUploadCommitted !== true) {
+      releaseArtifactUploadReservation(reservation);
+    }
+  };
+  const onAborted = () => release();
+  req.once('aborted', onAborted);
+  rawParser(req, res, (error?: unknown) => {
+    req.off('aborted', onAborted);
+    if (!error) {
+      next();
+      return;
+    }
+    release();
+    const parserError = error as { type?: string; status?: number; message?: string };
+    if (!res.headersSent) {
+      const status = parserError.status === 413 || parserError.type === 'entity.too.large' ? 413 : 400;
+      res.status(status).json({
         success: false,
-        error_code: 'QUERY_ARTIFACT_TOKEN_DENIED',
-        error: 'artifact ticket query parameter is disabled; use X-Artifact-Token header',
+        error_code: status === 413 ? 'ARTIFACT_TOO_LARGE' : 'INVALID_ARTIFACT_BODY',
+        error: status === 413 ? 'Artifact exceeds size limit' : 'Invalid artifact upload body',
       });
       return;
     }
-    const tokenCandidate = typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '';
-    if (!artifactId || !tokenCandidate) {
-      res.status(400).json({ success: false, error: 'artifactId and X-Artifact-Token are required' });
-      return;
-    }
-    const ticket = consumeArtifactTicket(tokenCandidate, 'upload', artifactId);
+    next(error);
+  });
+};
+
+app.post('/artifacts/upload/:artifactId', artifactUploadTicketGuard, artifactUploadBodyParser, async (req, res) => {
+  const reservation = res.locals.artifactUploadReservation as ActiveArtifactUploadReservation | undefined;
+  const ticket = reservation?.ticket;
+  try {
+    const artifactId = sanitizeArtifactId(firstStringValue(req.params.artifactId));
     if (!ticket) {
-      res.status(401).json({ success: false, error: 'Invalid or expired upload ticket' });
+      res.status(500).json({ success: false, error: 'Upload ticket reservation is missing' });
       return;
     }
 
@@ -1965,6 +2175,13 @@ app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) =>
       res.status(403).json({ success: false, error: 'Upload ticket owner mismatch' });
       return;
     }
+    // Consume the one-time reservation synchronously before any filesystem or DB side effect.
+    // Once consumed, an I/O failure requires the caller to create a fresh artifact upload.
+    if (!reservation || !commitArtifactUploadReservation(reservation)) {
+      res.status(409).json({ success: false, error: 'Upload ticket reservation was lost' });
+      return;
+    }
+    res.locals.artifactUploadCommitted = true;
 
     await fsp.mkdir(ARTIFACTS_DIR, { recursive: true });
     const artifactPath = artifactPathForId(artifactId);
@@ -1992,13 +2209,16 @@ app.post('/artifacts/upload/:artifactId', artifactUploadRaw, async (req, res) =>
   } catch (error) {
     console.error('[artifacts/upload] error', error);
     res.status(500).json({ success: false, error: 'artifact_upload_failed' });
+  } finally {
+    if (res.locals.artifactUploadCommitted !== true) releaseArtifactUploadReservation(reservation);
   }
 });
 
 app.get('/artifacts/download/:artifactId', async (req, res) => {
   try {
-    const artifactId = sanitizeArtifactId(req.params.artifactId || '');
-    if (typeof req.query.token === 'string' && req.query.token.trim().length > 0) {
+    setArtifactPrivateResponseHeaders(res);
+    const artifactId = sanitizeArtifactId(firstStringValue(req.params.artifactId));
+    if (Object.prototype.hasOwnProperty.call(req.query, 'token')) {
       res.status(401).json({
         success: false,
         error_code: 'QUERY_ARTIFACT_TOKEN_DENIED',
@@ -2006,7 +2226,7 @@ app.get('/artifacts/download/:artifactId', async (req, res) => {
       });
       return;
     }
-    const tokenCandidate = typeof req.headers['x-artifact-token'] === 'string' ? req.headers['x-artifact-token'] : '';
+    const tokenCandidate = firstStringValue(req.headers['x-artifact-token']).trim();
     if (!artifactId || !tokenCandidate) {
       res.status(400).json({ success: false, error: 'artifactId and X-Artifact-Token are required' });
       return;
@@ -2035,13 +2255,133 @@ app.get('/artifacts/download/:artifactId', async (req, res) => {
   }
 });
 
+// Artifact routes intentionally run before any generic body parser. MCP JSON requests are parsed
+// only after the binary side-channel has authenticated and applied its ticket-specific byte cap.
+app.use(express.json());
+
 // Map to track transports by session ID
 const transports = new Map<string, StreamableHTTPServerTransport>();
 const sessionLastActivity = new Map<string, number>();
+const sessionCreatedAt = new Map<string, number>();
+const sessionAuthenticatedAt = new Map<string, number>();
+const sessionSources = new Map<string, string>();
+const sessionCountsBySource = new Map<string, number>();
+const sessionInitializeBuckets = new Map<string, TokenBucket>();
+const pendingSessionInitializationsBySource = new Map<string, number>();
+let pendingSessionInitializations = 0;
+
+function requestSource(req: express.Request): string {
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function consumeSessionInitializeRateLimit(source: string, now = Date.now()): boolean {
+  const bucket = sessionInitializeBuckets.get(source) || { tokens: SESSION_INITIALIZE_BURST, lastRefillAt: now };
+  const elapsedMs = Math.max(0, now - bucket.lastRefillAt);
+  bucket.tokens = Math.min(SESSION_INITIALIZE_BURST, bucket.tokens + ((elapsedMs / 1000) * SESSION_INITIALIZE_RPS));
+  bucket.lastRefillAt = now;
+  if (bucket.tokens < 1) {
+    sessionInitializeBuckets.set(source, bucket);
+    return false;
+  }
+  bucket.tokens -= 1;
+  sessionInitializeBuckets.set(source, bucket);
+  return true;
+}
+
+function reserveSessionInitialization(source: string): { ok: true } | { ok: false; scope: string } {
+  const admission = evaluateSessionInitializationAdmission({
+    maxSessions: MAX_SESSIONS,
+    maxSessionsPerSource: MAX_SESSIONS_PER_SOURCE,
+    consumeRateLimit: () => consumeSessionInitializeRateLimit(source),
+    readCounts: () => ({
+      activeSessions: transports.size,
+      pendingSessions: pendingSessionInitializations,
+      activeForSource: sessionCountsBySource.get(source) || 0,
+      pendingForSource: pendingSessionInitializationsBySource.get(source) || 0,
+    }),
+    // Reclaim synchronously only when capacity would otherwise reject this request.
+    reclaimExpiredSessions: () => { evictExpiredSessions(); },
+  });
+  if (!admission.ok) return admission;
+
+  const pendingForSource = pendingSessionInitializationsBySource.get(source) || 0;
+  pendingSessionInitializations += 1;
+  pendingSessionInitializationsBySource.set(source, pendingForSource + 1);
+  return { ok: true };
+}
+
+function releaseSessionInitialization(source: string) {
+  pendingSessionInitializations = Math.max(0, pendingSessionInitializations - 1);
+  const pendingForSource = pendingSessionInitializationsBySource.get(source) || 0;
+  if (pendingForSource <= 1) pendingSessionInitializationsBySource.delete(source);
+  else pendingSessionInitializationsBySource.set(source, pendingForSource - 1);
+}
+
+function trackSession(sessionId: string, source: string, transport: StreamableHTTPServerTransport) {
+  const now = Date.now();
+  transports.set(sessionId, transport);
+  sessionSources.set(sessionId, source);
+  sessionCountsBySource.set(source, (sessionCountsBySource.get(source) || 0) + 1);
+  sessionCreatedAt.set(sessionId, now);
+  sessionLastActivity.set(sessionId, now);
+}
+
+function removeSession(sessionId: string) {
+  transports.delete(sessionId);
+  sessionLastActivity.delete(sessionId);
+  sessionCreatedAt.delete(sessionId);
+  sessionAuthenticatedAt.delete(sessionId);
+  const source = sessionSources.get(sessionId);
+  sessionSources.delete(sessionId);
+  if (!source) return;
+  const count = sessionCountsBySource.get(source) || 0;
+  if (count <= 1) sessionCountsBySource.delete(source);
+  else sessionCountsBySource.set(source, count - 1);
+}
 
 function touchSession(sessionId: string | undefined) {
   if (!sessionId) return;
   sessionLastActivity.set(sessionId, Date.now());
+}
+
+function promoteSessionFromRequest(sessionId: string, body: unknown, now = Date.now()) {
+  if (sessionAuthenticatedAt.has(sessionId)) return;
+  if (requestHasPromotableAgentAuth(body, validateAgentToken, AUTH_MODE !== 'enforce')) {
+    sessionAuthenticatedAt.set(sessionId, now);
+  }
+}
+
+function isSessionExpired(sessionId: string, now = Date.now()): 'provisional' | 'idle' | null {
+  const lastActivityAt = sessionLastActivity.get(sessionId) ?? now;
+  return getSessionExpiryReason({
+    authenticated: sessionAuthenticatedAt.has(sessionId),
+    createdAt: sessionCreatedAt.get(sessionId) ?? lastActivityAt,
+    lastActivityAt,
+    now,
+    provisionalTtlMs: SESSION_PROVISIONAL_TTL_MS,
+    idleTimeoutMs: SESSION_IDLE_TIMEOUT_MS,
+  });
+}
+
+function closeAndRemoveSession(sessionId: string) {
+  const transport = transports.get(sessionId);
+  if (!transport) return;
+  const maybeClosable = transport as unknown as { close?: () => void | Promise<void> };
+  Promise.resolve(maybeClosable.close?.()).catch(() => undefined);
+  removeSession(sessionId);
+}
+
+function evictExpiredSessions(now = Date.now()): { provisional: number; idle: number } {
+  let provisional = 0;
+  let idle = 0;
+  for (const sessionId of [...transports.keys()]) {
+    const reason = isSessionExpired(sessionId, now);
+    if (!reason) continue;
+    closeAndRemoveSession(sessionId);
+    if (reason === 'provisional') provisional += 1;
+    else idle += 1;
+  }
+  return { provisional, idle };
 }
 
 async function createConnectedTransport() {
@@ -2074,11 +2414,17 @@ app.post('/mcp', async (req, res) => {
   const isInitialize = isInitializeMethod(req.body);
 
   if (sessionId && transports.has(sessionId)) {
-    // Existing session
-    const transport = transports.get(sessionId)!;
-    touchSession(sessionId);
-    await transport.handleRequest(req, res, req.body);
-    return;
+    const expiryReason = isSessionExpired(sessionId);
+    if (expiryReason) {
+      closeAndRemoveSession(sessionId);
+    } else {
+      // A provisional session is promoted only by a known tool call carrying valid agent auth.
+      promoteSessionFromRequest(sessionId, req.body);
+      const transport = transports.get(sessionId)!;
+      touchSession(sessionId);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    }
   }
 
   if (!isInitialize) {
@@ -2104,29 +2450,50 @@ app.post('/mcp', async (req, res) => {
     return;
   }
 
-  // New session — create server + transport
-  const { server, transport } = await createConnectedTransport();
+  const source = requestSource(req);
+  const reservation = reserveSessionInitialization(source);
+  if (!reservation.ok) {
+    res.setHeader('Retry-After', '1');
+    res.status(429).json(jsonRpcErrorResponse(requestId, -32001, 'MCP session initialization limit exceeded', {
+      retryable: true,
+      reason: `session_${reservation.scope}_limit`,
+      retry_after_ms: 1000,
+      max_sessions: MAX_SESSIONS,
+      max_sessions_per_source: MAX_SESSIONS_PER_SOURCE,
+    }));
+    return;
+  }
 
-  transport.onclose = () => {
-    const sid = [...transports.entries()].find(([, t]) => t === transport)?.[0];
-    if (sid) {
-      transports.delete(sid);
-      sessionLastActivity.delete(sid);
+  let transport: StreamableHTTPServerTransport | null = null;
+  let createdSessionId = '';
+  let transportClosed = false;
+  try {
+    ({ transport } = await createConnectedTransport());
+    transport.onclose = () => {
+      transportClosed = true;
+      const sid = createdSessionId || [...transports.entries()].find(([, candidate]) => candidate === transport)?.[0];
+      if (sid) removeSession(sid);
+    };
+    await transport.handleRequest(req, res, req.body);
+    if (transport.sessionId && !transportClosed) {
+      createdSessionId = transport.sessionId;
+      trackSession(createdSessionId, source, transport);
     }
-  };
-
-  await transport.handleRequest(req, res, req.body);
-
-  // Store with the generated session ID
-  if (transport.sessionId) {
-    transports.set(transport.sessionId, transport);
-    touchSession(transport.sessionId);
+  } finally {
+    releaseSessionInitialization(source);
+    if (transport && !createdSessionId) {
+      const maybeClosable = transport as unknown as { close?: () => void | Promise<void> };
+      Promise.resolve(maybeClosable.close?.()).catch(() => undefined);
+    }
   }
 });
 
 app.get('/mcp', async (req, res) => {
   setServerCapabilityHeaders(res);
   const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  if (sessionId && transports.has(sessionId) && isSessionExpired(sessionId)) {
+    closeAndRemoveSession(sessionId);
+  }
   if (!sessionId || !transports.has(sessionId)) {
     if (sessionId && STRICT_SESSION_STATUS) {
       sendUnknownSessionError(res, null, 404);
@@ -2145,8 +2512,7 @@ app.delete('/mcp', async (req, res) => {
   if (sessionId && transports.has(sessionId)) {
     const transport = transports.get(sessionId)!;
     await transport.handleRequest(req, res, req.body);
-    transports.delete(sessionId);
-    sessionLastActivity.delete(sessionId);
+    removeSession(sessionId);
   } else {
     if (sessionId && STRICT_SESSION_STATUS) {
       setServerCapabilityHeaders(res);
@@ -2405,7 +2771,12 @@ app.get('/events', (req, res) => {
 
   unsubscribeStreamEvents = onStreamEvent((event) => {
     if (streamClosed || !streams.includes(event.stream)) return;
-    if (event.target_agent_id && event.target_agent_id !== agentId && event.target_agent_id !== '*') return;
+    if (
+      event.agent_id !== agentId
+      && event.target_agent_id
+      && event.target_agent_id !== agentId
+      && event.target_agent_id !== '*'
+    ) return;
     wakeSoon();
   });
 
@@ -2424,10 +2795,24 @@ app.get('/events', (req, res) => {
 
 app.get('/health', (_req, res) => {
   setServerCapabilityHeaders(res);
+  const provisionalSessions = transports.size - sessionAuthenticatedAt.size;
   res.json({
     status: 'ok',
     sessions: transports.size,
+    session_limits: {
+      max_sessions: MAX_SESSIONS,
+      max_per_source: MAX_SESSIONS_PER_SOURCE,
+      pending_initializations: pendingSessionInitializations,
+      tracked_sources: sessionCountsBySource.size,
+      initialize_bucket_sources: sessionInitializeBuckets.size,
+      initialize_rps: SESSION_INITIALIZE_RPS,
+      initialize_burst: SESSION_INITIALIZE_BURST,
+      provisional_sessions: provisionalSessions,
+      authenticated_sessions: sessionAuthenticatedAt.size,
+      provisional_ttl_ms: SESSION_PROVISIONAL_TTL_MS,
+    },
     auth_mode: AUTH_MODE,
+    register_auth_mode: REGISTER_TOKEN ? 'token_required' : 'open_enrollment',
     origin_mode: ORIGIN_MODE,
     query_auth_token_mode: 'deny',
     namespace_quota_mode: NAMESPACE_QUOTA_MODE,
@@ -2445,21 +2830,46 @@ app.get('/health', (_req, res) => {
       drain_timeout_ms: EVENT_STREAM_DRAIN_TIMEOUT_MS,
     },
     artifact_tickets: artifactTickets.size,
+    artifact_ticket_states: artifactTicketStateSnapshot(),
+    artifact_upload_tickets: {
+      ...artifactUploadTicketLimiter.snapshot(),
+      reservation_ttl_ms: ARTIFACT_UPLOAD_RESERVATION_TTL_MS,
+    },
+    artifact_download_tickets: artifactDownloadTicketLimiter.snapshot(),
     session_idle_timeout_ms: SESSION_IDLE_TIMEOUT_MS,
-    session_gc_enabled: SESSION_GC_ENABLED,
+    session_provisional_ttl_ms: SESSION_PROVISIONAL_TTL_MS,
+    session_gc_enabled: true,
+    session_idle_gc_enabled: SESSION_GC_ENABLED,
     unknown_session_policy: 'error',
     strict_session_status: STRICT_SESSION_STATUS,
   });
 });
 
+const finalJsonErrorHandler: express.ErrorRequestHandler = (error, req, res, next) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+
+  const response = describeHttpError(error);
+
+  if (response.status >= 500) {
+    console.error(`[http] unhandled error method=${req.method} path=${req.path} status=${response.status}`, error);
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(response.status).json(response.body);
+};
+
+app.use(finalJsonErrorHandler);
+
 setInterval(() => {
   try {
-    const expiredTickets = cleanupExpiredArtifactTickets();
+    const ticketCleanup = cleanupExpiredArtifactTickets();
     const rateLimitStateCleaned = cleanupRateLimitState();
     const maintenance = runMaintenance();
-    if (expiredTickets > 0 || rateLimitStateCleaned > 0 || maintenance.slo.triggered > 0 || maintenance.slo.resolved > 0) {
+    if (ticketCleanup.deleted > 0 || rateLimitStateCleaned > 0 || maintenance.slo.triggered > 0 || maintenance.slo.resolved > 0) {
       console.log(
-        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} stream_events=${maintenance.stream_events_cleaned} tickets_expired=${expiredTickets} rate_limit_state=${rateLimitStateCleaned} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
+        `[maintenance] claims=${maintenance.claims_cleaned} artifacts=${maintenance.artifacts_cleaned} stream_events=${maintenance.stream_events_cleaned} tickets_expired=${ticketCleanup.deleted} upload_reservations_expired=${ticketCleanup.reservations_expired} rate_limit_state=${rateLimitStateCleaned} archived=${maintenance.tasks_archived} slo_triggered=${maintenance.slo.triggered} slo_resolved=${maintenance.slo.resolved}`
       );
     }
   } catch (error) {
@@ -2469,20 +2879,9 @@ setInterval(() => {
 
 setInterval(() => {
   try {
-    if (!SESSION_GC_ENABLED) return;
-    const now = Date.now();
-    let evicted = 0;
-    for (const [sid, transport] of transports.entries()) {
-      const last = sessionLastActivity.get(sid) ?? now;
-      if (now - last <= SESSION_IDLE_TIMEOUT_MS) continue;
-      const maybeClosable = transport as unknown as { close?: () => void | Promise<void> };
-      Promise.resolve(maybeClosable.close?.()).catch(() => undefined);
-      transports.delete(sid);
-      sessionLastActivity.delete(sid);
-      evicted += 1;
-    }
-    if (evicted > 0) {
-      console.log(`[session-gc] evicted=${evicted} active=${transports.size} idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL}`);
+    const evicted = evictExpiredSessions();
+    if (evicted.provisional > 0 || evicted.idle > 0) {
+      console.log(`[session-gc] provisional_evicted=${evicted.provisional} idle_evicted=${evicted.idle} active=${transports.size} provisional_ttl_ms=${SESSION_PROVISIONAL_TTL_MS} idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL}`);
     }
   } catch (error) {
     console.error('[session-gc] error', error);
@@ -2490,7 +2889,10 @@ setInterval(() => {
 }, Math.max(1_000, SESSION_GC_INTERVAL_MS)).unref();
 
 app.listen(PORT, HOST, () => {
+  if (AUTH_MODE === 'enforce' && !REGISTER_TOKEN) {
+    console.warn('[security] MCP_HUB_AUTH_MODE=enforce is running with open agent enrollment because MCP_HUB_REGISTER_TOKEN is not configured.');
+  }
   console.log(
-    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, unknown_session_policy=error, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
+    `MCP Agent Hub running at http://${HOST}:${PORT}/mcp (auth_mode=${AUTH_MODE}, unknown_session_policy=error, session_provisional_ttl_ms=${SESSION_PROVISIONAL_TTL_MS}, session_idle_timeout_ms=${SESSION_IDLE_TIMEOUT_LABEL})`
   );
 });

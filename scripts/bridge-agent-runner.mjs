@@ -1,9 +1,22 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createMcpClient as createMcpHttpClient } from './lib/mcp-client.mjs';
+import {
+  assessTaskCompletion,
+  getOrCreateAgentToken,
+  readAgentToken,
+  resolveThreadPublicationPolicy,
+  runIdempotencyKey,
+  sanitizeBackendEnv,
+  taskRequiresIndependentVerifier,
+  writeAgentToken,
+  writePrivateJson,
+} from './lib/bridge-runtime.mjs';
+
+process.umask(0o077);
 
 const DEFAULT_ENDPOINT = process.env.ENDPOINT || process.env.MCP_ENDPOINT || 'http://127.0.0.1:3000/mcp';
 const MAX_CONTEXT_CHARS = Number(process.env.BRIDGE_CONTEXT_MAX_CHARS || 1900);
@@ -40,6 +53,9 @@ function parseArgs(argv) {
     lifecycle: process.env.BRIDGE_AGENT_LIFECYCLE || 'ephemeral',
     onboardingMode: process.env.BRIDGE_ONBOARDING_MODE || 'none',
     registerToken: process.env.BRIDGE_REGISTER_TOKEN || process.env.MCP_HUB_REGISTER_TOKEN || '',
+    registerTokenFromArgv: false,
+    agentAuthToken: process.env.BRIDGE_AGENT_AUTH_TOKEN || '',
+    agentTokenFile: process.env.BRIDGE_AGENT_TOKEN_FILE || '',
     capabilities: process.env.BRIDGE_AGENT_CAPABILITIES || '',
     namespace: `BRIDGE-${Date.now()}`,
     key: '',
@@ -63,6 +79,7 @@ function parseArgs(argv) {
     runtimeMode: process.env.BRIDGE_RUNTIME_MODE || 'auto',
     timeoutMs: Number(process.env.BRIDGE_TIMEOUT_MS || 180000),
     messageMode: process.env.BRIDGE_MESSAGE_MODE || 'auto',
+    failureStatus: process.env.BRIDGE_FAILURE_STATUS || 'blocked',
     expectJson: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -79,7 +96,8 @@ function parseArgs(argv) {
     else if (arg === '--role') out.role = next();
     else if (arg === '--lifecycle') out.lifecycle = next();
     else if (arg === '--onboarding-mode') out.onboardingMode = next();
-    else if (arg === '--register-token') out.registerToken = next();
+    else if (arg === '--register-token') { out.registerToken = next(); out.registerTokenFromArgv = true; }
+    else if (arg === '--agent-token-file') out.agentTokenFile = next();
     else if (arg === '--capabilities') out.capabilities = next();
     else if (arg === '--namespace') out.namespace = next();
     else if (arg === '--key') out.key = next();
@@ -103,6 +121,7 @@ function parseArgs(argv) {
     else if (arg === '--runtime-mode') out.runtimeMode = next();
     else if (arg === '--timeout-ms') out.timeoutMs = Number(next());
     else if (arg === '--message-mode') out.messageMode = next();
+    else if (arg === '--failure-status') out.failureStatus = next();
     else if (arg === '--expect-json') out.expectJson = true;
     else if (arg === '--no-message') out.messageMode = 'never';
     else if (arg === '--help' || arg === '-h') {
@@ -115,11 +134,12 @@ Options:
   --role ROLE          Hub coordination role: orchestrator|reviewer|assistant|worker (default worker)
   --lifecycle MODE     Agent lifecycle: ephemeral|persistent (default ephemeral)
   --onboarding-mode M  register_agent onboarding: none|compact|full (default none)
-  --register-token T   Registration secret when MCP_HUB_REGISTER_TOKEN is configured
+  --register-token T   Legacy compatibility; prefer BRIDGE_REGISTER_TOKEN (argv is ps-visible)
+  --agent-token-file P Read/write this agent's auth token (mode 0600); preferred for restart/fallback
   --capabilities CSV   Extra registered capabilities
   --namespace NAME     Context namespace
   --key KEY            Context key
-  --task-id ID         Claim and release a hub task around backend execution
+  --task-id ID         Claim/release a hub task; backend must return JSON with verification_passed and confidence
   --require-claim      Refuse to run backend unless --task-id is provided and claimed
   --prompt TEXT        Prompt for the backend
   --prompt-file PATH   Prompt file
@@ -136,10 +156,12 @@ Options:
   --runtime-mode MODE  Runtime profile override: auto|repo|isolated|unknown
   --timeout-ms MS      Backend timeout
   --message-mode MODE  Result broadcast mode: auto|always|never (default auto; auto skips duplicate broadcast for thread runs)
+  --failure-status S   Task status after failed backend: blocked|pending (default blocked)
 
 Custom backend env:
   BRIDGE_CUSTOM_COMMAND executable path
-  BRIDGE_CUSTOM_ARGS_JSON optional JSON string array of arguments`);
+  BRIDGE_CUSTOM_ARGS_JSON optional JSON string array of arguments
+  The composed prompt is provided on stdin (BRIDGE_PROMPT_MODE=stdin).`);
       process.exit(0);
     } else {
       throw new Error(`Unknown arg: ${arg}`);
@@ -161,11 +183,20 @@ function validateBridgeOptions(opts) {
   if (!['auto', 'always', 'never'].includes(opts.messageMode)) {
     throw new Error('--message-mode must be auto|always|never');
   }
+  if (!['blocked', 'pending'].includes(opts.failureStatus)) {
+    throw new Error('--failure-status must be blocked|pending');
+  }
   if (opts.requireClaim && (!Number.isInteger(opts.taskId) || opts.taskId <= 0)) {
     throw new Error('--require-claim requires --task-id');
   }
   if (!Number.isFinite(opts.threadTail) || opts.threadTail < 0) {
     throw new Error('--thread-tail must be a non-negative number');
+  }
+  if (!Number.isFinite(opts.leaseSeconds) || opts.leaseSeconds <= 0) {
+    throw new Error('--lease-seconds must be a positive number');
+  }
+  if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) {
+    throw new Error('--timeout-ms must be a positive number');
   }
   opts.threadTail = Math.min(50, Math.floor(opts.threadTail));
 }
@@ -405,13 +436,16 @@ function serializePreflight(preflight) {
   return { text, truncated: true, original_chars: originalChars, wire_chars: full.length };
 }
 
-function buildBackendPrompt(prompt, preflight) {
+function buildBackendPrompt(prompt, preflight, requireTaskCompletion = false) {
   const serialized = serializePreflight(preflight);
   const context = serialized.text;
   const notice = serialized.truncated
     ? `\nPreflight note: context was truncated from ${serialized.original_chars} chars; retained thread tail is prioritized when available.\n`
     : '\n';
-  return `Hub preflight context (bounded JSON; use if relevant, do not repeat verbatim):\n${context}${notice}\nUser task:\n${prompt}`;
+  const completionContract = requireTaskCompletion
+    ? `\nTask completion contract (required): return one JSON object containing verification_passed (boolean), confidence (number 0..1), verification.checks (non-empty array), and the result. Set verification_passed=true only after performing the listed checks.\n`
+    : '';
+  return `Hub preflight context (bounded JSON; use if relevant, do not repeat verbatim):\n${context}${notice}\nUser task:\n${prompt}${completionContract}`;
 }
 
 function parseCsv(value) {
@@ -527,7 +561,7 @@ function runProcess(command, args, options) {
     const child = spawn(command, args, {
       cwd: options.cwd || process.cwd(),
       env: options.env || process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [options.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       // T79-F2: run the backend in its own process group so a timeout/abort can signal the whole
       // tree. `codex exec` / `claude -p` fork helper subprocesses; signalling only the direct child
       // PID re-parents those grandchildren to init and leaks them.
@@ -571,6 +605,10 @@ function runProcess(command, args, options) {
     };
     child.stdout.on('data', (chunk) => stdout.push(Buffer.from(chunk)));
     child.stderr.on('data', (chunk) => stderr.push(Buffer.from(chunk)));
+    if (child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(String(options.input ?? ''));
+    }
     child.on('error', (error) => {
       cleanup();
       resolve({
@@ -598,15 +636,7 @@ function runProcess(command, args, options) {
 }
 
 function buildBackendEnv(extra = {}) {
-  const blockedEnvPatterns = [/^MCP_HUB_/, /^BRIDGE_/, /^WORKER_.*MCP_/, /^CODEX_.*MCP_/];
-  const blockedKeys = new Set(['ENDPOINT', 'MCP_ENDPOINT', 'HUB_ENDPOINT', 'MCP_CONFIG_FILE']);
-  const env = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (blockedKeys.has(key)) continue;
-    if (blockedEnvPatterns.some((pattern) => pattern.test(key))) continue;
-    env[key] = value;
-  }
-  return { ...env, ...extra };
+  return sanitizeBackendEnv(process.env, extra);
 }
 
 function parseCustomArgs() {
@@ -622,8 +652,13 @@ function parseCustomArgs() {
 async function runCodex(opts, prompt, signal) {
   const args = ['exec', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', opts.codexSandbox];
   if (opts.codexModel) args.push('--model', opts.codexModel);
-  args.push(prompt);
-  const result = await runProcess(opts.codexBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv(), signal });
+  args.push('-');
+  const result = await runProcess(opts.codexBin, args, {
+    timeoutMs: opts.timeoutMs,
+    env: buildBackendEnv(),
+    input: prompt,
+    signal,
+  });
   return {
     backend: 'codex',
     ok: result.exitCode === 0 && !result.timedOut && !result.aborted,
@@ -640,8 +675,12 @@ async function runCodex(opts, prompt, signal) {
 async function runClaude(opts, prompt, signal) {
   const args = ['-p', '--mcp-config', '{"mcpServers":{}}', '--strict-mcp-config'];
   if (opts.claudeModel) args.push('--model', opts.claudeModel);
-  args.push(prompt);
-  const result = await runProcess(opts.claudeBin, args, { timeoutMs: opts.timeoutMs, env: buildBackendEnv(), signal });
+  const result = await runProcess(opts.claudeBin, args, {
+    timeoutMs: opts.timeoutMs,
+    env: buildBackendEnv(),
+    input: prompt,
+    signal,
+  });
   return {
     backend: 'claude',
     ok: result.exitCode === 0 && !result.timedOut && !result.aborted,
@@ -680,7 +719,8 @@ async function runCustom(opts, prompt, signal) {
   }
   const result = await runProcess(command, customArgs, {
     timeoutMs: opts.timeoutMs,
-    env: buildBackendEnv({ BRIDGE_PROMPT: prompt }),
+    env: buildBackendEnv({ BRIDGE_PROMPT_MODE: 'stdin' }),
+    input: prompt,
     signal,
   });
   return {
@@ -703,20 +743,23 @@ async function runBackend(opts, prompt, signal) {
   throw new Error(`Unsupported backend: ${opts.backend}`);
 }
 
-function startClaimRenewal(mcp, opts, authToken, claim, abortController) {
+function startClaimRenewal(mcp, opts, authToken, claim, abortController, runId) {
   const intervalMs = Math.max(10_000, Math.min(60_000, Math.floor(opts.leaseSeconds * 1000 / 3)));
   let stopped = false;
   let inFlight = null;
   let renewals = 0;
+  let renewalAttempts = 0;
   let lastError = null;
   const renew = () => {
     if (stopped || inFlight) return;
+    renewalAttempts += 1;
     inFlight = mcp.call('renew_task_claim', {
       task_id: opts.taskId,
       agent_id: opts.agentId,
       auth_token: authToken,
       claim_id: claim.claim?.claim_id,
       lease_seconds: opts.leaseSeconds,
+      idempotency_key: runIdempotencyKey(runId, 'renew', opts.taskId, renewalAttempts),
     })
       .then((result) => {
         if (result.success === true) {
@@ -784,6 +827,8 @@ function compactResult(opts, prompt, backendResult) {
       model: backendResult.model,
       error: backendResult.error,
       json_valid: backendResult.json_valid,
+      completion_verified: backendResult.completion_verified,
+      completion_confidence: backendResult.completion_confidence,
       phase_timings_ms: backendResult.phase_timings_ms,
       rpc_retries: backendResult.rpc_retries,
       negotiated_read_mode: backendResult.negotiated_read_mode,
@@ -812,6 +857,7 @@ function compactResult(opts, prompt, backendResult) {
       task_routing_error: backendResult.task_routing_error,
       release_error: backendResult.release_error,
       blocked_release: backendResult.blocked_release,
+      failure_release: backendResult.failure_release,
       claim_renewals: backendResult.claim_renewals,
       claim_renewal_error: backendResult.claim_renewal_error,
     },
@@ -951,7 +997,7 @@ function buildRunStatus(opts, prompt, state) {
 }
 
 async function publishRunStatus(mcp, opts, authToken, prompt, state) {
-  if (!mcp || !authToken) return false;
+  if (!mcp || !authToken || state.allowSharedPublication === false) return false;
   state.publishAttempts += 1;
   const payload = JSON.stringify(buildRunStatus(opts, prompt, state));
   try {
@@ -990,42 +1036,6 @@ function startRunHeartbeat(mcp, opts, authToken, prompt, state) {
   };
 }
 
-function parseLooseJson(text) {
-  const value = String(text || '').trim();
-  if (!value) return null;
-  const normalizeParsed = (parsed) => {
-    if (typeof parsed === 'string') {
-      const nested = parsed.trim();
-      if (nested.startsWith('{') || nested.startsWith('[')) {
-        return parseLooseJson(nested) ?? parsed;
-      }
-    }
-    return parsed;
-  };
-  try {
-    return normalizeParsed(JSON.parse(value));
-  } catch {
-    const fenced = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    if (fenced?.[1]) {
-      try {
-        return normalizeParsed(JSON.parse(fenced[1].trim()));
-      } catch {
-        return null;
-      }
-    }
-    const start = value.indexOf('{');
-    const end = value.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      try {
-        return normalizeParsed(JSON.parse(value.slice(start, end + 1)));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
 async function measurePhase(timings, name, fn) {
   const startedAt = Date.now();
   try {
@@ -1038,14 +1048,18 @@ async function measurePhase(timings, name, fn) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   validateBridgeOptions(opts);
+  if (opts.registerTokenFromArgv) {
+    process.stderr.write('[security] --register-token exposes the registration secret in ps/process listings; prefer BRIDGE_REGISTER_TOKEN.\n');
+  }
   const prompt = await readPrompt(opts);
   opts.agentId ||= `bridge-${opts.backend}-${Date.now()}`;
   opts.agentName ||= opts.agentId;
   opts.key ||= `bridge-result-${opts.backend}`;
-  await fs.mkdir(opts.outDir, { recursive: true });
+  await fs.mkdir(opts.outDir, { recursive: true, mode: 0o700 });
+  await fs.chmod(opts.outDir, 0o700);
   const phaseTimings = {};
   const startedAt = Date.now();
-  const runId = `${opts.agentId}:${startedAt}`;
+  const runId = `${opts.agentId}:${randomUUID()}`;
   const runState = {
     runId,
     status: 'starting',
@@ -1058,10 +1072,29 @@ async function main() {
     errorDigest: null,
     errorClass: null,
     errorPreview: null,
+    // A requested thread is privacy-unknown until read_thread succeeds. Suppress shared status
+    // publication during that window; public threads opt back in after metadata validation.
+    allowSharedPublication: !opts.threadId,
   };
-  const reportPath = path.join(opts.outDir, `${opts.agentId}.json`);
+  const reportFile = `${opts.agentId.replace(/[^a-zA-Z0-9._-]+/g, '_') || 'bridge-agent'}.${startedAt}.json`;
+  const reportPath = path.join(opts.outDir, reportFile);
   const runtimeProfile = await measurePhase(phaseTimings, 'detect_runtime_profile_ms', () => detectRuntimeProfile(opts));
   runtimeProfile.model = buildModelProfile(opts);
+  let existingAgentToken = await measurePhase(
+    phaseTimings,
+    'read_agent_token_ms',
+    () => readAgentToken(opts.agentAuthToken, opts.agentTokenFile),
+  );
+  // Persist a strong client-generated credential before the first registration request. If the
+  // server commits registration but its response is lost, the next run can prove ownership with
+  // the same credential instead of orphaning the stable agent id.
+  if (!existingAgentToken && opts.agentTokenFile) {
+    existingAgentToken = await measurePhase(
+      phaseTimings,
+      'prepare_agent_token_ms',
+      () => getOrCreateAgentToken(opts.agentTokenFile, `${randomUUID()}-${randomUUID()}`),
+    );
+  }
 
   const mcp = await measurePhase(phaseTimings, 'mcp_initialize_ms', () => createMcpClient(opts.endpoint));
   let authToken = '';
@@ -1069,6 +1102,11 @@ async function main() {
   let activeClaim = null;
   let activeClaimRenewal = null;
   let activeClaimReleased = false;
+  let threadPublication = {
+    is_private: Boolean(opts.threadId),
+    private_peer: null,
+    allow_shared_publication: !opts.threadId,
+  };
   const backendAbort = new AbortController();
   let shutdownSignal = null;
   const requestShutdown = (signalName) => {
@@ -1087,6 +1125,7 @@ async function main() {
       type: `bridge:${opts.backend}`,
       role: opts.role,
       register_token: opts.registerToken || undefined,
+      auth_token: existingAgentToken || undefined,
       capabilities: ['bridge', 'external-runtime', opts.backend, ...parseCsv(opts.capabilities)].join(','),
       lifecycle: opts.lifecycle,
       onboarding_mode: opts.onboardingMode,
@@ -1107,6 +1146,13 @@ async function main() {
       const registerError = registration?.error ? ` error=${truncate(registration.error, 240)}` : '';
       throw new Error(`register_agent did not return auth token.${errorCode}${registerError}`);
     }
+    if (opts.agentTokenFile) {
+      await measurePhase(
+        phaseTimings,
+        'write_agent_token_ms',
+        () => writeAgentToken(opts.agentTokenFile, authToken),
+      );
+    }
     runState.phase = 'registered';
     runState.status = 'running';
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
@@ -1121,18 +1167,27 @@ async function main() {
       limit_per_source: 5,
     }));
     let threadTail = null;
-    if (opts.threadId && opts.threadTail > 0) {
-      threadTail = await measurePhase(phaseTimings, 'read_thread_preflight_ms', () => mcp.call('read_thread', {
+    if (opts.threadId) {
+      const threadAccess = await measurePhase(phaseTimings, 'read_thread_preflight_ms', () => mcp.call('read_thread', {
         agent_id: opts.agentId,
         auth_token: authToken,
         thread_id: opts.threadId,
         // Keep compact here: compactThreadPreflight depends on content_preview.
         response_mode: 'compact',
-        limit: opts.threadTail,
+        limit: Math.max(1, opts.threadTail),
       })).catch((error) => ({
         success: false,
         error: String(error?.message || error),
       }));
+      if (threadAccess?.success !== true) {
+        throw new Error(`read_thread preflight failed: ${truncate(threadAccess?.error || threadAccess?.error_code || 'unknown error', 240)}`);
+      }
+      if (typeof threadAccess?.thread?.private !== 'boolean') {
+        throw new Error('read_thread preflight did not return authoritative privacy metadata');
+      }
+      threadPublication = resolveThreadPublicationPolicy(threadAccess, opts.agentId);
+      runState.allowSharedPublication = threadPublication.allow_shared_publication;
+      threadTail = opts.threadTail > 0 ? threadAccess : null;
     }
     let taskRouting = null;
     if (Number.isInteger(opts.taskId) && opts.taskId > 0) {
@@ -1156,9 +1211,13 @@ async function main() {
       task_routing: taskRouting,
     };
     const preflightSerialized = serializePreflight(preflight);
-    const backendPrompt = buildBackendPrompt(prompt, preflight);
+    const backendPrompt = buildBackendPrompt(prompt, preflight, Number.isInteger(opts.taskId) && opts.taskId > 0);
+    await publishRunStatus(mcp, opts, authToken, prompt, runState);
 
     if (Number.isInteger(opts.taskId) && opts.taskId > 0) {
+      if (taskRequiresIndependentVerifier(taskRouting)) {
+        throw new Error('STRICT_TASK_REQUIRES_VERIFIER_WORKFLOW: bridge runner will not claim strict tasks without an independent reviewer attestation phase');
+      }
       runState.phase = 'claiming';
       await publishRunStatus(mcp, opts, authToken, prompt, runState);
       activeClaim = await measurePhase(phaseTimings, 'claim_task_ms', () => mcp.call('claim_task', {
@@ -1167,12 +1226,25 @@ async function main() {
         auth_token: authToken,
         lease_seconds: opts.leaseSeconds,
         namespace: opts.namespace || undefined,
-        idempotency_key: `${opts.agentId}:claim:${opts.taskId}`,
+        idempotency_key: runIdempotencyKey(runId, 'claim', opts.taskId),
       }));
       if (activeClaim.success !== true) {
         throw new Error(`claim_task failed: ${JSON.stringify(activeClaim)}`);
       }
-      activeClaimRenewal = startClaimRenewal(mcp, opts, authToken, activeClaim, backendAbort);
+      if (taskRequiresIndependentVerifier(activeClaim)) {
+        const returned = await mcp.call('release_task_claim', {
+          task_id: opts.taskId,
+          agent_id: opts.agentId,
+          auth_token: authToken,
+          claim_id: activeClaim.claim?.claim_id,
+          next_status: 'pending',
+          preserve_assignment: true,
+          idempotency_key: runIdempotencyKey(runId, 'release-strict-unsupported', opts.taskId),
+        });
+        activeClaimReleased = returned?.success === true;
+        throw new Error('STRICT_TASK_REQUIRES_VERIFIER_WORKFLOW: claimed task was returned to pending');
+      }
+      activeClaimRenewal = startClaimRenewal(mcp, opts, authToken, activeClaim, backendAbort, runId);
     }
 
     let backendResult;
@@ -1224,19 +1296,27 @@ async function main() {
       backendResult.aborted = true;
       backendResult.error = backendResult.error || `shutdown_signal:${shutdownSignal}`;
     }
-    if (opts.expectJson) {
-      const parsed = parseLooseJson(backendResult.output);
-      backendResult.json_valid = Boolean(parsed);
-      backendResult.parsed_json = parsed || undefined;
-      if (!parsed) {
+    const completion = assessTaskCompletion(backendResult.output);
+    if (opts.expectJson || (Number.isInteger(opts.taskId) && opts.taskId > 0)) {
+      backendResult.json_valid = completion.json_valid;
+      backendResult.parsed_json = completion.parsed || undefined;
+    }
+    backendResult.completion_verified = completion.verification_passed;
+    backendResult.completion_confidence = completion.confidence;
+    if (opts.expectJson && !completion.json_valid) {
+      backendResult.ok = false;
+      backendResult.error = backendResult.error || 'expected_json_not_returned';
+    }
+    if (Number.isInteger(opts.taskId) && opts.taskId > 0 && backendResult.ok) {
+      if (!completion.completion_ready) {
         backendResult.ok = false;
-        backendResult.error = backendResult.error || 'expected_json_not_returned';
+        backendResult.error = backendResult.error || 'task_completion_contract_missing';
       }
     }
     if (backendResult.error || backendResult.stderr) {
       backendResult.error_digest = errorDigest(backendResult.error || backendResult.stderr);
     }
-    if (opts.rememberKey && backendResult.ok && backendResult.output) {
+    if (threadPublication.allow_shared_publication && opts.rememberKey && backendResult.ok && backendResult.output) {
       const memory = await measurePhase(phaseTimings, 'write_memory_ms', () => mcp.call('write_memory', {
         agent_id: opts.agentId,
         auth_token: authToken,
@@ -1245,7 +1325,7 @@ async function main() {
         text: truncate(backendResult.output, 1800),
         tags: ['bridge', opts.backend, ...parseCsv(opts.rememberTags)],
         importance: 0.7,
-        idempotency_key: `${opts.agentId}:memory:${opts.rememberKey}`,
+        idempotency_key: runIdempotencyKey(runId, 'memory', opts.rememberKey),
       })).catch((error) => ({ success: false, error: String(error?.message || error) }));
       if (memory?.success === true) {
         backendResult.memory_id = memory.memory?.id;
@@ -1262,17 +1342,19 @@ async function main() {
       raw_error: backendResult.error,
       parsed_json: backendResult.parsed_json,
     };
-    await measurePhase(phaseTimings, 'write_report_initial_ms', () => fs.writeFile(reportPath, `${JSON.stringify(fullReport, null, 2)}\n`));
+    await measurePhase(phaseTimings, 'write_report_initial_ms', () => writePrivateJson(reportPath, fullReport));
 
     runState.phase = 'publishing';
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
     const resultBlob = buildResultBlobPayload(fullReport);
-    if (resultBlob.payload.length >= RESULT_BLOB_MIN_CHARS) {
+    if (threadPublication.is_private || resultBlob.payload.length >= RESULT_BLOB_MIN_CHARS) {
       const blob = await measurePhase(phaseTimings, 'store_result_blob_ms', () => mcp.call('store_protocol_blob', {
         agent_id: opts.agentId,
         auth_token: authToken,
         payload: resultBlob.payload,
         compression_mode: 'json',
+        visibility: threadPublication.is_private ? 'private' : 'public',
+        share_with_agents: threadPublication.private_peer ? [threadPublication.private_peer] : undefined,
         hash_truncate: 16,
       }));
       if (blob.success === true) {
@@ -1286,27 +1368,31 @@ async function main() {
       }
     }
     let payload = buildPublishPayload(opts, prompt, backendResult);
-    let context = await measurePhase(phaseTimings, 'share_context_ms', () => mcp.call('share_context', {
-      agent_id: opts.agentId,
-      auth_token: authToken,
-      key: opts.key,
-      namespace: opts.namespace,
-      value: payload,
-      idempotency_key: `${opts.agentId}:${opts.key}`,
-    }));
-    if (context.success !== true) {
-      backendResult.ok = false;
-      backendResult.error = backendResult.error || 'publish_context_failed';
-      backendResult.context_error = context.error_code || context.error || 'share_context_failed';
+    let context = null;
+    if (threadPublication.allow_shared_publication) {
+      context = await measurePhase(phaseTimings, 'share_context_ms', () => mcp.call('share_context', {
+        agent_id: opts.agentId,
+        auth_token: authToken,
+        key: opts.key,
+        namespace: opts.namespace,
+        value: payload,
+        idempotency_key: runIdempotencyKey(runId, 'context', opts.key),
+      }));
+      if (context.success !== true) {
+        backendResult.ok = false;
+        backendResult.error = backendResult.error || 'publish_context_failed';
+        backendResult.context_error = context.error_code || context.error || 'share_context_failed';
+      }
     }
     let message = null;
-    const shouldPublishMessage = opts.messageMode === 'always' || (opts.messageMode === 'auto' && !opts.threadId);
+    const shouldPublishMessage = threadPublication.allow_shared_publication
+      && (opts.messageMode === 'always' || (opts.messageMode === 'auto' && !opts.threadId));
     if (shouldPublishMessage) {
       message = await measurePhase(phaseTimings, 'send_message_ms', () => mcp.call('send_message', {
         from_agent: opts.agentId,
         auth_token: authToken,
         content: truncate(payload, MAX_MESSAGE_CHARS),
-        idempotency_key: `${opts.agentId}:message`,
+        idempotency_key: runIdempotencyKey(runId, 'message'),
       }));
       if (message.success !== true) {
         backendResult.ok = false;
@@ -1322,7 +1408,7 @@ async function main() {
         thread_id: opts.threadId,
         role: opts.threadRole,
         content: truncate(payload, MAX_MESSAGE_CHARS),
-        idempotency_key: `${opts.agentId}:thread:${opts.threadId}:${opts.key}`,
+        idempotency_key: runIdempotencyKey(runId, 'thread', opts.threadId, opts.key),
       }));
       if (threadReply.success === true) {
         backendResult.thread_message_id = threadReply.message?.id;
@@ -1332,7 +1418,7 @@ async function main() {
         backendResult.thread_error = threadReply.error_code || threadReply.error || 'reply_thread_failed';
       }
     }
-    if (context.success === true && (backendResult.message_error || backendResult.thread_error)) {
+    if (context?.success === true && (backendResult.message_error || backendResult.thread_error)) {
       payload = buildPublishPayload(opts, prompt, backendResult);
       context = await measurePhase(phaseTimings, 'share_context_publish_correction_ms', () => mcp.call('share_context', {
         agent_id: opts.agentId,
@@ -1340,7 +1426,7 @@ async function main() {
         key: opts.key,
         namespace: opts.namespace,
         value: payload,
-        idempotency_key: `${opts.agentId}:${opts.key}:publish-correction`,
+        idempotency_key: runIdempotencyKey(runId, 'context-publish-correction', opts.key),
       }));
       if (context.success !== true) {
         backendResult.context_error = context.error_code || context.error || 'share_context_publish_correction_failed';
@@ -1350,7 +1436,7 @@ async function main() {
     if (activeClaim && Number.isInteger(opts.taskId) && opts.taskId > 0) {
       runState.phase = 'releasing';
       await publishRunStatus(mcp, opts, authToken, prompt, runState);
-      const contextId = context.context?.id;
+      const contextId = context?.context?.id;
       const messageId = message?.message?.id;
       const threadMessageId = threadReply?.message?.id;
       const evidenceRefs = [
@@ -1364,34 +1450,38 @@ async function main() {
         agent_id: opts.agentId,
         auth_token: authToken,
         claim_id: activeClaim.claim?.claim_id,
-        next_status: backendResult.ok ? 'done' : 'blocked',
-        confidence: backendResult.ok ? 0.9 : undefined,
-        verification_passed: backendResult.ok ? true : undefined,
+        next_status: backendResult.ok ? 'done' : opts.failureStatus,
+        preserve_assignment: backendResult.ok ? undefined : true,
+        confidence: backendResult.ok ? backendResult.completion_confidence : undefined,
+        verification_passed: backendResult.ok ? backendResult.completion_verified : undefined,
         evidence_refs: backendResult.ok ? evidenceRefs : undefined,
-        idempotency_key: `${opts.agentId}:release:${opts.taskId}`,
+        idempotency_key: runIdempotencyKey(runId, 'release', opts.taskId),
       }));
       if (release.success !== true && backendResult.ok) {
         const releaseError = release;
         backendResult.ok = false;
         backendResult.error = 'done_release_failed';
         backendResult.release_error = releaseError.error_code || releaseError.error || 'release_task_claim_failed';
-        release = await measurePhase(phaseTimings, 'release_task_claim_blocked_ms', () => mcp.call('release_task_claim', {
+        release = await measurePhase(phaseTimings, 'release_task_claim_failed_done_ms', () => mcp.call('release_task_claim', {
           task_id: opts.taskId,
           agent_id: opts.agentId,
           auth_token: authToken,
           claim_id: activeClaim.claim?.claim_id,
-          next_status: 'blocked',
-          idempotency_key: `${opts.agentId}:release-blocked:${opts.taskId}`,
+          next_status: opts.failureStatus,
+          preserve_assignment: true,
+          idempotency_key: runIdempotencyKey(runId, 'release-failed-done', opts.taskId),
         }));
-        backendResult.blocked_release = release.success === true;
-        await measurePhase(phaseTimings, 'share_context_release_correction_ms', () => mcp.call('share_context', {
-          agent_id: opts.agentId,
-          auth_token: authToken,
-          key: opts.key,
-          namespace: opts.namespace,
-          value: buildPublishPayload(opts, prompt, backendResult),
-          idempotency_key: `${opts.agentId}:${opts.key}:release-correction`,
-        }));
+        backendResult.failure_release = release.success === true;
+        if (threadPublication.allow_shared_publication) {
+          await measurePhase(phaseTimings, 'share_context_release_correction_ms', () => mcp.call('share_context', {
+            agent_id: opts.agentId,
+            auth_token: authToken,
+            key: opts.key,
+            namespace: opts.namespace,
+            value: buildPublishPayload(opts, prompt, backendResult),
+            idempotency_key: runIdempotencyKey(runId, 'context-release-correction', opts.key),
+          }));
+        }
       }
       if (release.success !== true) {
         throw new Error(`release_task_claim failed: ${JSON.stringify(release)}`);
@@ -1411,7 +1501,7 @@ async function main() {
       raw_error: backendResult.error,
       parsed_json: backendResult.parsed_json,
     };
-    await measurePhase(phaseTimings, 'write_report_final_ms', () => fs.writeFile(reportPath, `${JSON.stringify(fullReport, null, 2)}\n`));
+    await measurePhase(phaseTimings, 'write_report_final_ms', () => writePrivateJson(reportPath, fullReport));
     runState.phase = 'final';
     runState.status = backendResult.ok ? 'pass' : (backendResult.timed_out ? 'timeout' : 'degraded');
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
@@ -1420,7 +1510,7 @@ async function main() {
       backend: opts.backend,
       agent_id: opts.agentId,
       namespace: opts.namespace,
-      context_id: context.context?.id || null,
+      context_id: context?.context?.id || null,
       message_id: message?.message?.id || null,
       thread_message_id: threadReply?.message?.id || null,
       task_id: opts.taskId || null,
@@ -1442,24 +1532,25 @@ async function main() {
     runState.errorDigest = errorDigest(error);
     runState.errorClass = error?.name || 'Error';
     runState.errorPreview = truncate(error?.message || String(error), 500);
-    let blockedRelease = null;
+    let failureRelease = null;
     if (activeClaimRenewal) {
       await measurePhase(phaseTimings, 'claim_renewal_stop_after_error_ms', () => activeClaimRenewal.stop()).catch(() => undefined);
       activeClaimRenewal = null;
     }
     if (activeClaim && !activeClaimReleased && authToken) {
-      blockedRelease = await measurePhase(phaseTimings, 'release_task_claim_after_error_ms', () => mcp.call('release_task_claim', {
+      failureRelease = await measurePhase(phaseTimings, 'release_task_claim_after_error_ms', () => mcp.call('release_task_claim', {
         task_id: opts.taskId,
         agent_id: opts.agentId,
         auth_token: authToken,
         claim_id: activeClaim.claim?.claim_id,
-        next_status: 'blocked',
-        idempotency_key: `${opts.agentId}:release-after-error:${opts.taskId}:${startedAt}`,
+        next_status: opts.failureStatus,
+        preserve_assignment: true,
+        idempotency_key: runIdempotencyKey(runId, 'release-after-error', opts.taskId),
       })).catch((releaseError) => ({
         success: false,
         error: String(releaseError?.message || releaseError),
       }));
-      activeClaimReleased = blockedRelease?.success === true;
+      activeClaimReleased = failureRelease?.success === true;
     }
     await publishRunStatus(mcp, opts, authToken, prompt, runState);
     const failureReport = {
@@ -1473,15 +1564,16 @@ async function main() {
       finished_at: Date.now(),
       error_digest: runState.errorDigest,
       error: runState.errorPreview,
-      blocked_release: blockedRelease?.success ?? null,
-      blocked_release_error: blockedRelease?.success === false ? (blockedRelease.error_code || blockedRelease.error || 'release_task_claim_failed') : undefined,
+      failure_status: opts.failureStatus,
+      failure_release: failureRelease?.success ?? null,
+      failure_release_error: failureRelease?.success === false ? (failureRelease.error_code || failureRelease.error || 'release_task_claim_failed') : undefined,
       phase: runState.phase,
       phase_timings_ms: phaseTimings,
       rpc_retries: rpcRetries,
       publish_attempts: runState.publishAttempts,
       publish_failures: runState.publishFailures,
     };
-    await fs.writeFile(reportPath, `${JSON.stringify(failureReport, null, 2)}\n`).catch(() => undefined);
+    await writePrivateJson(reportPath, failureReport).catch(() => undefined);
     throw error;
   } finally {
     heartbeat?.stop();

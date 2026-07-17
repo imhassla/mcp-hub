@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENDPOINT="${ENDPOINT:-http://localhost:3300/mcp}"
+ENDPOINT="${ENDPOINT:-http://127.0.0.1:3300/mcp}"
 ROUNDS="${ROUNDS:-20}"
 WAIT_MS="${WAIT_MS:-1500}"
 POLL_INTERVAL_MS="${POLL_INTERVAL_MS:-100}"
 WAIT_MODES="${WAIT_MODES:-tiny,micro,nano}"
 MCP_REINIT_ON_SESSION_ERROR="${MCP_REINIT_ON_SESSION_ERROR:-1}"
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 AGENT_ID="${AGENT_ID:-wait-ab-$(date +%s)-$$}"
 AGENT_NAME="${AGENT_NAME:-Wait Mode AB}"
 AGENT_TYPE="${AGENT_TYPE:-benchmark}"
@@ -18,8 +19,27 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 SID=""
-LAST_VALID_SID=""
 REQ_ID=1
+
+close_mcp_session() {
+  local session_id="${1:-}"
+  if [ -z "$session_id" ]; then
+    return 0
+  fi
+  curl -sS -X DELETE "$ENDPOINT" \
+    --connect-timeout 2 \
+    --max-time 5 \
+    -H "mcp-session-id: $session_id" \
+    -H 'Accept: application/json, text/event-stream' >/dev/null 2>&1 || true
+}
+
+cleanup() {
+  local session_id="$SID"
+  SID=""
+  close_mcp_session "$session_id"
+}
+
+trap cleanup EXIT
 
 next_id() {
   REQ_ID=$((REQ_ID + 1))
@@ -40,9 +60,9 @@ mcp_post() {
   local payload="$1"
   local response
   if [ -n "$SID" ]; then
-    response="$(curl -sS -H "content-type: application/json" -H "mcp-session-id: $SID" -X POST "$ENDPOINT" -d "$payload")"
+    response="$(printf '%s' "$payload" | curl -sS -H "content-type: application/json" -H "mcp-session-id: $SID" -X POST "$ENDPOINT" --data-binary @-)"
   else
-    response="$(curl -sS -H "content-type: application/json" -X POST "$ENDPOINT" -d "$payload")"
+    response="$(printf '%s' "$payload" | curl -sS -H "content-type: application/json" -X POST "$ENDPOINT" --data-binary @-)"
   fi
   printf '%s' "$response"
 }
@@ -106,6 +126,12 @@ tool_call() {
 }
 
 init_session() {
+  local previous_sid="$SID"
+  if [ -n "$previous_sid" ]; then
+    SID=""
+    close_mcp_session "$previous_sid"
+  fi
+
   local init_payload
   init_payload="$(jq -nc --argjson id "$(next_id)" \
     '{jsonrpc:"2.0",id:$id,method:"initialize",params:{protocolVersion:"2025-03-26",capabilities:{},clientInfo:{name:"wait-mode-ab",version:"1.0"}}}')"
@@ -113,21 +139,22 @@ init_session() {
   local headers_file body_file
   headers_file="$(mktemp)"
   body_file="$(mktemp)"
-  curl -sS -D "$headers_file" -o "$body_file" -H "content-type: application/json" -X POST "$ENDPOINT" -d "$init_payload" >/dev/null
-  SID="$(awk '/^mcp-session-id:/ {print $2}' "$headers_file" | tr -d '\r')"
+  printf '%s' "$init_payload" | curl -sS -D "$headers_file" -o "$body_file" -H "content-type: application/json" -X POST "$ENDPOINT" --data-binary @- >/dev/null
+  local new_sid
+  new_sid="$(awk '/^mcp-session-id:/ {print $2}' "$headers_file" | tr -d '\r')"
   rm -f "$headers_file"
-  if [ -z "$SID" ]; then
+  if [ -z "$new_sid" ]; then
     cat "$body_file" >&2 || true
     rm -f "$body_file"
     echo "failed to initialize MCP session" >&2
     exit 1
   fi
   rm -f "$body_file"
+  SID="$new_sid"
 
   local initialized_payload
   initialized_payload="$(jq -nc '{jsonrpc:"2.0",method:"notifications/initialized",params:{}}')"
   mcp_post "$initialized_payload" >/dev/null
-  LAST_VALID_SID="$SID"
 }
 
 main() {
@@ -151,8 +178,8 @@ main() {
   fi
 
   local register_args register_resp auth_token
-  register_args="$(jq -nc --arg id "$AGENT_ID" --arg name "$AGENT_NAME" --arg type "$AGENT_TYPE" \
-    '{id:$id,name:$name,type:$type,onboarding_mode:"none"}')"
+  register_args="$(REGISTER_TOKEN="$REGISTER_TOKEN" jq -nc --arg id "$AGENT_ID" --arg name "$AGENT_NAME" --arg type "$AGENT_TYPE" \
+    '{id:$id,name:$name,type:$type,onboarding_mode:"none"} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
   register_resp="$(tool_call "register_agent" "$register_args")"
   auth_token="$(printf '%s' "$register_resp" | jq -r '.auth.token // empty')"
 
@@ -173,20 +200,18 @@ main() {
       local wait_base_args wait_base cursor send_args wait_hit_args hit_json start_ms end_ms elapsed_ms bytes changed
 
       if [ "$mode" = "default" ]; then
-        wait_base_args="$(jq -nc \
+        wait_base_args="$(AUTH_TOKEN_VALUE="$auth_token" jq -nc \
           --arg agent "$AGENT_ID" \
-          --arg token "$auth_token" \
           --argjson wait 120 \
           --argjson poll "$POLL_INTERVAL_MS" \
-          '{agent_id:$agent,auth_token:$token,streams:["messages"],timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
+          '{agent_id:$agent,auth_token:env.AUTH_TOKEN_VALUE,streams:["messages"],timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
       else
-        wait_base_args="$(jq -nc \
+        wait_base_args="$(AUTH_TOKEN_VALUE="$auth_token" jq -nc \
           --arg agent "$AGENT_ID" \
-          --arg token "$auth_token" \
           --arg mode "$mode" \
           --argjson wait 120 \
           --argjson poll "$POLL_INTERVAL_MS" \
-          '{agent_id:$agent,auth_token:$token,streams:["messages"],response_mode:$mode,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
+          '{agent_id:$agent,auth_token:env.AUTH_TOKEN_VALUE,streams:["messages"],response_mode:$mode,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
       fi
       wait_base="$(tool_call "wait_for_updates" "$wait_base_args")"
       cursor="$(printf '%s' "$wait_base" | jq -r '.cursor // .u // empty')"
@@ -195,31 +220,29 @@ main() {
         exit 1
       fi
 
-      send_args="$(jq -nc \
+      send_args="$(AUTH_TOKEN_VALUE="$auth_token" jq -nc \
         --arg from "$AGENT_ID" \
         --arg to "$AGENT_ID" \
-        --arg token "$auth_token" \
         --arg content "ab-$mode-$i" \
-        '{from_agent:$from,to_agent:$to,content:$content,auth_token:$token}')"
+        --arg idem "$AGENT_ID:wait-ab:$mode:$i" \
+        '{from_agent:$from,to_agent:$to,content:$content,auth_token:env.AUTH_TOKEN_VALUE,idempotency_key:$idem}')"
       tool_call "send_message" "$send_args" >/dev/null
 
       if [ "$mode" = "default" ]; then
-        wait_hit_args="$(jq -nc \
+        wait_hit_args="$(AUTH_TOKEN_VALUE="$auth_token" jq -nc \
           --arg agent "$AGENT_ID" \
-          --arg token "$auth_token" \
           --arg cursor "$cursor" \
           --argjson wait "$WAIT_MS" \
           --argjson poll "$POLL_INTERVAL_MS" \
-          '{agent_id:$agent,auth_token:$token,streams:["messages"],cursor:$cursor,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
+          '{agent_id:$agent,auth_token:env.AUTH_TOKEN_VALUE,streams:["messages"],cursor:$cursor,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
       else
-        wait_hit_args="$(jq -nc \
+        wait_hit_args="$(AUTH_TOKEN_VALUE="$auth_token" jq -nc \
           --arg agent "$AGENT_ID" \
-          --arg token "$auth_token" \
           --arg mode "$mode" \
           --arg cursor "$cursor" \
           --argjson wait "$WAIT_MS" \
           --argjson poll "$POLL_INTERVAL_MS" \
-          '{agent_id:$agent,auth_token:$token,streams:["messages"],cursor:$cursor,response_mode:$mode,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
+          '{agent_id:$agent,auth_token:env.AUTH_TOKEN_VALUE,streams:["messages"],cursor:$cursor,response_mode:$mode,timeout_response:"default",wait_ms:$wait,poll_interval_ms:$poll}')"
       fi
 
       start_ms="$(now_ms)"

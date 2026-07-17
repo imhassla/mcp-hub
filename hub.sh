@@ -25,6 +25,24 @@ load_env_file() {
     echo "Environment file not found: $file" >&2
     exit 1
   fi
+  if [ "$label" = "local" ]; then
+    local mode
+    mode="$(stat -f '%Lp' "$file" 2>/dev/null || true)"
+    case "$mode" in
+      ""|*[!0-7]*) mode="$(stat -c '%a' "$file" 2>/dev/null || true)" ;;
+    esac
+    case "$mode" in
+      ""|*[!0-7]*)
+        echo "Cannot determine permissions for local environment file: $file" >&2
+        exit 1
+        ;;
+    esac
+    if (( (8#$mode & 8#077) != 0 )); then
+      echo "Local environment file must not be accessible by group or others: $file (mode $mode)" >&2
+      echo "Run: chmod 600 \"$file\"" >&2
+      exit 1
+    fi
+  fi
   # shellcheck disable=SC1090
   . "$file"
   ENV_SOURCES+=("${label}:${file}")
@@ -71,8 +89,11 @@ if [ -n "$EXTRA_BIND_HOSTS_RAW" ]; then
     if [ -z "$host" ] || [ "$host" = "$LOCAL_BIND_HOST" ]; then
       continue
     fi
-    if [ "$host" = "0.0.0.0" ]; then
-      echo "MCP_HUB_EXTRA_BIND_HOSTS must contain explicit interface addresses, not 0.0.0.0" >&2
+    if [ "$host" = "0.0.0.0" ] \
+      || [ "$host" = "::" ] \
+      || [ "$host" = "[::]" ] \
+      || [ "$host" = "0:0:0:0:0:0:0:0" ]; then
+      echo "MCP_HUB_EXTRA_BIND_HOSTS must contain explicit interface addresses, not wildcard binds" >&2
       exit 1
     fi
     duplicate=0
@@ -91,6 +112,10 @@ fi
 FORWARDED_ENV_VARS=(
   MCP_HUB_AUTH_MODE
   MCP_HUB_REQUIRE_AUTH
+  MCP_HUB_REGISTER_TOKEN
+  MCP_HUB_ALLOW_LEGACY_AGENT_CLAIM
+  MCP_HUB_REGISTER_RATE_LIMIT_RPS
+  MCP_HUB_REGISTER_RATE_LIMIT_BURST
   MCP_HUB_ORIGIN_MODE
   MCP_HUB_ALLOWED_ORIGINS
   MCP_HUB_STRICT_SESSION_STATUS
@@ -103,11 +128,21 @@ FORWARDED_ENV_VARS=(
   MCP_HUB_NAMESPACE_QUOTA_FALLBACK
   MCP_HUB_MAINTENANCE_INTERVAL_MS
   MCP_HUB_SESSION_IDLE_TIMEOUT_MS
+  MCP_HUB_SESSION_PROVISIONAL_TTL_MS
   MCP_HUB_SESSION_GC_INTERVAL_MS
+  MCP_HUB_MAX_SESSIONS
+  MCP_HUB_MAX_SESSIONS_PER_SOURCE
+  MCP_HUB_SESSION_INITIALIZE_RPS
+  MCP_HUB_SESSION_INITIALIZE_BURST
   MCP_HUB_RATE_LIMIT_RPS
   MCP_HUB_RATE_LIMIT_BURST
+  MCP_HUB_RATE_LIMIT_BUCKET_IDLE_TTL_MS
   MCP_HUB_EVENT_STREAM_INTERVAL_MS
   MCP_HUB_EVENT_STREAM_HEARTBEAT_MS
+  MCP_HUB_EVENT_STREAM_MAX_CONNECTIONS
+  MCP_HUB_EVENT_STREAM_MAX_PER_AGENT
+  MCP_HUB_EVENT_STREAM_MAX_BUFFER_BYTES
+  MCP_HUB_EVENT_STREAM_DRAIN_TIMEOUT_MS
   MCP_HUB_AGENT_OFFLINE_AFTER_MS
   MCP_HUB_AGENT_RETENTION_MS
   MCP_HUB_EPHEMERAL_OFFLINE_AFTER_MS
@@ -163,6 +198,11 @@ FORWARDED_ENV_VARS=(
   MCP_HUB_ARTIFACTS_DIR
   MCP_HUB_ARTIFACT_MAX_BYTES
   MCP_HUB_ARTIFACT_TICKET_TTL_SEC
+  MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE
+  MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT
+  MCP_HUB_ARTIFACT_UPLOAD_RESERVATION_TTL_MS
+  MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE
+  MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT
   MCP_HUB_ARTIFACT_UPLOAD_TTL_SEC
   MCP_HUB_ARTIFACT_DOWNLOAD_TTL_SEC
   MCP_HUB_ARTIFACT_RETENTION_SEC
@@ -182,7 +222,7 @@ usage() {
   echo "  stop     Stop running container"
   echo "  restart  Restart the server"
   echo "  status   Show container status and health"
-  echo "  smoke    MCP handshake smoke test (initialize + tools/list)"
+  echo "  smoke    MCP handshake + registration/authenticated-call smoke test"
   echo "  logs     Show container logs (follow with -f)"
   echo "  db       Open SQLite shell to inspect the database"
   echo "  clean    Remove container, image, and database"
@@ -191,17 +231,48 @@ usage() {
 
 cmd_build() {
   echo "Building $IMAGE..."
-  docker build -t "$IMAGE" .
+  docker build -t "$IMAGE" "$ROOT_DIR"
   echo "Done. Image: $IMAGE"
 }
 
 cmd_test() {
   echo "Building dev image and running tests..."
-  docker build -f Dockerfile.dev -t "${IMAGE}-dev" .
+  docker build -f "$ROOT_DIR/Dockerfile.dev" -t "${IMAGE}-dev" "$ROOT_DIR"
   docker run --rm "${IMAGE}-dev" npx vitest run
 }
 
+effective_auth_mode() {
+  local configured
+  configured="$(trim_ws "$(printf '%s' "${MCP_HUB_AUTH_MODE:-}" | tr '[:upper:]' '[:lower:]')")"
+  if [ -n "$configured" ]; then
+    printf '%s' "$configured"
+    return
+  fi
+  case "$(trim_ws "$(printf '%s' "${MCP_HUB_REQUIRE_AUTH:-}" | tr '[:upper:]' '[:lower:]')")" in
+    true) printf 'enforce' ;;
+    *) printf 'observe' ;;
+  esac
+}
+
+validate_start_config() {
+  local auth_mode
+  auth_mode="$(effective_auth_mode)"
+  case "$auth_mode" in
+    observe|warn|enforce) ;;
+    *)
+      echo "Invalid MCP_HUB_AUTH_MODE=$auth_mode (expected observe, warn, or enforce)." >&2
+      return 1
+      ;;
+  esac
+  if [ "$auth_mode" = "enforce" ] && [ -z "$(trim_ws "${MCP_HUB_REGISTER_TOKEN:-}")" ]; then
+    echo "Refusing to start auth_mode=enforce with open agent enrollment." >&2
+    echo "Set MCP_HUB_REGISTER_TOKEN in the protected local env overlay (for example: openssl rand -hex 32)." >&2
+    return 1
+  fi
+}
+
 cmd_start() {
+  validate_start_config
   if docker ps -q --filter name="^${CONTAINER}$" | grep -q .; then
     echo "Already running. Use '$0 restart' to restart."
     cmd_status
@@ -212,6 +283,7 @@ cmd_start() {
   docker rm "$CONTAINER" 2>/dev/null || true
 
   mkdir -p "$DB_DIR"
+  chmod 700 "$DB_DIR"
   echo "Starting MCP Agent Hub on port $PORT..."
   echo "Publishing:"
   for bind_host in "${PUBLISH_BIND_HOSTS[@]}"; do
@@ -231,7 +303,7 @@ cmd_start() {
   for bind_host in "${PUBLISH_BIND_HOSTS[@]}"; do
     publish_args+=(-p "$bind_host:$PORT:3000")
   done
-  local public_base_url="${MCP_HUB_PUBLIC_BASE_URL:-http://localhost:$PORT}"
+  local public_base_url="${MCP_HUB_PUBLIC_BASE_URL:-http://127.0.0.1:$PORT}"
   env_args+=(-e "MCP_HUB_PUBLIC_BASE_URL=${public_base_url}")
   for env_name in "${FORWARDED_ENV_VARS[@]}"; do
     local env_value="${!env_name:-}"
@@ -243,13 +315,14 @@ cmd_start() {
   docker run -d \
     --name "$CONTAINER" \
     --restart unless-stopped \
+    --user "$(id -u):$(id -g)" \
     "${publish_args[@]}" \
     -v "$DB_DIR:/data" \
     "${env_args[@]}" \
     "$IMAGE"
 
-  echo "Server: http://localhost:$PORT/mcp"
-  echo "Health: http://localhost:$PORT/health"
+  echo "Server: http://127.0.0.1:$PORT/mcp"
+  echo "Health: http://127.0.0.1:$PORT/health"
   echo "DB:     $DB_DIR/hub.db"
 }
 
@@ -264,6 +337,8 @@ cmd_stop() {
 }
 
 cmd_restart() {
+  # Validate before stopping a healthy container so a bad auth configuration cannot cause downtime.
+  validate_start_config
   cmd_stop
   cmd_start
 }
@@ -281,7 +356,7 @@ cmd_status() {
   if docker ps -q --filter name="^${CONTAINER}$" | grep -q .; then
     docker ps --filter name="^${CONTAINER}$" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
     echo ""
-    curl -s "http://localhost:$PORT/health" 2>/dev/null && echo "" || echo "Health check failed"
+    curl -s "http://127.0.0.1:$PORT/health" 2>/dev/null && echo "" || echo "Health check failed"
   else
     echo "Container $CONTAINER is not running."
   fi
@@ -294,12 +369,24 @@ cmd_status() {
 }
 
 cmd_smoke() {
-  local endpoint="http://localhost:$PORT/mcp"
+  local endpoint="http://127.0.0.1:$PORT/mcp"
+  local health_url="http://127.0.0.1:$PORT/health"
   local init_payload='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hub-smoke","version":"1.0.0"}}}'
   local initialized_payload='{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
   local tools_payload='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
   echo "Running MCP smoke test against $endpoint..."
+
+  local health_response
+  health_response=$(curl -fsS "$health_url") || {
+    echo "Smoke test failed: health endpoint could not be reached."
+    return 1
+  }
+  if printf '%s' "$health_response" | grep -q '"auth_mode":"enforce"' \
+    && printf '%s' "$health_response" | grep -q '"register_auth_mode":"open_enrollment"'; then
+    echo "Smoke test failed: auth_mode=enforce is running with open agent enrollment." >&2
+    return 1
+  fi
 
   local init_response
   init_response=$(curl -i -sS -X POST "$endpoint" \
@@ -318,12 +405,17 @@ cmd_smoke() {
     return 1
   fi
 
+  close_smoke_session() {
+    curl -sS -X DELETE "$endpoint" -H "mcp-session-id: $session_id" >/dev/null || true
+  }
+
   curl -sS -X POST "$endpoint" \
     -H "mcp-session-id: $session_id" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     --data "$initialized_payload" >/dev/null || {
     echo "Smoke test failed: notifications/initialized request failed."
+    close_smoke_session
     return 1
   }
 
@@ -334,6 +426,7 @@ cmd_smoke() {
     -H 'Accept: application/json, text/event-stream' \
     --data "$tools_payload") || {
     echo "Smoke test failed: tools/list request failed."
+    close_smoke_session
     return 1
   }
 
@@ -346,21 +439,81 @@ cmd_smoke() {
     else
       echo "Smoke test failed: tools/list response had no MCP data payload."
       printf '%s\n' "$tools_response" | sed -n '1,30p'
+      close_smoke_session
       return 1
     fi
   fi
 
   local tool_count
   tool_count=$(printf '%s\n' "$tools_data" | grep -o '"name":"' | wc -l | tr -d ' ')
-
-  curl -sS -X DELETE "$endpoint" -H "mcp-session-id: $session_id" >/dev/null || true
-
   if [ "$tool_count" -lt 10 ]; then
     echo "Smoke test failed: expected >=10 tools, got $tool_count."
+    close_smoke_session
     return 1
   fi
 
-  echo "Smoke test passed: session=$session_id tools=$tool_count"
+  local smoke_agent_id="hub-smoke-$(date +%s)-$$-$RANDOM"
+  local smoke_auth_token
+  smoke_auth_token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+  if [ "${#smoke_auth_token}" -lt 32 ]; then
+    echo "Smoke test failed: could not generate a client auth credential." >&2
+    close_smoke_session
+    return 1
+  fi
+
+  json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
+  }
+
+  local register_token_field=''
+  if [ -n "${MCP_HUB_REGISTER_TOKEN:-}" ]; then
+    register_token_field=",\"register_token\":\"$(json_escape "$MCP_HUB_REGISTER_TOKEN")\""
+  fi
+  local register_payload
+  register_payload="{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"id\":\"$smoke_agent_id\",\"name\":\"Hub Smoke\",\"type\":\"smoke\",\"lifecycle\":\"ephemeral\",\"onboarding_mode\":\"none\",\"auth_token\":\"$smoke_auth_token\"$register_token_field}}}"
+  local register_response
+  register_response=$(printf '%s' "$register_payload" | curl -sS -X POST "$endpoint" \
+    -H "mcp-session-id: $session_id" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    --data-binary @-) || {
+    echo "Smoke test failed: register_agent request failed." >&2
+    close_smoke_session
+    return 1
+  }
+  if ! printf '%s' "$register_response" | grep -q '\\"success\\":true'; then
+    echo "Smoke test failed: register_agent did not succeed (check MCP_HUB_REGISTER_TOKEN)." >&2
+    close_smoke_session
+    return 1
+  fi
+
+  local authenticated_payload
+  authenticated_payload="{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"list_agents\",\"arguments\":{\"agent_id\":\"$smoke_agent_id\",\"auth_token\":\"$smoke_auth_token\",\"response_mode\":\"summary\"}}}"
+  local authenticated_response
+  authenticated_response=$(printf '%s' "$authenticated_payload" | curl -sS -X POST "$endpoint" \
+    -H "mcp-session-id: $session_id" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    --data-binary @-) || {
+    echo "Smoke test failed: authenticated list_agents request failed." >&2
+    close_smoke_session
+    return 1
+  }
+  if ! printf '%s' "$authenticated_response" | grep -q '\\"summary\\":{'; then
+    echo "Smoke test failed: authenticated list_agents did not return its summary contract." >&2
+    printf '%s\n' "$authenticated_response" | sed -n '1,10p' >&2
+    close_smoke_session
+    return 1
+  fi
+
+  close_smoke_session
+  echo "Smoke test passed: session=$session_id tools=$tool_count auth=verified"
 }
 
 cmd_logs() {
@@ -377,9 +530,9 @@ cmd_db() {
     exit 1
   fi
   docker run --rm -it \
-    -v "$DB_DIR:/data" \
+    -v "$DB_DIR:/data:ro" \
     node:20-alpine \
-    sh -c "apk add --quiet sqlite && sqlite3 /data/hub.db"
+    sh -c "apk add --quiet sqlite && exec sqlite3 -readonly /data/hub.db"
 }
 
 cmd_clean() {

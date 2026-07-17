@@ -1,4 +1,4 @@
-import { registerAgent, listAgents, heartbeat, logActivity, getAgentToken, validateAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
+import { registerAgent, getAgentById, listAgents, heartbeat, logActivity, hasAgentToken, isAgentIdRetired, clearAgentIdRetirement, validateAgentToken, updateAgentRuntimeProfile, getAgentQuality } from '../db.js';
 import type { Agent, AgentLifecycle, AgentModelProfile, AgentRuntimeProfile, AgentWorkspaceMode, TaskExecutionMode } from '../types.js';
 
 type OnboardingMode = 'full' | 'compact' | 'none';
@@ -19,7 +19,7 @@ interface NegotiatedContract {
   preferred_read_mode: 'nano' | 'tiny' | 'compact';
   wait_for_updates_mode: 'nano' | 'micro';
   blob_handoff_mode: 'hash_ref' | 'inline_compact';
-  push_transport: PushTransport;
+  push_transport: 'wait_for_updates' | 'sse_events' | null;
 }
 
 const MAX_MESSAGE_CONTENT_CHARS = Number(process.env.MCP_HUB_MAX_MESSAGE_CONTENT_CHARS || 1024);
@@ -92,9 +92,11 @@ function negotiateContract(client: ClientCapabilities): NegotiatedContract {
   const preferredReadMode: 'nano' | 'tiny' | 'compact' = supportsNano
     ? 'nano'
     : (supportsTiny ? 'tiny' : 'compact');
-  const pushTransport: PushTransport = client.push_transports.includes('sse_events')
+  const serverPushTransports = buildServerCapabilities().push_transports;
+  const commonPushTransports = client.push_transports.filter((transport) => serverPushTransports.includes(transport));
+  const pushTransport: NegotiatedContract['push_transport'] = commonPushTransports.includes('sse_events')
     ? 'sse_events'
-    : (client.push_transports.includes('websocket') ? 'websocket' : 'wait_for_updates');
+    : (commonPushTransports.includes('wait_for_updates') ? 'wait_for_updates' : null);
   return {
     snapshot_tool: client.snapshot_reads ? 'read_snapshot' : 'manual_reads',
     preferred_read_mode: preferredReadMode,
@@ -166,9 +168,9 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
       { name: 'pack_protocol_message', purpose: 'Pack payload into compact CAEP-v1 packet with hash' },
       { name: 'unpack_protocol_message', purpose: 'Unpack CAEP-v1 packet and validate hash' },
       { name: 'hash_payload', purpose: 'Generate deterministic payload digest for references/dedup' },
-      { name: 'store_protocol_blob', purpose: 'Store deduplicated payload blob by hash for reference exchange' },
-      { name: 'get_protocol_blob', purpose: 'Resolve hash reference and fetch blob payload' },
-      { name: 'list_protocol_blobs', purpose: 'Inspect recent protocol blobs and access counters' },
+      { name: 'store_protocol_blob', purpose: 'Store a private-by-default blob with explicit public/agent grants' },
+      { name: 'get_protocol_blob', purpose: 'Resolve an accessible hash reference and fetch its payload' },
+      { name: 'list_protocol_blobs', purpose: 'Inspect blobs visible to the current agent and access counters' },
     ],
     artifacts: [
       { name: 'create_artifact_upload', purpose: 'Issue one-time upload ticket for binary artifact transfer without token-heavy MCP payloads' },
@@ -217,6 +219,8 @@ function buildOnboarding(mode: OnboardingMode = 'full') {
         'release_task_claim', 'send_message', 'send_blob_message', 'share_context', 'share_blob_context',
       ],
       recommendation: 'Use idempotency_key for all retryable mutating calls',
+      max_key_chars: 256,
+      payload_rule: 'A key can only be replayed with the same semantic arguments; changed arguments return IDEMPOTENCY_KEY_CONFLICT',
     },
     hash_blob_exchange: {
       recommendation: 'Prefer send_blob_message/share_blob_context with compression_mode=lossless_auto for strict no-loss hash-ref exchange',
@@ -556,18 +560,85 @@ export function handleRegisterAgent(args: {
   role?: AgentRole;
   auth_token?: string;
   register_token?: string;
+  registration_token?: string;
+  allow_legacy_claim?: boolean;
 }) {
-  const lifecycle = normalizeLifecycle(args.lifecycle);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,119}$/.test(args.id)) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_INVALID',
+      error: 'Agent id must be 1..120 safe characters and cannot use reserved wildcard values',
+    };
+  }
+  const requestedLifecycle = normalizeLifecycle(args.lifecycle);
   const role = normalizeRole(args.role);
-  const registrationResult = registerAgent({
-    id: args.id,
-    name: args.name,
-    type: args.type,
-    capabilities: args.capabilities || '',
-    lifecycle,
-    runtime_profile: args.runtime_profile,
-  });
+  const existingAgent = getAgentById(args.id);
+  const credentialExists = hasAgentToken(args.id);
+  const retiredIdentity = isAgentIdRetired(args.id);
+  const suppliedAuthToken = typeof args.auth_token === 'string' ? args.auth_token.trim() : '';
+  const newIdentity = !existingAgent && !credentialExists && !retiredIdentity;
+  if (newIdentity && suppliedAuthToken && (suppliedAuthToken.length < 32 || suppliedAuthToken.length > 512)) {
+    return {
+      success: false,
+      error_code: 'INITIAL_AUTH_TOKEN_INVALID',
+      error: 'A client-provided initial auth_token must contain 32..512 characters',
+    };
+  }
+  const ownershipProven = Boolean(
+    credentialExists
+      && suppliedAuthToken.length > 0
+      && validateAgentToken(args.id, suppliedAuthToken)
+  );
+  if (!existingAgent && retiredIdentity && !ownershipProven) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_RETIRED',
+      error: 'This retired agent id cannot be reused without its existing credential',
+      auth: { token: null, proof_required: credentialExists },
+    };
+  }
+  if (!existingAgent && credentialExists && !ownershipProven) {
+    return {
+      success: false,
+      error_code: 'AGENT_ID_RESERVED',
+      error: 'This retired agent id is reserved. Provide its existing auth_token to restore it.',
+      auth: { token: null, proof_required: true },
+    };
+  }
+  const legacyClaim = Boolean(existingAgent && !credentialExists && args.allow_legacy_claim === true);
+  // Existing identities are immutable until the caller proves ownership. Keep the historical
+  // no-token re-register response shape, but treat it as a read-only compatibility path.
+  const updateApplied = newIdentity || ownershipProven || legacyClaim;
+  let registrationResult: ReturnType<typeof registerAgent>;
+  try {
+    registrationResult = updateApplied
+      ? registerAgent({
+        id: args.id,
+        // A pre-token legacy row can be claimed once, but the unauthenticated migration request
+        // must not rewrite its identity metadata while obtaining the first token.
+        name: legacyClaim ? existingAgent!.name : args.name,
+        type: legacyClaim ? existingAgent!.type : args.type,
+        capabilities: legacyClaim ? existingAgent!.capabilities : (args.capabilities || ''),
+        lifecycle: legacyClaim ? normalizeLifecycle(existingAgent!.lifecycle) : requestedLifecycle,
+        runtime_profile: legacyClaim
+          ? parseRuntimeProfileJson(existingAgent!.runtime_profile_json)
+          : args.runtime_profile,
+        initial_auth_token: newIdentity && suppliedAuthToken ? suppliedAuthToken : undefined,
+      })
+      : { agent: existingAgent!, is_new: false, issued_token: null };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: agent_tokens.token')) {
+      return {
+        success: false,
+        error_code: 'INITIAL_AUTH_TOKEN_CONFLICT',
+        error: 'The client-provided auth_token is already bound to another agent id',
+      };
+    }
+    throw error;
+  }
+  if (retiredIdentity && ownershipProven) clearAgentIdRetirement(args.id);
   const agent = registrationResult.agent;
+  const lifecycle = normalizeLifecycle(agent.lifecycle);
   const inferredOnboardingMode: OnboardingMode = registrationResult.is_new
     ? (lifecycle === 'ephemeral' ? DEFAULT_EPHEMERAL_ONBOARDING_MODE : DEFAULT_ONBOARDING_MODE)
     : DEFAULT_REREGISTER_ONBOARDING_MODE;
@@ -581,20 +652,17 @@ export function handleRegisterAgent(args: {
     : runtimeProfile.mode === 'unknown'
       ? 'runtime_mode_unknown: provide runtime_profile for better task routing'
       : null;
-  logActivity(
-    args.id,
-    'register_agent',
-    `Agent "${args.name}" registered as ${args.type} role=${role} lifecycle=${lifecycle} runtime_mode=${runtimeProfile.mode} is_new=${registrationResult.is_new ? 1 : 0} onboarding_mode=${onboardingMode}`
-  );
+  if (updateApplied) {
+    logActivity(
+      args.id,
+      legacyClaim ? 'register_agent_legacy_claim' : 'register_agent',
+      `Agent "${agent.name}" registered as ${agent.type} role=${role} lifecycle=${lifecycle} runtime_mode=${runtimeProfile.mode} is_new=${registrationResult.is_new ? 1 : 0} legacy_claim=${legacyClaim ? 1 : 0} onboarding_mode=${onboardingMode}`
+    );
+  }
   const onboarding = buildOnboarding(onboardingMode);
-  const auth = getAgentToken(args.id);
-  // Security (F1): never return an existing agent's auth_token to a caller who has not
-  // proven ownership. A freshly created agent's token goes to its registrant; an existing
-  // agent's token is only echoed back when the caller supplies the matching token.
-  const ownershipProven = typeof args.auth_token === 'string'
-    && args.auth_token.length > 0
-    && validateAgentToken(args.id, args.auth_token);
-  const exposeToken = registrationResult.is_new || ownershipProven;
+  // Security (F1): a new token is returned only on first registration, on the one-time legacy
+  // migration path, or after the caller proves ownership of an already-tokenized identity.
+  const responseToken = registrationResult.issued_token?.token || (ownershipProven ? suppliedAuthToken : null);
   const roleGuidance = buildRoleGuidance(role);
   const runtimeGuidance = buildRuntimeGuidance(runtimeProfile);
   return {
@@ -609,14 +677,14 @@ export function handleRegisterAgent(args: {
       server: serverCapabilities,
       negotiated,
     },
-    auth: auth ? (exposeToken ? {
-      token: auth.token,
+    auth: responseToken ? {
+      token: responseToken,
       note: 'Keep token private. It is used by MCP_HUB_AUTH_MODE=warn|enforce.',
     } : {
       token: null,
       proof_required: true,
-      note: 'This agent id already exists. Re-register with its original auth_token to retrieve the token (proof of ownership required).',
-    }) : null,
+      note: 'This agent id already exists. No registration fields were changed. Re-register with its original auth_token to prove ownership.',
+    },
     client_runtime: {
       session_recovery: {
         error_code: -32000,
@@ -629,10 +697,18 @@ export function handleRegisterAgent(args: {
       role,
       lifecycle,
       onboarding_mode: onboardingMode,
-      is_new: registrationResult.is_new,
+      is_new: newIdentity,
+      update_applied: updateApplied,
+      legacy_claim: legacyClaim,
+      credential_source: registrationResult.issued_token
+        ? (suppliedAuthToken ? 'client_provided' : 'server_generated')
+        : (ownershipProven ? 'existing' : 'none'),
       contract_profile: negotiated,
     },
-    warnings: runtimeHint ? [runtimeHint] : [],
+    warnings: [
+      ...(runtimeHint ? [runtimeHint] : []),
+      ...(!updateApplied ? ['existing_agent_update_ignored: valid auth_token required'] : []),
+    ],
   };
 }
 
@@ -1065,6 +1141,8 @@ export const agentTools = {
         name: { type: 'string', description: 'Human-readable agent name' },
         type: { type: 'string', description: 'Agent type (e.g. claude, codex, custom)' },
         register_token: { type: 'string', description: 'Registration secret required when MCP_HUB_REGISTER_TOKEN is configured' },
+        registration_token: { type: 'string', description: 'Legacy alias for register_token' },
+        auth_token: { type: 'string', description: 'Existing ownership token, or strong client-generated initial token for response-loss recovery' },
         capabilities: { type: 'string', description: 'Comma-separated list of capabilities' },
         client_capabilities: {
           type: 'object',
@@ -1150,6 +1228,7 @@ export const agentTools = {
         offset: { type: 'number', description: 'Row offset for pagination (default 0)' },
         response_mode: { type: 'string', enum: ['full', 'compact', 'summary'], description: 'compact trims fields; summary returns runtime/model aggregate counts' },
       },
+      required: ['agent_id'],
     },
     handler: handleListAgents,
   },

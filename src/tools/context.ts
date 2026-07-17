@@ -5,6 +5,7 @@ import {
   heartbeat,
   logActivity,
   putProtocolBlob,
+  grantProtocolBlobAccess,
   getProtocolBlob,
 } from '../db.js';
 import type { Context } from '../types.js';
@@ -104,8 +105,8 @@ export function handleShareContext(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'share_context', args.idempotency_key, () => {
-    const compressionMode = args.compression_mode || 'auto';
+  return withIdempotency(args.agent_id, 'share_context', args.idempotency_key, args, () => {
+    const compressionMode = args.compression_mode || 'none';
     const compressed = maybeCompressValue(args.value, compressionMode);
     if (compressed.value.length > MAX_CONTEXT_VALUE_CHARS) {
       const error = `Context value too long (${compressed.value.length} chars). Max is ${MAX_CONTEXT_VALUE_CHARS}.`;
@@ -145,7 +146,7 @@ export function handleShareBlobContext(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'share_blob_context', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'share_blob_context', args.idempotency_key, args, () => {
     const compressionMode = args.compression_mode || 'lossless_auto';
     const compressed = compressionMode === 'lossless_auto'
       ? (() => {
@@ -177,7 +178,6 @@ export function handleShareBlobContext(args: {
 
     const fullHash = sha256Hex(compressed.value);
     const shortLen = Number.isFinite(args.hash_truncate) ? Math.max(8, Math.min(64, Math.floor(Number(args.hash_truncate)))) : 16;
-    const { created } = putProtocolBlob(fullHash, compressed.value);
     const refValue = makeBlobRefEnvelope(fullHash, compressed.value.length);
 
     if (refValue.length > MAX_CONTEXT_VALUE_CHARS) {
@@ -186,8 +186,10 @@ export function handleShareBlobContext(args: {
       return { success: false, error_code: 'VALUE_TOO_LONG', error, max_chars: MAX_CONTEXT_VALUE_CHARS };
     }
 
+    const { created } = putProtocolBlob(fullHash, compressed.value, args.agent_id);
     const contextNamespace = (args.namespace || 'default').trim() || 'default';
     const ctx = shareContext(args.agent_id, args.key, refValue, args.trace_id, args.span_id, contextNamespace);
+    grantProtocolBlobAccess(fullHash, ['*'], args.agent_id);
     logActivity(
       args.agent_id,
       'share_blob_context',
@@ -275,7 +277,7 @@ export function handleGetContext(args: {
     ? slicedContexts.map((ctx) => {
       const blobRef = parseBlobRefEnvelope(ctx.value);
       if (!blobRef) return { ...ctx };
-      const blob = getProtocolBlob(blobRef.hash);
+      const blob = getProtocolBlob(blobRef.hash, args.requesting_agent || args.agent_id || '');
       const decoded = blob ? decodeLosslessBlobPayload(blob.value) : null;
       return {
         ...ctx,
@@ -400,8 +402,8 @@ export const contextTools = {
         namespace: { type: 'string', description: 'Optional context namespace/tag (default "default")' },
         trace_id: { type: 'string', description: 'Optional trace identifier for cross-tool diagnostics' },
         span_id: { type: 'string', description: 'Optional span identifier for this context update' },
-        compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto'], description: 'Optional token-saving compression mode (default auto)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto'], description: 'Optional normalization/compression (default none preserves value exactly)' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['agent_id', 'key', 'value'],
     },
@@ -420,7 +422,7 @@ export const contextTools = {
         span_id: { type: 'string', description: 'Optional span identifier for this context update' },
         compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto', 'lossless_auto'], description: 'Compression mode before hashing/storage (lossless_auto is strict and reversible)' },
         hash_truncate: { type: 'number', description: 'Optional short hash length in response (8..64)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['agent_id', 'key', 'payload'],
     },

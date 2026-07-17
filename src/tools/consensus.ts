@@ -183,12 +183,12 @@ function computeAgentQualityWeight(agentId: string): number {
   return Math.round(Math.max(0.7, Math.min(1.2, weight)) * 1000) / 1000;
 }
 
-function loadVotesFromBlob(blobHash: string): { ok: true; data: LoadedVotes; invalid_count: number } | {
+function loadVotesFromBlob(blobHash: string, requestingAgent: string): { ok: true; data: LoadedVotes; invalid_count: number } | {
   ok: false;
   error_code: string;
   error: string;
 } {
-  const blob = getProtocolBlob(blobHash);
+  const blob = getProtocolBlob(blobHash, requestingAgent);
   if (!blob) {
     return {
       ok: false,
@@ -247,7 +247,7 @@ function loadVotesFromBlob(blobHash: string): { ok: true; data: LoadedVotes; inv
   };
 }
 
-function maybeStoreDecisionBlob(payload: Record<string, unknown>): null | {
+function maybeStoreDecisionBlob(payload: Record<string, unknown>, ownerAgentId: string): null | {
   hash: string;
   created: boolean;
   payload_chars: number;
@@ -257,7 +257,7 @@ function maybeStoreDecisionBlob(payload: Record<string, unknown>): null | {
   const payloadJson = JSON.stringify(payload);
   const encoded = encodeLosslessBlobPayloadAuto(payloadJson);
   const fullHash = sha256Hex(encoded.stored_value);
-  const { created } = putProtocolBlob(fullHash, encoded.stored_value);
+  const { created } = putProtocolBlob(fullHash, encoded.stored_value, ownerAgentId);
   return {
     hash: fullHash,
     created,
@@ -297,7 +297,7 @@ export function handleResolveConsensus(args: ResolveConsensusArgs) {
   }
 
   if (blobHash) {
-    const loaded = loadVotesFromBlob(blobHash);
+    const loaded = loadVotesFromBlob(blobHash, args.requesting_agent);
     if (!loaded.ok) {
       logActivity(args.requesting_agent, 'resolve_consensus_rejected', loaded.error);
       return { success: false, error_code: loaded.error_code, error: loaded.error };
@@ -463,7 +463,7 @@ export function handleResolveConsensus(args: ResolveConsensusArgs) {
       decision_id: decision.id,
       emit_blob_ref_policy: emitBlobRefPolicy,
       conflict_detected: hasConflict,
-    })
+    }, args.requesting_agent)
     : null;
 
   if (responseMode === 'tiny') {

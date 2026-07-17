@@ -10,6 +10,20 @@ afterEach(() => {
   closeDb();
 });
 
+describe('watcher identity scoping', () => {
+  it('rejects a requesting_agent/agent_id mismatch across snapshot, wait, and delta reads', async () => {
+    const args = { requesting_agent: 'agent-a', agent_id: 'agent-b' };
+    const snapshot = handleReadSnapshot(args) as Record<string, unknown>;
+    const wait = await handleWaitForUpdates({ ...args, wait_ms: 10 }) as Record<string, unknown>;
+    const deltas = handleReadEventDeltas(args) as Record<string, unknown>;
+
+    for (const result of [snapshot, wait, deltas]) {
+      expect(result.success).toBe(false);
+      expect(result.error_code).toBe('AGENT_SCOPE_MISMATCH');
+    }
+  });
+});
+
 describe('wait_for_updates response modes', () => {
   it('returns compact timeout payload by default', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
@@ -449,6 +463,13 @@ describe('wait_for_updates response modes', () => {
       target_agent_id: 'watcher',
       created_at: 1_000,
     });
+    const missedEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'missed',
+      target_agent_id: 'watcher',
+      created_at: 1_200,
+    });
     const retainedEvent = appendStreamEvent({
       stream: 'messages',
       op: 'created',
@@ -472,7 +493,8 @@ describe('wait_for_updates response modes', () => {
     expect(result.cursor_stale).toBe(true);
     expect(result.resync_required).toBe(true);
     expect(result.resync_hint).toBe('read_snapshot');
-    expect(result.min_event_id).toBe(retainedEvent.id);
+    expect(result.min_event_id).toBe(missedEvent.id);
+    expect(result.event_id).toBe(retainedEvent.id);
   });
 
   it('should support stream filtering and ignore non-watched updates', async () => {
@@ -536,6 +558,28 @@ describe('wait_for_updates response modes', () => {
 });
 
 describe('read_snapshot', () => {
+  it('performs a full state resync when TTL cleanup removed the entire event window', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    createTask({ title: 'known-before-cursor', created_by: 'watcher' });
+    const oldCursor = getStreamEventWatermark({ agent_id: 'watcher' });
+    const missedTask = createTask({ title: 'missed-after-cursor', created_by: 'watcher' });
+
+    cleanupStreamEvents(Date.now() + 10_000, 1);
+
+    const snapshot = handleReadSnapshot({
+      agent_id: 'watcher',
+      cursor: `e:${oldCursor.toString(36)}`,
+      response_mode: 'compact',
+    }) as Record<string, any>;
+
+    expect(snapshot.success).toBe(true);
+    expect(snapshot.cursor_stale).toBe(true);
+    expect(snapshot.resync_performed).toBe(true);
+    expect(snapshot.event_id).toBeGreaterThan(oldCursor);
+    expect(snapshot.cursor).toBe(`e:${snapshot.event_id.toString(36)}`);
+    expect(snapshot.snapshot.tasks.tasks.map((task: { id: number }) => task.id)).toContain(missedTask.id);
+  });
+
   it('returns nano batch with unified event cursor', async () => {
     registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
 
@@ -750,6 +794,13 @@ describe('read_event_deltas', () => {
       target_agent_id: 'watcher',
       created_at: 1_000,
     });
+    const missedEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'missed-delta',
+      target_agent_id: 'watcher',
+      created_at: 1_200,
+    });
     const retainedEvent = appendStreamEvent({
       stream: 'messages',
       op: 'created',
@@ -769,8 +820,33 @@ describe('read_event_deltas', () => {
     expect(result.success).toBe(true);
     expect(result.cursor_stale).toBe(true);
     expect(result.resync_required).toBe(true);
-    expect(result.min_event_id).toBe(retainedEvent.id);
+    expect(result.min_event_id).toBe(missedEvent.id);
     expect(result.events.map((event: { entity_id: string }) => event.entity_id)).toEqual(['retained-delta']);
+  });
+
+  it('does not mark a cursor stale merely because it precedes the first visible event', () => {
+    registerAgent({ id: 'watcher', name: 'Watcher', type: 'codex', capabilities: '' });
+    appendStreamEvent({ stream: 'messages', op: 'created', entity_id: 'private-1', target_agent_id: 'other' });
+    appendStreamEvent({ stream: 'messages', op: 'created', entity_id: 'private-2', target_agent_id: 'other' });
+    const visibleEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'visible',
+      target_agent_id: 'watcher',
+    });
+
+    const result = handleReadEventDeltas({
+      agent_id: 'watcher',
+      cursor: 'e:1',
+      streams: ['messages'],
+      response_mode: 'tiny',
+    }) as Record<string, any>;
+
+    expect(result.success).toBe(true);
+    expect(result.cursor_stale).toBeUndefined();
+    expect(result.resync_required).toBeUndefined();
+    expect(result.events.map((event: { entity_id: string }) => event.entity_id)).toEqual(['visible']);
+    expect(result.event_id).toBe(visibleEvent.id);
   });
 });
 

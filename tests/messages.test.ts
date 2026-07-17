@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { initDb, closeDb, registerAgent } from '../src/db.js';
 import { handleSendMessage, handleSendBlobMessage, handleReadMessages } from '../src/tools/messages.js';
+import { handleGetProtocolBlob, handleStoreProtocolBlob } from '../src/tools/protocol.js';
+import { makeBlobRefEnvelope } from '../src/utils.js';
 
 beforeEach(() => {
   initDb(':memory:');
@@ -14,6 +16,15 @@ describe('message tools', () => {
     const result = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'Hello' });
     expect(result.success).toBe(true);
     expect(result.message.content).toBe('Hello');
+  });
+
+  it('send_message preserves whitespace by default', () => {
+    const content = 'line one\n    line two\n        line three';
+    const result = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.compression.mode).toBe('none');
+    expect(result.message.content).toBe(content);
   });
 
   it('send_message should preserve trace_id/span_id in full and nano reads', () => {
@@ -72,11 +83,22 @@ describe('message tools', () => {
 
   it('send_message should support idempotency key', () => {
     const first = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'same', idempotency_key: 'msg-1' });
-    const second = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'different', idempotency_key: 'msg-1' });
+    const second = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'same', idempotency_key: 'msg-1' });
     expect(first.success).toBe(true);
     expect(second.success).toBe(true);
     if (!first.success || !second.success) return;
     expect(first.message.id).toBe(second.message.id);
+  });
+
+  it('send_message should reject idempotency key reuse with different arguments', () => {
+    const first = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'first', idempotency_key: 'msg-conflict' });
+    const conflict = handleSendMessage({ from_agent: 'a1', to_agent: 'a2', content: 'changed', idempotency_key: 'msg-conflict' });
+
+    expect(first.success).toBe(true);
+    expect(conflict).toMatchObject({ success: false, error_code: 'IDEMPOTENCY_KEY_CONFLICT' });
+    const messages = handleReadMessages({ agent_id: 'a2' });
+    expect(messages.messages).toHaveLength(1);
+    expect(messages.messages[0].content).toBe('first');
   });
 
   it('read_messages compact mode should return previews', () => {
@@ -135,6 +157,33 @@ describe('message tools', () => {
     expect(inbox.messages[0].blob_ref.hash).toBe(result.blob_ref.hash);
     expect(inbox.messages[0].blob_ref.resolved).toBe(true);
     expect(inbox.messages[0].resolved_content).toContain('large handoff payload');
+
+    expect(handleGetProtocolBlob({ agent_id: 'a2', hash: result.blob_ref.hash }).success).toBe(true);
+    registerAgent({ id: 'a3', name: 'A3', type: 'custom', capabilities: '' });
+    expect(handleGetProtocolBlob({ agent_id: 'a3', hash: result.blob_ref.hash }).success).toBe(false);
+  });
+
+  it('grants broadcast blob access explicitly to all agents', () => {
+    registerAgent({ id: 'a3', name: 'A3', type: 'custom', capabilities: '' });
+    const result = handleSendBlobMessage({ from_agent: 'a1', payload: 'broadcast payload' });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(handleGetProtocolBlob({ agent_id: 'a3', hash: result.blob_ref.hash }).success).toBe(true);
+  });
+
+  it('does not resolve a forged reference to another agent private blob', () => {
+    const stored = handleStoreProtocolBlob({ agent_id: 'a1', payload: 'TOP SECRET' });
+    expect(stored.success).toBe(true);
+    if (!stored.success) return;
+    handleSendMessage({
+      from_agent: 'a2',
+      to_agent: 'a2',
+      content: makeBlobRefEnvelope(stored.hash, 10),
+    });
+
+    const inbox = handleReadMessages({ agent_id: 'a2', resolve_blob_refs: true });
+    expect(inbox.messages[0].blob_ref.resolved).toBe(false);
+    expect(inbox.messages[0].resolved_content).toBeNull();
   });
 
   it('send_blob_message lossless_auto should preserve payload exactly on resolve', () => {

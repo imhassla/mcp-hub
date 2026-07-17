@@ -153,6 +153,7 @@ export interface IdempotencyRecord {
   agent_id: string;
   tool_name: string;
   idempotency_key: string;
+  request_hash: string | null;
   response_json: string;
   created_at: number;
 }

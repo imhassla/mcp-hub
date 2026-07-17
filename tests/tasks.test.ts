@@ -37,6 +37,105 @@ describe('task tools', () => {
     expect(result.task!.status).toBe('in_progress');
   });
 
+  it('update_task should reject a self-dependency', () => {
+    const { task } = handleCreateTask({ title: 'Self dependency', created_by: 'a1' });
+
+    const result = handleUpdateTask({ id: task.id, agent_id: 'a1', depends_on: [task.id] });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error_code).toBe('DEPENDENCY_CYCLE');
+  });
+
+  it('update_task should reject done while dependencies are unmet', () => {
+    const { task: upstream } = handleCreateTask({ title: 'unfinished handler dependency', created_by: 'a1' });
+    const { task } = handleCreateTask({
+      title: 'handler dependent',
+      created_by: 'a1',
+      depends_on: [upstream.id],
+    });
+
+    const result = handleUpdateTask({
+      id: task.id,
+      agent_id: 'a1',
+      status: 'done',
+      confidence: 0.96,
+      verification_passed: true,
+      evidence_refs: ['test:handler-too-early'],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error_code: 'DEPENDENCIES_NOT_MET',
+      unmet_dependencies: [upstream.id],
+    });
+  });
+
+  it('update_task should reject in_progress while dependencies are unmet', () => {
+    const { task: upstream } = handleCreateTask({ title: 'unfinished start dependency', created_by: 'a1' });
+    const { task } = handleCreateTask({
+      title: 'handler must not start',
+      created_by: 'a1',
+      depends_on: [upstream.id],
+    });
+
+    const result = handleUpdateTask({
+      id: task.id,
+      agent_id: 'a2',
+      status: 'in_progress',
+      assigned_to: 'a2',
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error_code: 'DEPENDENCIES_NOT_MET',
+      unmet_dependencies: [upstream.id],
+    });
+    expect(handleListTasks({ assigned_to: 'a2', agent_id: 'a2' }).tasks).toHaveLength(0);
+  });
+
+  it('update_task should report active dependents that block an upstream rollback', () => {
+    const { task: upstream } = handleCreateTask({ title: 'completed upstream', created_by: 'a1' });
+    expect(handleUpdateTask({
+      id: upstream.id,
+      agent_id: 'a1',
+      status: 'done',
+      confidence: 0.96,
+      verification_passed: true,
+      evidence_refs: ['test:rollback-upstream'],
+    }).success).toBe(true);
+    const { task: dependent } = handleCreateTask({
+      title: 'active downstream',
+      created_by: 'a1',
+      depends_on: [upstream.id],
+    });
+    expect(handleClaimTask({ task_id: dependent.id, agent_id: 'a2', lease_seconds: 120 }).success).toBe(true);
+
+    expect(handleUpdateTask({
+      id: upstream.id,
+      agent_id: 'a1',
+      status: 'pending',
+    })).toMatchObject({
+      success: false,
+      error_code: 'TASK_HAS_ACTIVE_DEPENDENTS',
+      dependent_task_ids: [dependent.id],
+    });
+  });
+
+  it('update_task should reject dependency mutation after work starts', () => {
+    const { task: upstream } = handleCreateTask({ title: 'handler lock input', created_by: 'a1' });
+    const { task } = handleCreateTask({ title: 'handler lock target', created_by: 'a1' });
+    const claimed = handleClaimTask({ task_id: task.id, agent_id: 'a2', lease_seconds: 120 });
+    expect(claimed.success).toBe(true);
+
+    const result = handleUpdateTask({ id: task.id, agent_id: 'a1', depends_on: [upstream.id] });
+
+    expect(result).toMatchObject({
+      success: false,
+      error_code: 'TASK_DEPENDENCIES_LOCKED',
+    });
+  });
+
   it('list_tasks should filter by status', () => {
     handleCreateTask({ title: 'T1', created_by: 'a1' });
     const { task: t2 } = handleCreateTask({ title: 'T2', created_by: 'a1' });
@@ -79,6 +178,26 @@ describe('task tools', () => {
     expect(released.success).toBe(true);
     if (!released.success) return;
     expect(released.task.status).toBe('done');
+  });
+
+  it('release_task_claim can keep a pending task assigned to the claimant', () => {
+    const { task } = handleCreateTask({ title: 'Retry with same agent', created_by: 'a1', assigned_to: 'a2' });
+    const claimed = handleClaimTask({ task_id: task.id, agent_id: 'a2', lease_seconds: 120 });
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    const released = handleReleaseTaskClaim({
+      task_id: task.id,
+      agent_id: 'a2',
+      claim_id: claimed.claim.claim_id,
+      next_status: 'pending',
+      preserve_assignment: true,
+    });
+
+    expect(released.success).toBe(true);
+    if (!released.success) return;
+    expect(released.task.status).toBe('pending');
+    expect(released.task.assigned_to).toBe('a2');
   });
 
   it('poll_and_claim should return claim metadata and retry hint', () => {
@@ -126,7 +245,7 @@ describe('task tools', () => {
     if (blocked.success) return;
     expect(blocked.error_code).toBe('VERIFIER_REQUIRED');
 
-    const finalized = handleUpdateTask({
+    const unattested = handleUpdateTask({
       id: created.task.id,
       agent_id: 'a1',
       status: 'done',
@@ -135,9 +254,112 @@ describe('task tools', () => {
       verified_by: 'a2',
       evidence_refs: ['ev-1', 'ev-2'],
     });
+    expect(unattested.success).toBe(false);
+    if (!unattested.success) expect(unattested.error_code).toBe('VERIFIER_REQUIRED');
+
+    const attestation = handleUpdateTask({
+      id: created.task.id,
+      agent_id: 'a2',
+      evidence_refs: ['review:a2-approved'],
+    });
+    expect(attestation.success).toBe(true);
+
+    const finalized = handleUpdateTask({
+      id: created.task.id,
+      agent_id: 'a1',
+      status: 'done',
+      confidence: 0.98,
+      verification_passed: true,
+      verified_by: 'a2',
+      evidence_refs: ['ev-1'],
+    });
     expect(finalized.success).toBe(true);
     if (!finalized.success) return;
     expect(finalized.task.status).toBe('done');
+  });
+
+  it('does not let a claimant downgrade a strict done gate or name an unknown verifier', () => {
+    const created = handleCreateTask({
+      title: 'Strict invariant',
+      created_by: 'a1',
+      consistency_mode: 'strict',
+    });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+
+    const claimed = handleClaimTask({ task_id: created.task.id, agent_id: 'a1' });
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    const downgraded = handleReleaseTaskClaim({
+      task_id: created.task.id,
+      agent_id: 'a1',
+      claim_id: claimed.claim.claim_id,
+      next_status: 'done',
+      consistency_mode: 'cheap',
+      confidence: 0.98,
+      verification_passed: true,
+      evidence_refs: ['ev-1', 'ev-2'],
+    });
+    expect(downgraded.success).toBe(false);
+    if (!downgraded.success) expect(downgraded.error_code).toBe('VERIFIER_REQUIRED');
+
+    const fakeVerifier = handleReleaseTaskClaim({
+      task_id: created.task.id,
+      agent_id: 'a1',
+      claim_id: claimed.claim.claim_id,
+      next_status: 'done',
+      consistency_mode: 'cheap',
+      confidence: 0.98,
+      verification_passed: true,
+      verified_by: 'not-a-registered-agent',
+      evidence_refs: ['ev-1', 'ev-2'],
+    });
+    expect(fakeVerifier.success).toBe(false);
+    if (!fakeVerifier.success) expect(fakeVerifier.error_code).toBe('VERIFIER_REQUIRED');
+
+    const unattestedVerifier = handleReleaseTaskClaim({
+      task_id: created.task.id,
+      agent_id: 'a1',
+      claim_id: claimed.claim.claim_id,
+      next_status: 'done',
+      consistency_mode: 'cheap',
+      confidence: 0.98,
+      verification_passed: true,
+      verified_by: 'a2',
+      evidence_refs: ['claimant:result', 'claimant:tests'],
+    });
+    expect(unattestedVerifier.success).toBe(false);
+    if (!unattestedVerifier.success) expect(unattestedVerifier.error_code).toBe('VERIFIER_REQUIRED');
+
+    const update = handleUpdateTask({
+      id: created.task.id,
+      agent_id: 'a1',
+      consistency_mode: 'cheap',
+    });
+    expect(update.success).toBe(true);
+    if (update.success) expect(update.task.consistency_mode).toBe('strict');
+
+    const attestation = handleUpdateTask({
+      id: created.task.id,
+      agent_id: 'a2',
+      evidence_refs: ['review:a2-approved'],
+    });
+    expect(attestation.success).toBe(true);
+
+    const finalized = handleReleaseTaskClaim({
+      task_id: created.task.id,
+      agent_id: 'a1',
+      claim_id: claimed.claim.claim_id,
+      next_status: 'done',
+      consistency_mode: 'cheap',
+      confidence: 0.98,
+      verification_passed: true,
+      verified_by: 'a2',
+      evidence_refs: ['claimant:result'],
+    });
+    expect(finalized.success).toBe(true);
+    if (finalized.success) expect(finalized.task.status).toBe('done');
   });
 
   it('poll_and_claim should prefer dependency-ready tasks', () => {
@@ -166,7 +388,7 @@ describe('task tools', () => {
 
   it('create_task should support idempotency key', () => {
     const first = handleCreateTask({ title: 'Idempotent', created_by: 'a1', idempotency_key: 'create-1' });
-    const second = handleCreateTask({ title: 'Idempotent changed title', created_by: 'a1', idempotency_key: 'create-1' });
+    const second = handleCreateTask({ title: 'Idempotent', created_by: 'a1', idempotency_key: 'create-1' });
     expect(first.success).toBe(true);
     expect(second.success).toBe(true);
     if (!first.success || !second.success) return;
@@ -174,6 +396,17 @@ describe('task tools', () => {
 
     const listed = handleListTasks({ agent_id: 'a1' });
     expect(listed.tasks.filter((task) => task.title.includes('Idempotent'))).toHaveLength(1);
+  });
+
+  it('create_task should reject idempotency key reuse with different arguments', () => {
+    const first = handleCreateTask({ title: 'Original title', created_by: 'a1', idempotency_key: 'create-conflict' });
+    const conflict = handleCreateTask({ title: 'Changed title', created_by: 'a1', idempotency_key: 'create-conflict' });
+
+    expect(first.success).toBe(true);
+    expect(conflict).toMatchObject({ success: false, error_code: 'IDEMPOTENCY_KEY_CONFLICT' });
+    const listed = handleListTasks({ agent_id: 'a1' });
+    expect(listed.tasks.filter((task) => task.title === 'Original title')).toHaveLength(1);
+    expect(listed.tasks.filter((task) => task.title === 'Changed title')).toHaveLength(0);
   });
 
   it('list_tasks delta cursor should support incremental task reads', () => {
@@ -189,6 +422,43 @@ describe('task tools', () => {
     const second = handleListTasks({ agent_id: 'a1', cursor: first.next_cursor, limit: 2, response_mode: 'compact' });
     expect(second.tasks).toHaveLength(1);
     expect(second.has_more).toBe(false);
+  });
+
+  it('surfaces a newly ready dependent task after an existing delta cursor', () => {
+    const base = handleCreateTask({ title: 'cursor dependency', created_by: 'a1' });
+    const child = handleCreateTask({
+      title: 'cursor dependent',
+      created_by: 'a1',
+      depends_on: [base.task.id],
+    });
+    const before = handleListTasks({
+      agent_id: 'a1',
+      status: 'pending',
+      ready_only: true,
+      updated_after: 0,
+      response_mode: 'compact',
+    });
+    expect(before.tasks.map((task) => task.id)).toContain(base.task.id);
+    expect(before.tasks.map((task) => task.id)).not.toContain(child.task.id);
+
+    const completed = handleUpdateTask({
+      id: base.task.id,
+      agent_id: 'a1',
+      status: 'done',
+      confidence: 0.95,
+      verification_passed: true,
+      evidence_refs: ['test:dependency-complete'],
+    });
+    expect(completed.success).toBe(true);
+
+    const after = handleListTasks({
+      agent_id: 'a1',
+      status: 'pending',
+      ready_only: true,
+      cursor: before.next_cursor,
+      response_mode: 'compact',
+    });
+    expect(after.tasks.map((task) => task.id)).toContain(child.task.id);
   });
 
   it('list_tasks tiny mode should return minimal routing fields', () => {
@@ -383,12 +653,20 @@ describe('task tools', () => {
       assigned_to: 'a2',
       depends_on: [base.task.id],
     });
-    handleUpdateTask({
+    expect(handleUpdateTask({
+      id: base.task.id,
+      agent_id: 'a1',
+      status: 'done',
+      confidence: 0.96,
+      verification_passed: true,
+      evidence_refs: ['test:handoff-base'],
+    }).success).toBe(true);
+    expect(handleUpdateTask({
       id: task.id,
       agent_id: 'a1',
       status: 'in_progress',
       evidence_refs: ['handoff:evidence-1'],
-    });
+    }).success).toBe(true);
 
     const artifact = createArtifactRecord({
       id: 'art-handoff-1',

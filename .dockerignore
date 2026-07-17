@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.local
+node_modules
+dist
+deploy/hub.local.env
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+*.summary.json
+hub-observer
+hub-reports

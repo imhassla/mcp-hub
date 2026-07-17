@@ -9,6 +9,10 @@ import {
   handleShareArtifact,
 } from '../src/tools/artifacts.js';
 import { handleAttachTaskArtifact, handleCreateTask, handleListTaskArtifacts } from '../src/tools/tasks.js';
+import {
+  ArtifactDownloadTicketCapacityError,
+  ArtifactUploadTicketCapacityError,
+} from '../src/artifact-ticket-limits.js';
 
 beforeEach(() => {
   initDb(':memory:');
@@ -39,6 +43,24 @@ describe('artifact tools', () => {
     expect(created.artifact.namespace).toBe('EXP-A');
     expect(created.upload.method).toBe('POST');
     expect(created.upload.url).toContain('/artifacts/upload/');
+  });
+
+  it('should return a stable retryable error when upload ticket capacity is exhausted', () => {
+    configureArtifactTicketIssuer(() => {
+      throw new ArtifactUploadTicketCapacityError('agent');
+    });
+
+    const result = handleCreateArtifactUpload({
+      agent_id: 'owner',
+      name: 'capacity.bin',
+    });
+
+    expect(result).toEqual(expect.objectContaining({
+      success: false,
+      error_code: 'ARTIFACT_UPLOAD_TICKET_AGENT_LIMIT_EXCEEDED',
+      retryable: true,
+    }));
+    expect(handleListArtifacts({ agent_id: 'owner' }).artifacts).toHaveLength(0);
   });
 
   it('should require share before non-owner download', () => {
@@ -81,6 +103,30 @@ describe('artifact tools', () => {
     expect(granted.success).toBe(true);
     if (!granted.success) return;
     expect(granted.download.url).toContain('/artifacts/download/');
+  });
+
+  it('returns a retryable error when download ticket capacity is exhausted', () => {
+    const created = handleCreateArtifactUpload({ agent_id: 'owner', name: 'download-capacity.bin' });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    finalizeArtifactUpload({
+      id: created.artifact.id,
+      size_bytes: 8,
+      sha256: 'd'.repeat(64),
+      storage_path: '/tmp/download-capacity.bin',
+    });
+    configureArtifactTicketIssuer(() => {
+      throw new ArtifactDownloadTicketCapacityError('global');
+    });
+
+    expect(handleCreateArtifactDownload({
+      agent_id: 'owner',
+      artifact_id: created.artifact.id,
+    })).toMatchObject({
+      success: false,
+      error_code: 'ARTIFACT_DOWNLOAD_TICKET_CAPACITY_EXCEEDED',
+      retryable: true,
+    });
   });
 
   it('should list visible artifacts in tiny mode', () => {
@@ -266,5 +312,83 @@ describe('artifact tools', () => {
     // 'evil' never gained access via the rejected re-share.
     const evilDownload = handleCreateArtifactDownload({ agent_id: 'evil', artifact_id: created.artifact.id });
     expect(evilDownload.success).toBe(false);
+  });
+
+  it('does not let an artifact grantee widen access through task attachment', () => {
+    registerAgent({ id: 'reviewer', name: 'Reviewer', type: 'codex', capabilities: 'review' });
+    const task = handleCreateTask({ title: 'private review', created_by: 'owner', assigned_to: 'reviewer' });
+    expect(task.success).toBe(true);
+    if (!task.success) return;
+
+    const created = handleCreateArtifactUpload({ agent_id: 'owner', name: 'owner-only.bin' });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    finalizeArtifactUpload({
+      id: created.artifact.id,
+      size_bytes: 16,
+      sha256: 'f'.repeat(64),
+      storage_path: '/tmp/owner-only.bin',
+    });
+    expect(handleShareArtifact({
+      from_agent: 'owner',
+      artifact_id: created.artifact.id,
+      to_agent: 'worker',
+      notify: false,
+    }).success).toBe(true);
+
+    const wideningAttach = handleAttachTaskArtifact({
+      task_id: task.task.id,
+      artifact_id: created.artifact.id,
+      agent_id: 'worker',
+    });
+    expect(wideningAttach).toMatchObject({ success: false, error_code: 'ARTIFACT_NOT_OWNER' });
+    expect(handleListTaskArtifacts({
+      task_id: task.task.id,
+      agent_id: 'reviewer',
+    }).artifacts).toHaveLength(0);
+    expect(handleCreateArtifactDownload({
+      agent_id: 'reviewer',
+      artifact_id: created.artifact.id,
+    })).toMatchObject({ success: false, error_code: 'ARTIFACT_ACCESS_DENIED' });
+
+    const nonSharingAttach = handleAttachTaskArtifact({
+      task_id: task.task.id,
+      artifact_id: created.artifact.id,
+      agent_id: 'worker',
+      auto_share_assignee: false,
+    });
+    expect(nonSharingAttach).toMatchObject({ success: true, shared_to_assignee: false });
+    const reviewerView = handleListTaskArtifacts({
+      task_id: task.task.id,
+      agent_id: 'reviewer',
+    });
+    expect(reviewerView.artifacts).toMatchObject([{ has_access: false }]);
+  });
+
+  it('does not grant access when the requested task binding is invalid', () => {
+    const created = handleCreateArtifactUpload({ agent_id: 'owner', name: 'atomic-share.bin' });
+    expect(created.success).toBe(true);
+    if (!created.success) return;
+    finalizeArtifactUpload({
+      id: created.artifact.id,
+      size_bytes: 16,
+      sha256: 'c'.repeat(64),
+      storage_path: '/tmp/atomic-share.bin',
+    });
+
+    const shared = handleShareArtifact({
+      from_agent: 'owner',
+      artifact_id: created.artifact.id,
+      to_agent: 'worker',
+      task_id: 999_999,
+      notify: false,
+    });
+    expect(shared).toMatchObject({ success: false, error_code: 'TASK_NOT_FOUND' });
+
+    const download = handleCreateArtifactDownload({
+      agent_id: 'worker',
+      artifact_id: created.artifact.id,
+    });
+    expect(download).toMatchObject({ success: false, error_code: 'ARTIFACT_ACCESS_DENIED' });
   });
 });

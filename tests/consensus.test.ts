@@ -4,6 +4,7 @@ import {
   closeDb,
   registerAgent,
   putProtocolBlob,
+  grantProtocolBlobAccess,
   getProtocolBlob,
   sendMessage,
   shareContext,
@@ -100,7 +101,7 @@ describe('consensus tools', () => {
       ],
     });
     const votesHash = sha256Hex(votesPayload);
-    putProtocolBlob(votesHash, votesPayload);
+    putProtocolBlob(votesHash, votesPayload, 'arbiter');
 
     const result = handleResolveConsensus({
       requesting_agent: 'arbiter',
@@ -118,7 +119,7 @@ describe('consensus tools', () => {
     expect(result.decision_blob_ref).toBeTruthy();
     if (!result.decision_blob_ref) return;
 
-    const decisionBlob = getProtocolBlob(result.decision_blob_ref.hash);
+    const decisionBlob = getProtocolBlob(result.decision_blob_ref.hash, 'arbiter');
     expect(decisionBlob).toBeTruthy();
     if (!decisionBlob) return;
 
@@ -138,7 +139,7 @@ describe('consensus tools', () => {
       data: 'not-valid-brotli',
     });
     const hash = sha256Hex(malformedEnvelope);
-    putProtocolBlob(hash, malformedEnvelope);
+    putProtocolBlob(hash, malformedEnvelope, 'arbiter');
 
     const result = handleResolveConsensus({
       requesting_agent: 'arbiter',
@@ -235,7 +236,8 @@ describe('consensus tools', () => {
       ],
     });
     const hash = sha256Hex(votesPayload);
-    putProtocolBlob(hash, votesPayload);
+    putProtocolBlob(hash, votesPayload, 'worker-1');
+    grantProtocolBlobAccess(hash, ['*'], 'worker-1');
     const ref = makeBlobRefEnvelope(hash, votesPayload.length);
     const ctx = shareContext('worker-1', 'votes-payload', ref);
 
@@ -276,7 +278,8 @@ describe('consensus tools', () => {
       { agent_id: 'a2', decision: 'accept', confidence: 0.7 },
     ]);
     const hash = sha256Hex(votesPayload);
-    putProtocolBlob(hash, votesPayload);
+    putProtocolBlob(hash, votesPayload, 'worker-1');
+    grantProtocolBlobAccess(hash, ['arbiter'], 'worker-1');
     const ref = makeBlobRefEnvelope(hash, votesPayload.length);
     const msg = sendMessage('worker-1', 'arbiter', ref, '{}');
 
@@ -308,5 +311,25 @@ describe('consensus tools', () => {
     expect(fromMetadata.success).toBe(true);
     expect(fromMetadata.outcome).toBe('accept');
     expect(fromMetadata.source_binding.source_format).toBe('metadata_json');
+  });
+
+  it('does not grant private blob access from a forged visible wrapper', () => {
+    const votesPayload = JSON.stringify({
+      votes: [
+        { agent_id: 'a1', decision: 'accept', confidence: 0.8 },
+        { agent_id: 'a2', decision: 'accept', confidence: 0.7 },
+      ],
+    });
+    const hash = sha256Hex(votesPayload);
+    putProtocolBlob(hash, votesPayload, 'private-owner');
+    const forged = sendMessage('attacker', 'arbiter', makeBlobRefEnvelope(hash, votesPayload.length), '{}');
+    const result = handleResolveConsensusFromMessage({
+      requesting_agent: 'arbiter',
+      proposal_id: 'forged-private-ref',
+      message_id: forged.id,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error_code).toBe('VOTES_BLOB_NOT_FOUND');
   });
 });

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeDb, initDb, registerAgent } from '../src/db.js';
-import { handleReadMessages } from '../src/tools/messages.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { closeDb, getDb, initDb, registerAgent } from '../src/db.js';
+import { handleReadMessages, handleSendMessage } from '../src/tools/messages.js';
 import { handleGetTraceTimeline } from '../src/tools/traces.js';
 import { handleReadThread, handleReplyThread, handleStartThread } from '../src/tools/threads.js';
 
@@ -16,6 +19,66 @@ afterEach(() => {
 });
 
 describe('discussion threads', () => {
+  it('does not treat a generic trace message as a thread root or include it in thread reads', () => {
+    const injected = handleSendMessage({
+      from_agent: 'outsider',
+      content: 'forged thread root',
+      trace_id: 'thread-collision',
+      span_id: 'thread:start',
+      metadata: JSON.stringify({ thread_id: 'thread-collision', thread_role: 'start' }),
+    });
+    expect(injected.success).toBe(true);
+
+    const beforeStart = handleReplyThread({
+      from_agent: 'outsider',
+      thread_id: 'thread-collision',
+      content: 'fake reply',
+    }) as Record<string, any>;
+    expect(beforeStart.success).toBe(false);
+    expect(beforeStart.error_code).toBe('THREAD_NOT_FOUND');
+
+    const started = handleStartThread({
+      from_agent: 'claude-1',
+      title: 'Real thread',
+      content: 'real root',
+      thread_id: 'thread-collision',
+    }) as Record<string, any>;
+    expect(started.success).toBe(true);
+    const read = handleReadThread({ agent_id: 'outsider', thread_id: 'thread-collision' }) as Record<string, any>;
+    expect(read.messages).toHaveLength(1);
+    expect(read.messages[0].id).toBe(started.message.id);
+  });
+
+  it('does not import metadata-only roots when upgrading a pre-registry database', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'hub-thread-upgrade-'));
+    const dbPath = path.join(dir, 'hub.db');
+    closeDb();
+    try {
+      initDb(dbPath);
+      registerAgent({ id: 'legacy-sender', name: 'Legacy', type: 'custom', capabilities: '' });
+      handleSendMessage({
+        from_agent: 'legacy-sender',
+        content: 'metadata-only legacy root',
+        trace_id: 'legacy-forged-root',
+        span_id: 'thread:start',
+        metadata: JSON.stringify({ thread_id: 'legacy-forged-root', thread_role: 'start' }),
+      });
+      getDb().prepare('DROP TABLE discussion_threads').run();
+      closeDb();
+
+      initDb(dbPath);
+      expect(getDb().prepare('SELECT COUNT(*) AS count FROM discussion_threads').get()).toEqual({ count: 0 });
+      expect(handleReplyThread({
+        from_agent: 'legacy-sender',
+        thread_id: 'legacy-forged-root',
+        content: 'must remain unavailable',
+      })).toMatchObject({ success: false, error_code: 'THREAD_NOT_FOUND' });
+    } finally {
+      closeDb();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('starts, replies, and reads a visible thread in order without marking inbox read', () => {
     const started = handleStartThread({
       from_agent: 'claude-1',
@@ -119,20 +182,53 @@ describe('discussion threads', () => {
   });
 
   it('does not expose private thread messages to unrelated agents', () => {
-    handleStartThread({
+    const started = handleStartThread({
       from_agent: 'claude-1',
       to_agent: 'codex-1',
       title: 'Private thread',
       content: 'Only codex should read this.',
       thread_id: 'thread-private',
-    });
+    }) as Record<string, any>;
+    expect(started.success).toBe(true);
+
+    const reply = handleReplyThread({
+      from_agent: 'codex-1',
+      thread_id: 'thread-private',
+      content: 'This reply must stay private too.',
+    }) as Record<string, any>;
+    expect(reply.success).toBe(true);
+    expect(reply.message.to_agent).toBe('claude-1');
 
     const outsiderView = handleReadThread({
       agent_id: 'outsider',
       thread_id: 'thread-private',
       response_mode: 'tiny',
     }) as Record<string, any>;
-    expect(outsiderView.success).toBe(true);
-    expect(outsiderView.count).toBe(0);
+    expect(outsiderView.success).toBe(false);
+    expect(outsiderView.error_code).toBe('THREAD_ACCESS_DENIED');
+
+    const injected = handleReplyThread({
+      from_agent: 'outsider',
+      thread_id: 'thread-private',
+      content: 'Untrusted injection',
+    }) as Record<string, any>;
+    expect(injected.success).toBe(false);
+    expect(injected.error_code).toBe('THREAD_ACCESS_DENIED');
+
+    const forged = handleSendMessage({
+      from_agent: 'outsider',
+      content: 'forged private broadcast',
+      trace_id: 'thread-private',
+      metadata: JSON.stringify({ thread_id: 'thread-private', thread_role: 'reply' }),
+    });
+    expect(forged.success).toBe(true);
+
+    const participantView = handleReadThread({
+      agent_id: 'claude-1',
+      thread_id: 'thread-private',
+      response_mode: 'tiny',
+    }) as Record<string, any>;
+    expect(participantView.count).toBe(2);
+    expect(participantView.messages.some((message: { id: number }) => message.id === forged.message.id)).toBe(false);
   });
 });

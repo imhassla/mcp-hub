@@ -57,10 +57,10 @@ If any call returns JSON-RPC error `code = -32000` (`Unknown or expired MCP sess
 
 ## Work Cycle
 
-1. **Check inbox** - `read_messages { agent_id: "<your_id>", unread_only: true }`
-2. **Check task board** - `list_tasks { agent_id: "<your_id>" }`
+1. **Wait for a change** - `wait_for_updates { requesting_agent: "<your_id>", streams: ["messages","tasks"], response_mode: "nano", cursor: "<previous_cursor>" }`
+2. **Hydrate changed state** - `read_snapshot { requesting_agent: "<your_id>", response_mode: "nano", cursor: "<previous_cursor>" }`
 3. **Claim task atomically** - `poll_and_claim { agent_id: "<your_id>", lease_seconds: 300, include_artifacts: true }`
-4. **Check context and task handoff** - `get_context {}` + `get_task_handoff { task_id: N, agent_id: "<your_id>", response_mode: "tiny", include_downloads: true }` (for isolated runtime)
+4. **Read the claimed handoff** - `get_task_handoff { task_id: N, agent_id: "<your_id>", response_mode: "tiny", include_downloads: true }` (for isolated runtime)
 5. **Work** - execute tasks (or prepare handoff for reviewer in repo-isolated mode)
 6. **Report progress** - `share_context`, `send_message`, `renew_task_claim` / `release_task_claim`
 
@@ -70,9 +70,10 @@ If any call returns JSON-RPC error `code = -32000` (`Unknown or expired MCP sess
 - **Respect execution profile** - tasks with `execution_mode: "repo"` need repo-runtime, tasks with `execution_mode: "isolated"` need isolated-runtime
 - **If no task is available**, respect `retry_after_ms` from `poll_and_claim` (adaptive value with jitter; do not spam polling)
 - **For idle loops**, use `wait_for_updates { streams: ["messages","tasks"], response_mode: "nano", cursor: "<prev_cursor>" }` before `read_messages`/`list_tasks` and respect `r` (`retry_after_ms` short key in nano mode, adaptive backoff)
-- **Renew lease** about every 5 minutes: `renew_task_claim { task_id: N, agent_id: "<your_id>", lease_seconds: 300, claim_id: "<claim_id>" }`
+- **Renew lease** before one third of its duration remains (for a 300s lease, renew about every 100s): `renew_task_claim { task_id: N, agent_id: "<your_id>", lease_seconds: 300, claim_id: "<claim_id>" }`
 - **Done** - `release_task_claim { task_id: N, agent_id: "<your_id>", next_status: "done", claim_id: "<claim_id>", confidence: 0.95, verification_passed: true, evidence_refs: ["context_id:<id>", "message_id:<id>"] }` + message to creator
-- **Blocked** - `release_task_claim { task_id: N, agent_id: "<your_id>", next_status: "blocked", claim_id: "<claim_id>" }` + message describing blocker
+- **Strict done** - an independent registered reviewer first calls `update_task { id: N, agent_id: "<reviewer_id>", evidence_refs: ["review:<result-ref>"] }`; the claimant then calls `release_task_claim` with `verified_by: "<reviewer_id>"`. A verifier name without verifier-authored evidence is rejected.
+- **Blocked** - `release_task_claim { task_id: N, agent_id: "<your_id>", next_status: "blocked", claim_id: "<claim_id>", preserve_assignment: true }` + message describing blocker; omit `preserve_assignment` when handing ownership back to the pool
 - **Need help** - `send_message` to a specific agent or broadcast (without `to_agent`)
 - **Share context** - `share_context { agent_id: "<your_id>", key: "current_task", value: "description" }`
 
@@ -87,4 +88,4 @@ If any call returns JSON-RPC error `code = -32000` (`Unknown or expired MCP sess
 
 ## Who Else Is In The Team
 
-To see team members: `list_agents {}`
+To see team members: `list_agents { agent_id: "<your-id>", auth_token: "<token>" }`

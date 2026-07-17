@@ -2,6 +2,34 @@ const DEFAULT_HTTP_RETRIES = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
+const IDEMPOTENCY_SUPPORTED_TOOL_NAMES = new Set([
+  'attach_task_artifact',
+  'claim_task',
+  'create_artifact_download',
+  'create_artifact_upload',
+  'create_task',
+  'create_task_artifact_downloads',
+  'delete_task',
+  'poll_and_claim',
+  'release_task_claim',
+  'renew_task_claim',
+  'reply_thread',
+  'send_blob_message',
+  'send_message',
+  'share_artifact',
+  'share_blob_context',
+  'share_context',
+  'start_thread',
+  'update_task',
+  'write_memory',
+]);
+const REPLAY_SAFE_TOOL_NAMES = new Set([
+  'hash_payload',
+  'pack_protocol_message',
+  'unpack_protocol_message',
+  'store_protocol_blob',
+]);
+
 function clampNumber(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -56,6 +84,20 @@ function isRetryableJsonRpcError(json) {
   );
 }
 
+export function isReplaySafeToolCall(name, args = {}) {
+  if (
+    IDEMPOTENCY_SUPPORTED_TOOL_NAMES.has(name)
+    && typeof args?.idempotency_key === 'string'
+    && args.idempotency_key.length > 0
+  ) return true;
+  if (REPLAY_SAFE_TOOL_NAMES.has(name)) return true;
+  if (name === 'read_messages') return args.mark_read === false;
+  if (name === 'read_filter_feed') return args.advance_cursor !== true;
+  if (name === 'fetch_hub_refs') return args.mark_messages_read !== true;
+  if (name === 'get_task_handoff') return args.include_downloads !== true;
+  return /^(read_|get_|list_|search_|fetch_|suggest_)/.test(name);
+}
+
 export async function createMcpClient(endpoint, options = {}) {
   const httpRetries = clampNumber(options.httpRetries, DEFAULT_HTTP_RETRIES, 0, 5);
   const retryDelayMs = clampNumber(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS, 25, 5_000);
@@ -66,15 +108,16 @@ export async function createMcpClient(endpoint, options = {}) {
   let nextId = 1;
   let sessionId = '';
   let rpcRetries = 0;
+  let unsafeRetriesSuppressed = 0;
 
   const recordRetry = (reason) => {
     rpcRetries += 1;
     options.onRetry?.(reason, rpcRetries);
   };
 
-  const postRpc = async (body, currentSessionId = sessionId) => {
+  const postRpc = async (body, currentSessionId = sessionId, maxRetries = httpRetries) => {
     let lastError;
-    for (let attempt = 0; attempt <= httpRetries; attempt += 1) {
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -89,21 +132,33 @@ export async function createMcpClient(endpoint, options = {}) {
           body: JSON.stringify(body),
         });
         const text = await res.text();
+        let json = null;
+        if (text.trim()) {
+          try {
+            json = extractMcpJson(text);
+          } catch (error) {
+            if (res.ok) throw error;
+          }
+        }
         if (!res.ok) {
+          // The hub intentionally returns JSON-RPC -32000 in an HTTP 400/404 response for an
+          // expired session. Preserve that body so call() can reinitialize instead of turning the
+          // recoverable protocol error into an opaque HTTP exception.
+          if (json?.error) return { res, json, text };
           const error = new Error(`MCP HTTP ${res.status}: ${text}`);
-          if (res.status >= 500 && attempt < httpRetries) {
+          if (res.status >= 500 && attempt < maxRetries) {
             lastError = error;
           } else {
             throw error;
           }
         } else {
-          return { res, json: text.trim() ? extractMcpJson(text) : null, text };
+          return { res, json, text };
         }
       } catch (error) {
         lastError = controller.signal.aborted
           ? new Error(`MCP HTTP request timed out after ${timeoutMs}ms`)
           : error;
-        if (attempt >= httpRetries) throw lastError;
+        if (attempt >= maxRetries) throw lastError;
       } finally {
         clearTimeout(timer);
       }
@@ -137,7 +192,7 @@ export async function createMcpClient(endpoint, options = {}) {
       return sessionId;
     },
     get stats() {
-      return { rpc_retries: rpcRetries };
+      return { rpc_retries: rpcRetries, unsafe_retries_suppressed: unsafeRetriesSuppressed };
     },
     async call(name, args) {
       const body = {
@@ -146,15 +201,18 @@ export async function createMcpClient(endpoint, options = {}) {
         method: 'tools/call',
         params: { name, arguments: args },
       };
-      let { json } = await postRpc(body);
+      const replaySafe = isReplaySafeToolCall(name, args);
+      const callRetries = replaySafe ? httpRetries : 0;
+      if (!replaySafe && httpRetries > 0) unsafeRetriesSuppressed += 1;
+      let { json } = await postRpc(body, sessionId, callRetries);
       if (isReinitializeRequired(json)) {
         recordRetry('reinitialize');
         await initializeSession();
-        ({ json } = await postRpc(body));
-      } else if (isRetryableJsonRpcError(json)) {
+        ({ json } = await postRpc(body, sessionId, callRetries));
+      } else if (isRetryableJsonRpcError(json) && replaySafe) {
         recordRetry('jsonrpc');
         await sleep(retryDelayMs);
-        ({ json } = await postRpc(body));
+        ({ json } = await postRpc(body, sessionId, callRetries));
       }
       return parseMcpPayload(json);
     },

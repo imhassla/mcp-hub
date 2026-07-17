@@ -140,7 +140,14 @@ describe('get_hub_digest', () => {
       target_agent_id: 'a2',
       created_at: 1_000,
     });
-    const retainedEvent = appendStreamEvent({
+    const missedEvent = appendStreamEvent({
+      stream: 'messages',
+      op: 'created',
+      entity_id: 'digest-missed',
+      target_agent_id: 'a2',
+      created_at: 1_200,
+    });
+    appendStreamEvent({
       stream: 'messages',
       op: 'created',
       entity_id: 'digest-retained',
@@ -160,6 +167,6 @@ describe('get_hub_digest', () => {
     expect(digest.success).toBe(true);
     expect(digest.digest.events.cursor_stale).toBe(true);
     expect(digest.digest.events.resync_required).toBe(true);
-    expect(digest.digest.events.min_event_id).toBe(retainedEvent.id);
+    expect(digest.digest.events.min_event_id).toBe(missedEvent.id);
   });
 });

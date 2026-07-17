@@ -5,6 +5,8 @@ import { handleSendMessage, handleReadMessages } from '../src/tools/messages.js'
 import { handleCreateTask, handleUpdateTask, handleListTasks } from '../src/tools/tasks.js';
 import { handleShareContext, handleShareBlobContext, handleGetContext } from '../src/tools/context.js';
 import { handleGetActivityLog } from '../src/tools/activity.js';
+import { handleStoreProtocolBlob } from '../src/tools/protocol.js';
+import { makeBlobRefEnvelope } from '../src/utils.js';
 
 beforeEach(() => { initDb(':memory:'); });
 afterEach(() => { closeDb(); });
@@ -113,6 +115,40 @@ describe('integration: full multi-agent scenario', () => {
     expect(ctx.contexts[0].value).toBe('done');
     expect(ctx.contexts[0].trace_id).toBe('trace-ctx');
     expect(ctx.contexts[0].span_id).toBe('span-3');
+  });
+
+  it('share_context preserves whitespace by default', () => {
+    handleRegisterAgent({ id: 'a1', name: 'A1', type: 'claude' });
+    const value = 'line one\n    line two\n        line three';
+    const shared = handleShareContext({ agent_id: 'a1', key: 'exact-text', value });
+    expect(shared.success).toBe(true);
+    if (!shared.success) return;
+    expect(shared.compression.mode).toBe('none');
+
+    const ctx = handleGetContext({ agent_id: 'a1', key: 'exact-text' });
+    expect(ctx.contexts[0].value).toBe(value);
+  });
+
+  it('does not resolve a forged context reference to another agent private blob', () => {
+    handleRegisterAgent({ id: 'owner', name: 'Owner', type: 'claude' });
+    handleRegisterAgent({ id: 'attacker', name: 'Attacker', type: 'codex' });
+    const stored = handleStoreProtocolBlob({ agent_id: 'owner', payload: 'PRIVATE CONTEXT' });
+    expect(stored.success).toBe(true);
+    if (!stored.success) return;
+    handleShareContext({
+      agent_id: 'attacker',
+      key: 'forged-ref',
+      value: makeBlobRefEnvelope(stored.hash, 15),
+    });
+
+    const result = handleGetContext({
+      agent_id: 'attacker',
+      requesting_agent: 'attacker',
+      key: 'forged-ref',
+      resolve_blob_refs: true,
+    });
+    expect(result.contexts[0].blob_ref.resolved).toBe(false);
+    expect(result.contexts[0].resolved_value).toBeNull();
   });
 
   it('context tools should enforce value and query limits', () => {

@@ -7,9 +7,8 @@
 // via read_event_deltas -> fetch_hub_refs, emitting compact hydrated JSONL.
 //
 // Why not bolt --hydrate onto the client: that would couple a clean SSE reader to the
-// full MCP client surface (tools/call, auth, idempotency, session-recovery) and
-// duplicate the bridge runner's createMcpClient. (TODO: extract a shared mcp-client
-// lib so runner + this helper share one session-recovery client.)
+// full MCP client surface (tools/call, auth, idempotency, session-recovery). Hydration
+// instead composes the SSE reader with the shared session-recovery MCP client.
 //
 // Guards: debounce (coalesce bursts), dedup entities, bounded fan-out with NO silent
 // loss (cap per round via read_event_deltas limit; if has_more, drain without skipping),

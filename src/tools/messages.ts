@@ -5,6 +5,7 @@ import {
   heartbeat,
   logActivity,
   putProtocolBlob,
+  grantProtocolBlobAccess,
   getProtocolBlob,
 } from '../db.js';
 import type { Message } from '../types.js';
@@ -123,8 +124,8 @@ export function handleSendMessage(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'send_message', args.idempotency_key, () => {
-    const compressionMode = args.compression_mode || 'auto';
+  return withIdempotency(args.from_agent, 'send_message', args.idempotency_key, args, () => {
+    const compressionMode = args.compression_mode || 'none';
     const compressed = maybeCompressContent(args.content, compressionMode);
     const metadata = normalizeJsonString(args.metadata || '{}');
 
@@ -179,7 +180,7 @@ export function handleSendBlobMessage(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'send_blob_message', args.idempotency_key, () => {
+  return withIdempotency(args.from_agent, 'send_blob_message', args.idempotency_key, args, () => {
     const compressionMode = args.compression_mode || 'lossless_auto';
     const compressed = compressBlobPayload(args.payload, compressionMode);
     const storedPayload = compressed.stored;
@@ -191,7 +192,6 @@ export function handleSendBlobMessage(args: {
 
     const fullHash = sha256Hex(storedPayload);
     const shortLen = Number.isFinite(args.hash_truncate) ? Math.max(8, Math.min(64, Math.floor(Number(args.hash_truncate)))) : 16;
-    const { created } = putProtocolBlob(fullHash, storedPayload);
     const envelope = makeBlobRefEnvelope(fullHash, storedPayload.length);
 
     if (envelope.length > MAX_MESSAGE_CONTENT_CHARS) {
@@ -207,6 +207,7 @@ export function handleSendBlobMessage(args: {
       return { success: false, error_code: 'METADATA_TOO_LONG', error, max_chars: MAX_MESSAGE_METADATA_CHARS };
     }
 
+    const { created } = putProtocolBlob(fullHash, storedPayload, args.from_agent);
     const message = sendMessage(
       args.from_agent,
       args.to_agent || null,
@@ -215,6 +216,7 @@ export function handleSendBlobMessage(args: {
       args.trace_id,
       args.span_id,
     );
+    grantProtocolBlobAccess(fullHash, [args.to_agent || '*'], args.from_agent);
     const target = args.to_agent || 'broadcast';
     logActivity(
       args.from_agent,
@@ -303,7 +305,7 @@ export function handleReadMessages(args: {
     ? slicedMessages.map((message) => {
       const blobRef = parseBlobRefEnvelope(message.content);
       if (!blobRef) return { ...message };
-      const blob = getProtocolBlob(blobRef.hash);
+      const blob = getProtocolBlob(blobRef.hash, args.agent_id);
       const decoded = blob ? decodeLosslessBlobPayload(blob.value) : null;
       return {
         ...message,
@@ -402,8 +404,8 @@ export const messageTools = {
         metadata: { type: 'string', description: 'JSON metadata string' },
         trace_id: { type: 'string', description: 'Optional trace identifier for cross-tool diagnostics' },
         span_id: { type: 'string', description: 'Optional span identifier for this message emission' },
-        compression_mode: { type: 'string', enum: ['none', 'whitespace', 'auto'], description: 'Optional token-saving compression mode (default auto)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        compression_mode: { type: 'string', enum: ['none', 'whitespace', 'auto'], description: 'Optional lossy whitespace compression (default none preserves content exactly)' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['from_agent', 'content'],
     },
@@ -422,7 +424,7 @@ export const messageTools = {
         span_id: { type: 'string', description: 'Optional span identifier for this message emission' },
         compression_mode: { type: 'string', enum: ['none', 'json', 'whitespace', 'auto', 'lossless_auto'], description: 'Compression mode before hashing/storage (lossless_auto is strict and reversible)' },
         hash_truncate: { type: 'number', description: 'Optional short hash length in response (8..64)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
       },
       required: ['from_agent', 'payload'],
     },

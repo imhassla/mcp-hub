@@ -15,6 +15,8 @@ EXTRA_NOTE=""
 RUNTIME_MODE_OVERRIDE=""
 LIFECYCLE_OVERRIDE=""
 REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
+REGISTER_TOKEN_FROM_ARGV=0
+AGENT_TOKEN_FILE="${HUB_AGENT_TOKEN_FILE:-}"
 
 usage() {
   cat <<USAGE
@@ -30,6 +32,7 @@ Options:
   --onboarding <full|compact|none>
   --lifecycle <persistent|ephemeral>
   --register-token <token>
+  --agent-token-file <path>  Persist agent auth for a reusable --agent-id (mode 0600)
   --runtime-mode <repo|isolated|unknown>
   --thread-id <id>       Publish result as a discussion thread reply
   --repo-runtime         Shortcut for --runtime-mode repo
@@ -177,6 +180,11 @@ while [ $# -gt 0 ]; do
       ;;
     --register-token)
       REGISTER_TOKEN="${2:-}"
+      REGISTER_TOKEN_FROM_ARGV=1
+      shift 2
+      ;;
+    --agent-token-file)
+      AGENT_TOKEN_FILE="${2:-}"
       shift 2
       ;;
     --repo-runtime)
@@ -207,6 +215,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$REGISTER_TOKEN_FROM_ARGV" -eq 1 ]; then
+  echo "[security] --register-token is visible in process listings; prefer HUB_REGISTER_TOKEN or MCP_HUB_REGISTER_TOKEN." >&2
+fi
+
 if [ "$BACKEND" != "codex" ] && [ "$BACKEND" != "claude" ]; then
   echo "Unsupported backend: $BACKEND (use codex|claude)" >&2
   exit 1
@@ -230,7 +242,7 @@ fi
 require_cmd jq
 
 if [ -z "$AGENT_ID" ]; then
-  AGENT_ID="${ROLE}-${BACKEND}-$(date +%s)"
+  AGENT_ID="${ROLE}-${BACKEND}-$(date +%s)-$$-${RANDOM}"
 fi
 if [ -z "$AGENT_NAME" ]; then
   role_title="$(printf '%s' "$ROLE" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
@@ -317,18 +329,20 @@ BRIDGE_ARGS=(
   --remember-key "hub-${ROLE}-${BACKEND}-$(date +%s)"
   --remember-tags "hub-launcher,$ROLE,$BACKEND"
   --runtime-mode "${RUNTIME_MODE_OVERRIDE:-auto}"
-  --prompt "$PROMPT"
   --out-dir "${HUB_BRIDGE_OUT_DIR:-/tmp/hub-bridge-launcher}"
 )
 
 if [ -n "${THREAD_ID:-}" ]; then
   BRIDGE_ARGS+=(--thread-id "$THREAD_ID" --thread-role "$ROLE")
 fi
+if [ -n "${AGENT_TOKEN_FILE:-}" ]; then
+  BRIDGE_ARGS+=(--agent-token-file "$AGENT_TOKEN_FILE")
+fi
 
 # T79-F5: pass the registration secret via env (the runner reads BRIDGE_REGISTER_TOKEN) instead of
 # on argv, so it is never visible in `ps`/process listings.
 if [ -n "${REGISTER_TOKEN:-}" ]; then
-  BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN" node "${BRIDGE_ARGS[@]}"
+  printf '%s' "$PROMPT" | BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN" node "${BRIDGE_ARGS[@]}"
 else
-  node "${BRIDGE_ARGS[@]}"
+  printf '%s' "$PROMPT" | node "${BRIDGE_ARGS[@]}"
 fi

@@ -5,10 +5,14 @@ A network MCP server for coordinating multiple AI agents through a shared SQLite
 ## Quick Start
 
 ```bash
+test -f deploy/hub.local.env || cp deploy/hub.local.env.example deploy/hub.local.env
+grep -q '^MCP_HUB_REGISTER_TOKEN=' deploy/hub.local.env || \
+  printf 'MCP_HUB_REGISTER_TOKEN=%s\n' "$(openssl rand -hex 32)" >> deploy/hub.local.env
+chmod 600 deploy/hub.local.env
 ./hub.sh build       # Build Docker image
 ./hub.sh start       # Start daemon on port 3000
 ./hub.sh status      # Check that it is running
-./hub.sh smoke       # Verify MCP handshake (initialize + tools/list)
+./hub.sh smoke       # Verify handshake + registration + authenticated tool call
 ```
 
 ## Management
@@ -20,7 +24,7 @@ A network MCP server for coordinating multiple AI agents through a shared SQLite
 ./hub.sh stop     # Stop
 ./hub.sh restart  # Restart
 ./hub.sh status   # Status + health check
-./hub.sh smoke    # MCP smoke test (initialize + tools/list)
+./hub.sh smoke    # MCP handshake + registration/auth smoke test
 ./hub.sh logs     # Logs (use logs -f to follow)
 ./hub.sh db       # SQLite shell for DB inspection
 ./hub.sh clean    # Remove everything
@@ -31,6 +35,7 @@ A network MCP server for coordinating multiple AI agents through a shared SQLite
 For a comparative baseline vs hash/blob mode run:
 
 ```bash
+set -a; . deploy/hub.local.env; set +a  # expose the same registration secret to helpers
 ./scripts/kpi-round.sh                # default: 10 workers
 WORKERS=12 ./scripts/kpi-round.sh     # upper load boundary
 USE_AUTH_TOKEN=true WORKERS=12 ./scripts/kpi-round.sh   # for auth_mode=enforce
@@ -45,6 +50,7 @@ The script registers orchestrator/workers with `onboarding_mode=none` to avoid u
 To run real CLI workers instead of synthetic calls:
 
 ```bash
+set -a; . deploy/hub.local.env; set +a
 ./scripts/smart-swarm-round.sh
 WORKERS=12 WORKER_BACKEND=mixed ./scripts/smart-swarm-round.sh
 WORKERS=10 WORKER_BACKEND=claude ./scripts/smart-swarm-round.sh
@@ -56,7 +62,7 @@ The worker contract in this round uses `register_agent(onboarding_mode=none)` wi
 Key variables:
 
 ```bash
-ENDPOINT=http://localhost:3000/mcp
+ENDPOINT=http://127.0.0.1:3000/mcp
 WORKERS=8
 WORKER_BACKEND=mixed      # claude | codex | mixed
 USE_AUTH_TOKEN=auto       # auto | true | false
@@ -65,8 +71,7 @@ WORKER_TIMEOUT_SEC=900
 OUT_DIR=/tmp/smart-swarm
 SNAPSHOT_RESPONSE_MODE=auto  # auto | tiny | nano (auto => nano when server supports it)
 ALLOW_BACKEND_FALLBACK=1  # 1 = fallback to another backend on worker runtime failure
-SKIP_CLI_PREFLIGHT=0      # 1 = skip CLI mcp list preflight check
-FORCE_WORKER_ENDPOINT_CONFIG=1  # 1 = force worker CLI to use ENDPOINT
+SKIP_CLI_PREFLIGHT=0      # 1 = skip CLI availability/auth preflight checks
 ```
 
 The script:
@@ -84,7 +89,7 @@ The script:
 To measure transport payload savings in `wait_for_updates`:
 
 ```bash
-ENDPOINT=http://localhost:3300/mcp ROUNDS=12 WAIT_MODES=default,tiny,micro,nano ./scripts/wait-mode-ab.sh
+ENDPOINT=http://127.0.0.1:3300/mcp ROUNDS=12 WAIT_MODES=default,tiny,micro,nano ./scripts/wait-mode-ab.sh
 ```
 
 Output:
@@ -105,10 +110,9 @@ If workers must not change project files:
 Prerequisites:
 
 - `claude` and/or `codex` CLI are installed and authenticated;
-- `agent-hub` is visible in `claude mcp list` / `codex mcp list`;
 - hub is reachable via `ENDPOINT`.
-- Claude workers use `MCP_CONFIG_FILE` (default `.mcp.json`; start from `.mcp.example.json` in this repo);
-- Codex workers use the active configuration from `codex mcp list`.
+- bridge workers do not need direct MCP configuration; the runner deliberately disables backend
+  MCP servers and mediates all authenticated hub calls.
 
 Ready-to-use template for an empty isolated directory:
 
@@ -165,10 +169,19 @@ Key protocol modes:
 
 ```bash
 MCP_HUB_AUTH_MODE=observe|warn|enforce
+MCP_HUB_REGISTER_TOKEN=<bootstrap-secret>
+MCP_HUB_ALLOW_LEGACY_AGENT_CLAIM=false
+MCP_HUB_REGISTER_RATE_LIMIT_RPS=5
+MCP_HUB_REGISTER_RATE_LIMIT_BURST=20
 MCP_HUB_NAMESPACE_GOVERNANCE=off|warn|require
 MCP_HUB_EXTRA_BIND_HOSTS=100.107.1.68[,192.168.1.50]
 MCP_HUB_SESSION_IDLE_TIMEOUT_MS=21600000 # <=0 disables idle session eviction (sessions live until DELETE /mcp or server restart)
+MCP_HUB_SESSION_PROVISIONAL_TTL_MS=60000 # absolute deadline to present valid agent auth after initialize
 MCP_HUB_SESSION_GC_INTERVAL_MS=60000
+MCP_HUB_MAX_SESSIONS=500
+MCP_HUB_MAX_SESSIONS_PER_SOURCE=100
+MCP_HUB_SESSION_INITIALIZE_RPS=10
+MCP_HUB_SESSION_INITIALIZE_BURST=20
 MCP_HUB_UNKNOWN_SESSION_POLICY=error
 MCP_HUB_AGENT_OFFLINE_AFTER_MS=1800000
 MCP_HUB_AGENT_RETENTION_MS=604800000
@@ -188,6 +201,11 @@ MCP_HUB_MAX_EVIDENCE_REFS_PER_CALL=16
 MCP_HUB_MAX_EVIDENCE_REF_CHARS=256
 MCP_HUB_ARTIFACT_MAX_BYTES=52428800
 MCP_HUB_ARTIFACT_TICKET_TTL_SEC=300
+MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_ACTIVE=10000
+MCP_HUB_ARTIFACT_UPLOAD_TICKET_MAX_PER_AGENT=100
+MCP_HUB_ARTIFACT_UPLOAD_RESERVATION_TTL_MS=300000
+MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_ACTIVE=20000
+MCP_HUB_ARTIFACT_DOWNLOAD_TICKET_MAX_PER_AGENT=200
 MCP_HUB_ARTIFACT_UPLOAD_TTL_SEC=300
 MCP_HUB_ARTIFACT_DOWNLOAD_TTL_SEC=180
 MCP_HUB_ARTIFACT_RETENTION_SEC=86400
@@ -207,6 +225,8 @@ The persistent production profile is stored in the repository:
 - `deploy/hub.local.env` (optional local overlay, gitignored)
 
 Port `127.0.0.1` is always published. To add external interfaces, define `MCP_HUB_EXTRA_BIND_HOSTS` in `deploy/hub.local.env`.
+`hub.sh` refuses to start the production `auth_mode=enforce` profile until
+`MCP_HUB_REGISTER_TOKEN` is set in that protected overlay.
 
 Example local overlay:
 
@@ -214,6 +234,7 @@ Example local overlay:
 cp deploy/hub.local.env.example deploy/hub.local.env
 # then edit deploy/hub.local.env and set:
 # MCP_HUB_EXTRA_BIND_HOSTS=100.107.1.68
+# MCP_HUB_PUBLIC_BASE_URL=http://100.107.1.68:3000
 ```
 
 `./hub.sh` picks it up automatically (if the file exists). Priority:
@@ -274,10 +295,11 @@ File: `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ## Codex Connection
 
-Codex supports MCP servers. Use `codex-config.json` or CLI:
+Add the running Streamable HTTP server to Codex:
 
 ```bash
-codex --mcp-server "http://localhost:3000/mcp"
+codex mcp add agent-hub --url http://127.0.0.1:3000/mcp
+codex mcp get agent-hub --json
 ```
 
 ## Network Connection (other machines)
@@ -293,6 +315,12 @@ If an extra bind is configured (for example `MCP_HUB_EXTRA_BIND_HOSTS=100.107.1.
   }
 }
 ```
+
+Set `MCP_HUB_PUBLIC_BASE_URL` to the externally reachable origin as well; artifact upload/download
+URLs otherwise default to `localhost` and will not work from remote clients. Bearer and registration
+tokens require an encrypted trusted network (for example a VPN) or a TLS reverse proxy; do not
+publish the plain HTTP endpoint on an untrusted network. Browser clients also need their exact
+origin in `MCP_HUB_ALLOWED_ORIGINS`.
 
 ## Architecture
 
@@ -312,28 +340,47 @@ One Docker daemon server, all agents connect via HTTP (Streamable HTTP transport
 └─────────────┘              └────────────────────────┘
 ```
 
-## Available Tools (46)
+## Available Tools (65)
 
 | Tool | Description |
 |------|-------------|
 | `register_agent` | Register an agent (call first; use `lifecycle: "ephemeral"` for short-lived workers; provide `runtime_profile` for accurate task routing) |
 | `update_runtime_profile` | Update registered agent `runtime_profile` (useful when working directory/mode changes after start) |
 | `list_agents` | List all agents and statuses (`response_mode`: `full`/`compact`/`summary`) |
+| `suggest_agents` | Rank agents for a capability/model/runtime request |
 | `get_onboarding` | Get onboarding with protocol capabilities and rules |
 | `send_message` | Send a message to one agent or broadcast, supports `trace_id`/`span_id` |
 | `send_blob_message` | Send message as hash-reference to deduplicated blob (single call, default `compression_mode=lossless_auto`; supports `trace_id`/`span_id`) |
 | `read_messages` | Read inbox messages (`response_mode`: `full`/`compact`/`tiny`/`nano`; `full` is forbidden when `polling=true`) |
+| `start_thread` | Start a topic thread backed by trace-scoped messages |
+| `reply_thread` | Reply to an existing discussion thread |
+| `read_thread` | Read a visible discussion thread with cursor pagination |
+| `search_hub` | Search messages, tasks, context, activity, artifacts, and consensus |
+| `fetch_hub_refs` | Hydrate selected search/event references without broad list reads |
+| `save_filter` | Save a reusable signal-feed filter |
+| `list_filters` | List filters owned by the current agent |
+| `read_filter_feed` | Read and optionally advance a saved filter cursor |
+| `delete_filter` | Delete an owned saved filter |
+| `read_signal_feed` | Read a low-token actionable inbox across hub sources |
+| `ack_feed_items` | Acknowledge handled signal-feed items |
+| `get_hub_digest` | Read a bounded multi-source coordination digest |
+| `write_memory` | Store durable, namespace-scoped shared memory |
+| `search_memory` | Search shared memory by text/tags/importance |
+| `get_memory_digest` | Read compact high-value memory at startup |
+| `get_trace_timeline` | Read a cross-source trace timeline |
 | `create_task` | Create task on shared board (`execution_mode`: `any`/`repo`/`isolated`, `consistency_mode`: `auto`/`cheap`/`strict`, supports `trace_id`/`span_id`) |
 | `update_task` | Update task (status, assignment, `execution_mode`, `consistency_mode`, done-gate with `confidence`/`verification_passed`/`evidence_refs`, supports `trace_id`/`span_id`) |
 | `list_tasks` | View task board (`response_mode`: `full`/`compact`/`tiny`/`nano`; `full` is forbidden when `polling=true`) |
+| `suggest_task_agents` | Rank compatible agents for a specific task |
 | `poll_and_claim` | Atomically claim next available task by priority (`include_artifacts` option for tiny attachment refs) |
 | `claim_task` | Claim a specific task in lease mode (anti-duplicate; `include_artifacts` option) |
 | `renew_task_claim` | Renew task lease |
-| `release_task_claim` | Release lease and set final status (`done` requires `confidence`/`verification_passed`/`evidence_refs`; optional `consistency_mode`) |
+| `release_task_claim` | Release lease and set final status (`done` requires `confidence`/`verification_passed`/`evidence_refs`; strict mode also requires `verified_by` with verifier-authored evidence) |
 | `list_task_claims` | List active leased tasks and expiration times |
 | `attach_task_artifact` | Attach artifact to task and auto-share to current assignee (for repo-isolated handoff) |
 | `list_task_artifacts` | List artifacts attached to a task (`full`/`compact`/`tiny`, supports `limit/offset`) |
 | `get_task_handoff` | Get consolidated task handoff packet (deps + evidence refs + artifact hints), optionally with download tickets (`include_downloads`) |
+| `delete_task` | Archive/delete an unclaimed task safely |
 | `share_context` | Share context (key-value), supports `trace_id`/`span_id` |
 | `share_blob_context` | Share context as hash-reference to deduplicated blob (single call, default `compression_mode=lossless_auto`; supports `trace_id`/`span_id`) |
 | `get_context` | Get context from other agents (`response_mode`: `full`/`compact`/`tiny`/`nano`/`summary`, `updated_after` for delta; `full` forbidden when `polling=true`) |
@@ -344,9 +391,9 @@ One Docker daemon server, all agents connect via HTTP (Streamable HTTP transport
 | `pack_protocol_message` | Pack payload into CAEP-v1 packet with adaptive lossless policy (`mode:auto` enables dictionary only with enough size/gain) |
 | `unpack_protocol_message` | Unpack CAEP-v1 packet and validate hash |
 | `hash_payload` | Compute deterministic payload hash for references/dedup |
-| `store_protocol_blob` | Store payload as deduplicated blob by hash |
-| `get_protocol_blob` | Get payload blob by hash |
-| `list_protocol_blobs` | List recent blobs and access counters |
+| `store_protocol_blob` | Store a deduplicated blob; private by default, with explicit public/agent grants |
+| `get_protocol_blob` | Fetch a blob visible to the authenticated agent |
+| `list_protocol_blobs` | List only visible blobs and access counters |
 | `create_artifact_upload` | Create upload ticket + URL for binary side-channel transfer (without MCP payload tokens) |
 | `create_artifact_download` | Create download ticket + URL for shared artifact download |
 | `create_task_artifact_downloads` | Create batch download tickets for task-bound artifacts (single call, supports `limit`) |
@@ -357,9 +404,11 @@ One Docker daemon server, all agents connect via HTTP (Streamable HTTP transport
 | `get_transport_snapshot` | Lightweight wait/poll transport efficiency snapshot for a window (`window_sec`), modes `tiny`/`full` |
 | `wait_for_updates` | Long-poll for updates (`streams` to filter channels, `cursor` for compact delta mode; `response_mode: "nano"` for shortest machine format `c/s/u/r`; `response_mode: "micro"` for compact-compatible mode; `timeout_response: "minimal"` returns only changed flag on timeout; normal timeout returns `retry_after_ms` or `r` in nano mode with adaptive backoff+jitter, can disable via `adaptive_retry:false`) |
 | `read_snapshot` | Batch read for polling loops: one call returns `messages+tasks+context` with a single cursor (`compact`/`tiny`/`nano`) |
+| `read_event_deltas` | Read replayable stream-event deltas from a cursor |
 | `evaluate_slo_alerts` | Recalculate SLO alerts (pending age / claim churn / stale in_progress) |
 | `list_slo_alerts` | List open/closed SLO alerts |
 | `get_auth_coverage` | Auth-token usage coverage by time window and tools |
+| `run_maintenance` | Run retention, claim cleanup, archival, and SLO housekeeping |
 
 Artifact upload/download ticket tools require a client/runtime that actually has MCP tool access and
 has negotiated `artifact_tickets: true`. Bridge-launched CLIs are mediated by the bridge runner and
@@ -420,6 +469,10 @@ What launcher does:
   context and returns a structured result; the bridge handles hub registration, evidence
   publication, and any artifact side-channel work only when its negotiated capabilities include
   `artifact_tickets: true`.
+- sends composed prompts to model backends over stdin instead of process arguments and strips hub
+  credentials from their environment;
+- keeps private-thread results inside that thread: no shared memory/context/broadcast publication,
+  and any full result blob is private with access granted only to the other participant.
 
 Role skill cheatsheets:
 - `skills/codex-hub.md`
@@ -468,7 +521,28 @@ Recommended client algorithm:
 1. Catch `error.code == -32000`.
 2. Re-run handshake: `initialize` -> `notifications/initialized`.
 3. Retry the original request exactly once.
-4. For mutating tools, retry with the same `idempotency_key`.
+4. For tools that advertise `idempotency_key`, preserve the exact same key and arguments.
+
+An explicit `-32000` unknown-session response means the rejected call was not executed by that
+session. A timeout, disconnect, or lost HTTP response is different: execution may already have
+committed. In that case, automatically retry a mutation only when its tool schema advertises
+`idempotency_key`. Side-effecting reads also need argument-aware handling: retry
+`read_messages` only with `mark_read=false`, `read_filter_feed` only without
+`advance_cursor=true`, `fetch_hub_refs` only without `mark_messages_read=true`, and
+`get_task_handoff` only without `include_downloads=true`.
+
+Idempotency keys are limited to 256 characters. A key may only be reused with the same semantic
+arguments (authentication and registration secrets are excluded from the payload fingerprint).
+Reusing a key with different arguments fails with `IDEMPOTENCY_KEY_CONFLICT`; pre-fingerprint
+legacy records fail closed and require a new key.
+
+Artifact upload/download ticket responses are encrypted at rest with a process-ephemeral key.
+They replay within the same server process, but after restart return
+`IDEMPOTENCY_VOLATILE_RESPONSE_EXPIRED`; request a new ticket with a new idempotency key.
+
+Discussion thread roots are server-owned records. Databases upgraded from releases that stored only
+message metadata do not auto-import those legacy roots, because forged metadata is indistinguishable
+from a legitimate old root. Recreate or export important legacy threads before upgrading.
 
 Server also adds:
 
@@ -476,16 +550,25 @@ Server also adds:
 - `error.data.recovery_sequence`
 - HTTP header `x-mcp-reinit-required: 1`
 
-For long-lived pools, you can fully disable idle expiration of transport sessions:
+For long-lived pools, keep a long but finite idle timeout and bound session admission:
 
 ```bash
-MCP_HUB_SESSION_IDLE_TIMEOUT_MS=0
+MCP_HUB_SESSION_IDLE_TIMEOUT_MS=21600000
+MCP_HUB_SESSION_PROVISIONAL_TTL_MS=60000
+MCP_HUB_MAX_SESSIONS=500
+MCP_HUB_MAX_SESSIONS_PER_SOURCE=100
 ```
+
+New sessions are provisional until a non-registration `tools/call` supplies a valid agent subject
+and `auth_token` in `enforce` mode. In `observe`/`warn`, a known caller subject is enough to preserve
+legacy rollout behavior. The provisional deadline is measured from `initialize` and is not extended
+by notifications, `tools/list`, unknown tools, or anonymous traffic. After promotion, the normal
+idle timeout applies. `/health` reports provisional/authenticated counts and both TTLs.
 
 Why not Redis for "live" MCP sessions:
 - In the SDK, transport session keeps in-memory connection state and is not serializable.
 - Redis is useful for metrics/queues/event-store, but transport itself does not resume from Redis after process restart.
-- Practical reliability path: `MCP_HUB_SESSION_IDLE_TIMEOUT_MS=0` (or long timeout) + client auto-reinit on unknown session.
+- Practical reliability path: finite idle timeout + bounded admission + client auto-reinit on unknown session.
 
 ### Onboarding at Agent Startup
 
@@ -496,8 +579,42 @@ Minimal bootstrap contract:
 3. Call all subsequent tools with `auth_token`
 4. Call `get_onboarding { mode: "compact" }` once
 
+Set `MCP_HUB_REGISTER_TOKEN` whenever auth enforcement is enabled. `hub.sh` refuses to start its
+production enforce profile without it. A server started directly without the secret has open
+registration: a client can create a new agent identity and receive its token even when
+`MCP_HUB_AUTH_MODE=enforce`. Keep the secret in the gitignored
+`deploy/hub.local.env` (or another protected env file), then pass the same value as
+`register_token` only during registration. Existing IDs additionally require their current
+`auth_token`; registration never recovers a lost agent token. Tokens are stored in SQLite only as
+SHA-256 digests. A client may provide a strong initial `auth_token` (32..512 characters) and persist
+it before registration; the bridge runner uses this to recover when the first response is lost.
+
+When upgrading a database created by a plaintext-token release, logical rows are migrated to
+digests, but the hub does not run an expensive `VACUUM` during startup. Old token bytes can remain
+in WAL, free pages, or backups until an operator compacts the database. During a maintenance window,
+stop the hub, back up the database, then run this with a local `sqlite3` as the hub's OS user:
+
+```bash
+./hub.sh stop
+DB="${MCP_HUB_DATA:-$HOME/.mcp-hub}/hub.db"
+sqlite3 "$DB" 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA secure_delete=ON; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);'
+chmod 600 "$DB"
+./hub.sh start
+```
+
+Treat pre-compaction backups as containing plaintext credentials and rotate or securely retire them.
+
+Legacy database rows that predate agent tokens are not claimable by default. For a supervised
+migration window, configure `MCP_HUB_REGISTER_TOKEN`, temporarily set
+`MCP_HUB_ALLOW_LEGACY_AGENT_CLAIM=true`, migrate the intended agents, then disable the flag. Never
+enable this mode with open enrollment.
+
+Agent tokens authenticate the caller identity; they are not a full project/task RBAC system. Run
+separate hub instances for mutually untrusted teams until namespace/task authorization policies are
+configured at the deployment boundary.
+
 Token optimization for mass re-registrations:
-- on repeated `register_agent` (same `id`) server defaults to `onboarding_mode=none`;
+- on an authenticated repeated `register_agent` (same `id` plus current `auth_token`) server defaults to `onboarding_mode=none`;
 - first `register_agent` remains detailed (`full` for persistent, `compact` for ephemeral);
 - behavior is configurable via `MCP_HUB_DEFAULT_ONBOARDING_MODE`, `MCP_HUB_EPHEMERAL_DEFAULT_ONBOARDING_MODE`, `MCP_HUB_REREGISTER_ONBOARDING_MODE`.
 
@@ -516,6 +633,8 @@ For swarm workers use `register_agent { ..., lifecycle: "ephemeral" }`:
 6. Codex shares progress: `share_context { agent_id: "codex-1", key: "status", value: "refactoring auth.ts" }`
 7. On completion Codex records result:
    `release_task_claim { task_id: 42, agent_id: "codex-1", next_status: "done", claim_id: "<from claim response>", confidence: 0.95, verification_passed: true, evidence_refs: ["context_id:123", "message_id:456"] }`
+
+For a `strict` task, an independent reviewer must first attach evidence with `update_task`; the claimant then includes that reviewer's ID as `verified_by` in `release_task_claim`. The server rejects self-verification, unknown reviewers, and reviewer IDs that have not authored evidence for the task.
 
 ## Recommendations for Swarm Polling
 

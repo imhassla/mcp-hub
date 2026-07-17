@@ -369,7 +369,10 @@ export function handleReadSnapshot(args: {
   context_namespace?: string;
   resolve_blob_refs?: boolean;
 }) {
-  const watcherAgentId = args.agent_id || args.requesting_agent;
+  if (args.requesting_agent && args.agent_id && args.requesting_agent !== args.agent_id) {
+    return { success: false, error_code: 'AGENT_SCOPE_MISMATCH', error: 'agent_id must match requesting_agent' };
+  }
+  const watcherAgentId = args.requesting_agent || args.agent_id;
   if (args.requesting_agent) heartbeat(args.requesting_agent);
   if (!watcherAgentId) {
     return { success: false, error_code: 'AGENT_ID_REQUIRED', error: 'agent_id or requesting_agent is required' };
@@ -401,53 +404,19 @@ export function handleReadSnapshot(args: {
     agent_id: watcherAgentId,
     streams: [...SNAPSHOT_STREAMS],
   });
-  if (parsedEventCursor !== null) {
-    const cursorState = getCursorStaleness(watcherAgentId, parsedEventCursor, [...SNAPSHOT_STREAMS]);
-    if (cursorState.stale) {
-      const cursor = encodeEventCursor(initialEventWatermark);
-      logActivity(
-        args.requesting_agent || watcherAgentId,
-        'read_snapshot_cursor_stale',
-        `cursor_in=${args.cursor || '-'} min_event_id=${cursorState.min_event_id} event_cursor=${initialEventWatermark}`,
-        { emit_stream_event: false }
-      );
-      if (responseMode === 'nano') {
-        return {
-          s: { m: [], t: [], c: [] },
-          h: { m: 0, t: 0 },
-          ch: { m: 0, t: 0, c: 0, a: 0, r: 0, q: 0 },
-          n: { m: null, t: null },
-          u: cursor,
-          ei: initialEventWatermark,
-          ew: initialEventWatermark,
-          eh: 0,
-          x: 1,
-          m: cursorState.min_event_id,
-        };
-      }
-      return {
-        success: true,
-        response_mode: responseMode,
-        changed: changedStreamMap([]),
-        cursor,
-        event_id: initialEventWatermark,
-        event_watermark: initialEventWatermark,
-        events_has_more: false,
-        events: [],
-        snapshot: {
-          messages: { messages: [], has_more: false, next_cursor: null },
-          tasks: { tasks: [], has_more: false, next_cursor: null },
-          context: { contexts: [], has_more: false, next_cursor: null },
-        },
-        counts: { messages: 0, tasks: 0, context: 0 },
-        cursor_stale: true,
-        resync_required: true,
-        resync_hint: cursorState.resync_hint,
-        min_event_id: cursorState.min_event_id,
-      };
-    }
+  const cursorState = parsedEventCursor !== null
+    ? getCursorStaleness(watcherAgentId, parsedEventCursor, [...SNAPSHOT_STREAMS])
+    : { stale: false, min_event_id: 0 };
+  const cursorStale = cursorState.stale;
+  if (cursorStale) {
+    logActivity(
+      args.requesting_agent || watcherAgentId,
+      'read_snapshot_cursor_stale',
+      `cursor_in=${args.cursor || '-'} min_event_id=${cursorState.min_event_id} event_cursor=${initialEventWatermark}`,
+      { emit_stream_event: false }
+    );
   }
-  const eventChanges = parsedEventCursor !== null
+  const eventChanges = parsedEventCursor !== null && !cursorStale
     ? listStreamEventsAfter({
       agent_id: watcherAgentId,
       after_id: parsedEventCursor,
@@ -456,7 +425,7 @@ export function handleReadSnapshot(args: {
     })
     : [];
   const eventStreams = new Set(eventChanges.map((event) => event.stream));
-  const shouldReadAll = parsedEventCursor === null;
+  const shouldReadAll = parsedEventCursor === null || cursorStale;
   const shouldReadMessages = shouldReadAll || eventStreams.has('messages');
   const shouldReadTasks = shouldReadAll || eventStreams.has('tasks');
   const shouldReadContext = shouldReadAll || eventStreams.has('context');
@@ -543,9 +512,11 @@ export function handleReadSnapshot(args: {
     });
   const lastReturnedEventId = eventChanges.length > 0
     ? eventChanges[eventChanges.length - 1].id
-    : eventWatermark;
+    : Math.max(parsedEventCursor || 0, eventWatermark);
   const eventsHasMore = lastReturnedEventId < eventWatermark;
-  const changed = changedStreamMap([...eventStreams]);
+  const changed = cursorStale
+    ? changedStreamMap([...SNAPSHOT_STREAMS])
+    : changedStreamMap([...eventStreams]);
   const messagesCount = Array.isArray((messages as { m?: unknown[] }).m)
     ? (messages as { m: unknown[] }).m.length
     : Array.isArray((messages as { messages?: unknown[] }).messages)
@@ -597,6 +568,8 @@ export function handleReadSnapshot(args: {
       ei: lastReturnedEventId,
       ew: eventWatermark,
       eh: eventsHasMore ? 1 : 0,
+      x: cursorStale ? 1 : undefined,
+      m: cursorStale ? cursorState.min_event_id : undefined,
     };
   }
 
@@ -625,6 +598,9 @@ export function handleReadSnapshot(args: {
       tasks: tasksCount,
       context: contextCount,
     },
+    cursor_stale: cursorStale || undefined,
+    resync_performed: cursorStale || undefined,
+    min_event_id: cursorStale ? cursorState.min_event_id : undefined,
   };
 }
 
@@ -639,7 +615,10 @@ export async function handleWaitForUpdates(args: {
   response_mode?: WaitResponseMode;
   timeout_response?: WaitTimeoutResponseMode;
 }) {
-  const watcherAgentId = args.agent_id || args.requesting_agent;
+  if (args.requesting_agent && args.agent_id && args.requesting_agent !== args.agent_id) {
+    return { success: false, error_code: 'AGENT_SCOPE_MISMATCH', error: 'agent_id must match requesting_agent' };
+  }
+  const watcherAgentId = args.requesting_agent || args.agent_id;
   if (args.requesting_agent) heartbeat(args.requesting_agent);
   if (!watcherAgentId) {
     return { success: false, error_code: 'AGENT_ID_REQUIRED', error: 'agent_id or requesting_agent is required' };
@@ -861,7 +840,10 @@ export function handleReadEventDeltas(args: {
   include_payload?: boolean;
   response_mode?: 'compact' | 'tiny' | 'nano';
 }) {
-  const watcherAgentId = args.agent_id || args.requesting_agent;
+  if (args.requesting_agent && args.agent_id && args.requesting_agent !== args.agent_id) {
+    return { success: false, error_code: 'AGENT_SCOPE_MISMATCH', error: 'agent_id must match requesting_agent' };
+  }
+  const watcherAgentId = args.requesting_agent || args.agent_id;
   if (args.requesting_agent) heartbeat(args.requesting_agent);
   if (!watcherAgentId) {
     return { success: false, error_code: 'AGENT_ID_REQUIRED', error: 'agent_id or requesting_agent is required' };

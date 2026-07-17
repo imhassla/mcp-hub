@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { createHash } from 'node:crypto';
 import { initDb, closeDb, registerAgent } from '../src/db.js';
 import {
   handlePackProtocolMessage,
@@ -157,6 +158,37 @@ describe('protocol tools', () => {
     expect((unpacked.decoded_payload as { status?: string }).status).toBe('done');
   });
 
+  it('unpack_protocol_message rejects tampered payloads without returning decoded data', () => {
+    const packed = handlePackProtocolMessage({
+      agent_id: 'a1',
+      payload: JSON.stringify({ trusted: true }),
+      payload_format: 'json',
+      mode: 'json',
+    });
+    expect(packed.success).toBe(true);
+    if (!packed.success) return;
+    const packet = JSON.parse(packed.packet_json);
+    packet.d = { trusted: false };
+
+    const unpacked = handleUnpackProtocolMessage({ agent_id: 'a1', packet_json: JSON.stringify(packet) });
+    expect(unpacked.success).toBe(false);
+    if (unpacked.success) return;
+    expect(unpacked.error_code).toBe('HASH_MISMATCH');
+    expect('decoded_payload' in unpacked).toBe(false);
+  });
+
+  it('unpack_protocol_message returns INVALID_PACKET for malformed text data instead of throwing', () => {
+    const body = { d: null, enc: 'json', fmt: 'text', ts: 1, v: 'caep-1' };
+    const hash = createHash('sha256').update(JSON.stringify(body)).digest('hex');
+    const result = handleUnpackProtocolMessage({
+      agent_id: 'a1',
+      packet_json: JSON.stringify({ ...body, h: hash }),
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error_code).toBe('INVALID_PACKET');
+  });
+
   it('hash_payload should return deterministic digest', () => {
     const h1 = handleHashPayload({
       agent_id: 'a1',
@@ -179,6 +211,7 @@ describe('protocol tools', () => {
   });
 
   it('store/get/list protocol blob should work', () => {
+    registerAgent({ id: 'a2', name: 'A2', type: 'codex', capabilities: 'protocol' });
     const payload = JSON.stringify({ agent_id: 'a1', task_id: 99, status: 'done', summary: 'blob-data' });
     const stored = handleStoreProtocolBlob({
       agent_id: 'a1',
@@ -205,6 +238,42 @@ describe('protocol tools', () => {
     });
     expect(listed.success).toBe(true);
     expect(listed.blobs.find((blob) => blob.hash === stored.hash)).toBeTruthy();
+
+    const forbidden = handleGetProtocolBlob({ agent_id: 'a2', hash: stored.hash });
+    expect(forbidden.success).toBe(false);
+    if (!forbidden.success) expect(forbidden.error_code).toBe('BLOB_NOT_FOUND_OR_FORBIDDEN');
+    const outsiderList = handleListProtocolBlobs({ agent_id: 'a2', limit: 10 });
+    expect(outsiderList.blobs.some((blob) => blob.hash === stored.hash)).toBe(false);
+  });
+
+  it('store_protocol_blob preserves payload bytes by default', () => {
+    const payload = 'line one\n    line two\n        line three';
+    const stored = handleStoreProtocolBlob({ agent_id: 'a1', payload });
+    expect(stored.success).toBe(true);
+    if (!stored.success) return;
+    expect(stored.compression_mode).toBe('none');
+
+    const fetched = handleGetProtocolBlob({ agent_id: 'a1', hash: stored.hash });
+    expect(fetched.success).toBe(true);
+    if (!fetched.success) return;
+    expect(fetched.blob.value).toBe(payload);
+  });
+
+  it('requires an explicit grant before another agent can read a stored blob', () => {
+    registerAgent({ id: 'a2', name: 'A2', type: 'codex', capabilities: 'protocol' });
+    const shared = handleStoreProtocolBlob({
+      agent_id: 'a1',
+      payload: 'shared result',
+      share_with_agents: ['a2'],
+    });
+    expect(shared.success).toBe(true);
+    if (!shared.success) return;
+    expect(handleGetProtocolBlob({ agent_id: 'a2', hash: shared.hash }).success).toBe(true);
+
+    const publicBlob = handleStoreProtocolBlob({ agent_id: 'a1', payload: 'public result', visibility: 'public' });
+    expect(publicBlob.success).toBe(true);
+    if (!publicBlob.success) return;
+    expect(handleGetProtocolBlob({ agent_id: 'a2', hash: publicBlob.hash }).success).toBe(true);
   });
 
   it('dictionary packing is lossless for colliding keys (T78-F1)', () => {

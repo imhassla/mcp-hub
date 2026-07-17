@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:3000/mcp}"
 HEALTH_URL="${ENDPOINT%/mcp}/health"
@@ -13,6 +14,7 @@ NAMESPACE="${NAMESPACE:-}"
 ENABLE_THREAD_FEED="${ENABLE_THREAD_FEED:-auto}" # auto | true | false
 THREAD_ID="${THREAD_ID:-}"
 USE_AUTH_TOKEN="${USE_AUTH_TOKEN:-auto}" # auto | true | false
+REGISTER_TOKEN="${HUB_REGISTER_TOKEN:-${MCP_HUB_REGISTER_TOKEN:-}}"
 SNAPSHOT_RESPONSE_MODE="${SNAPSHOT_RESPONSE_MODE:-auto}" # auto | tiny | nano
 MCP_HTTP_CONNECT_TIMEOUT_SEC="${MCP_HTTP_CONNECT_TIMEOUT_SEC:-3}"
 MCP_HTTP_TIMEOUT_SEC="${MCP_HTTP_TIMEOUT_SEC:-25}"
@@ -23,18 +25,25 @@ CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-}"
 CODEX_MODEL="${CODEX_MODEL:-}"
-SKIP_CLI_PREFLIGHT="${SKIP_CLI_PREFLIGHT:-0}" # 1 to skip local CLI MCP checks
+SKIP_CLI_PREFLIGHT="${SKIP_CLI_PREFLIGHT:-0}" # 1 to skip local CLI availability/auth checks
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR/bridge-tokens"
+chmod 700 "$OUT_DIR/bridge-tokens"
 
 if [ -z "$NAMESPACE" ]; then
-  NAMESPACE="SWARM-$(date +%s)"
+  NAMESPACE="SWARM-$(date +%s)-$$-$RANDOM"
+fi
+if ! [[ "$NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._:@-]{0,89}$ ]]; then
+  echo "NAMESPACE must be 1..90 safe identifier characters" >&2
+  exit 1
 fi
 
 EXPERIMENT_TAG="$NAMESPACE"
 ORCHESTRATOR_ID="orch-${EXPERIMENT_TAG}"
+ORCHESTRATOR_TOKEN_FILE="$OUT_DIR/bridge-tokens/${ORCHESTRATOR_ID}.token"
 TASK_PREFIX="[${EXPERIMENT_TAG}]"
 WORKER_PREFIX="sw-${EXPERIMENT_TAG}-"
 BACKEND_MODE_REQUESTED="$WORKER_BACKEND"
@@ -268,12 +277,48 @@ mcp_close() {
   fi
 }
 
+payload_is_replay_safe() {
+  local payload="$1"
+  printf '%s' "$payload" | jq -e '
+    .method == "tools/list"
+    or .method == "notifications/initialized"
+    or (
+      .method == "tools/call"
+      and ((.params.name // "") as $name | (.params.arguments // {}) as $args | (
+        ((([
+          "attach_task_artifact", "claim_task", "create_artifact_download", "create_artifact_upload",
+          "create_task", "create_task_artifact_downloads", "delete_task", "poll_and_claim",
+          "release_task_claim", "renew_task_claim", "reply_thread", "send_blob_message",
+          "send_message", "share_artifact", "share_blob_context", "share_context",
+          "start_thread", "update_task", "write_memory"
+        ] | index($name)) != null) and ((($args.idempotency_key // "") | tostring | length) > 0))
+        or (
+          ($name | test("^(get_|read_|list_|search_|fetch_|suggest_)"))
+          and ($name != "read_messages" or $args.mark_read == false)
+          and ($name != "read_filter_feed" or $args.advance_cursor != true)
+          and ($name != "fetch_hub_refs" or $args.mark_messages_read != true)
+          and ($name != "get_task_handoff" or $args.include_downloads != true)
+        )
+        or ($name | test("^(hash_payload|pack_protocol_message|unpack_protocol_message|store_protocol_blob)$"))
+        or (
+          $name == "register_agent"
+          and ((($args.auth_token // "") | tostring | length) >= 32)
+        )
+      ))
+    )
+  ' >/dev/null 2>&1
+}
+
 curl_post_json() {
   local sid="$1"
   local payload="$2"
   local attempt=1
+  local max_attempts=1
   local response=''
-  while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
+  if payload_is_replay_safe "$payload"; then
+    max_attempts=$((MCP_HTTP_RETRIES + 1))
+  fi
+  while [ "$attempt" -le "$max_attempts" ]; do
     local -a args
     args=(
       -sS
@@ -286,14 +331,12 @@ curl_post_json() {
     if [ -n "$sid" ]; then
       args+=(-H "mcp-session-id: $sid")
     fi
-    args+=(--data "$payload")
-
-    if response=$(curl "${args[@]}"); then
+    if response=$(printf '%s' "$payload" | curl "${args[@]}" --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
 
-    if [ "$attempt" -le "$MCP_HTTP_RETRIES" ]; then
+    if [ "$attempt" -lt "$max_attempts" ]; then
       sleep "$MCP_HTTP_RETRY_DELAY_SEC"
     fi
     attempt=$((attempt + 1))
@@ -306,13 +349,13 @@ curl_init_post() {
   local attempt=1
   local response=''
   while [ "$attempt" -le $((MCP_HTTP_RETRIES + 1)) ]; do
-    if response=$(curl -i -sS \
+    if response=$(printf '%s' "$payload" | curl -i -sS \
       --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" \
       --max-time "$MCP_HTTP_TIMEOUT_SEC" \
       -X POST "$ENDPOINT" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
-      --data "$payload"); then
+      --data-binary @-); then
       printf '%s' "$response"
       return 0
     fi
@@ -439,7 +482,7 @@ with_auth_token() {
     printf '%s' "$args_json"
     return 0
   fi
-  printf '%s' "$args_json" | jq -c --arg token "$token" '. + {auth_token:$token}'
+  printf '%s' "$args_json" | AUTH_TOKEN_VALUE="$token" jq -c '. + {auth_token:env.AUTH_TOKEN_VALUE}'
 }
 
 mcp_tool_call_auth() {
@@ -534,7 +577,12 @@ make_worker_prompt() {
 You are $worker_id ($backend) participating in MCP protocol optimization experiment $EXPERIMENT_TAG.
 The bridge runner handles hub registration, task claim/release, context, message, auth, and evidence.
 
-Produce one compact JSON proposal with exactly 3 hypotheses:
+Produce one compact JSON proposal with exactly 3 hypotheses and these top-level completion fields:
+- verification_passed: true only after validating the JSON shape and required categories
+- confidence: number from 0 to 1
+- verification: {"passed":true,"checks":["three required hypothesis categories present"]}
+
+Required hypotheses:
 - token_economy
 - latency
 - accuracy
@@ -549,10 +597,11 @@ EOF
 
 execute_worker_backend() {
   local backend="$1"
-  local prompt="$2"
+  local prompt_file="$2"
   local log_file="$3"
   local worker_id="${4:-}"
   local task_id="${5:-0}"
+  local failure_status="${6:-blocked}"
   local exit_code
 
   set +e
@@ -568,18 +617,22 @@ execute_worker_backend() {
     --namespace "$NAMESPACE" \
     --key "worker-${worker_id}" \
     --task-id "$task_id" \
+    --agent-token-file "$OUT_DIR/bridge-tokens/${worker_id}.token" \
+    --failure-status "$failure_status" \
     --memory-namespace "$NAMESPACE" \
     --remember-key "worker-${worker_id}-proposal" \
     --remember-tags "smart-swarm,$backend,$EXPERIMENT_TAG" \
     --timeout-ms "$bridge_timeout_ms" \
-    --prompt "$prompt" \
     --expect-json \
     --out-dir "$OUT_DIR/bridge-reports"
   )
   if [ "$USE_THREAD_FEED" -eq 1 ]; then
     bridge_args+=(--thread-id "$THREAD_ID" --thread-role "worker-result" --no-message)
   fi
-  timeout_wrap "$WORKER_TIMEOUT_SEC" node "$ROOT_DIR/scripts/bridge-agent-runner.mjs" "${bridge_args[@]}" >"$log_file" 2>&1
+  (
+    export BRIDGE_REGISTER_TOKEN="$REGISTER_TOKEN"
+    timeout_wrap "$WORKER_TIMEOUT_SEC" node "$ROOT_DIR/scripts/bridge-agent-runner.mjs" "${bridge_args[@]}"
+  ) <"$prompt_file" >"$log_file" 2>&1
   exit_code=$?
   set -e
 
@@ -606,7 +659,7 @@ run_single_worker() {
   local log_file="$4"
   local prompt_file="$5"
   local result_file="$6"
-  local started ended exit_code prompt
+  local started ended exit_code
   local log_bytes=0
   local effective_backend="$backend"
   local fallback_used=0
@@ -615,9 +668,11 @@ run_single_worker() {
   local bridge_summary='null'
 
   started=$(now_ms)
-  prompt=$(cat "$prompt_file")
-
-  exit_code=$(execute_worker_backend "$backend" "$prompt" "$log_file" "$worker_id" "$task_id")
+  local first_failure_status='blocked'
+  if [ "$backend" = 'claude' ] && [ "$ALLOW_BACKEND_FALLBACK" = "1" ] && [ "$CODEX_AVAILABLE" -eq 1 ]; then
+    first_failure_status='pending'
+  fi
+  exit_code=$(execute_worker_backend "$backend" "$prompt_file" "$log_file" "$worker_id" "$task_id" "$first_failure_status")
   if [ -f "$log_file" ]; then
     log_bytes=$(wc -c < "$log_file" | tr -d ' ')
   fi
@@ -630,7 +685,7 @@ run_single_worker() {
     else
       fallback_reason='claude_empty_output'
     fi
-    exit_code=$(execute_worker_backend 'codex' "$prompt" "$log_file" "$worker_id" "$task_id")
+    exit_code=$(execute_worker_backend 'codex' "$prompt_file" "$log_file" "$worker_id" "$task_id" 'blocked')
     if [ -f "$log_file" ]; then
       log_bytes=$(wc -c < "$log_file" | tr -d ' ')
     else
@@ -809,11 +864,26 @@ case "$ENABLE_THREAD_FEED" in
     ;;
 esac
 
-mcp_tool_call "$SESSION_ID" register_agent "$(jq -cn --arg id "$ORCHESTRATOR_ID" --arg n "Smart Swarm Orchestrator" '{id:$id,name:$n,type:"codex",capabilities:"orchestration,experiment",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"}}')"
+ORCHESTRATOR_AUTH_TOKEN="$(
+  BRIDGE_RUNTIME="$ROOT_DIR/scripts/lib/bridge-runtime.mjs" \
+  TOKEN_FILE="$ORCHESTRATOR_TOKEN_FILE" \
+  node --input-type=module -e '
+    import { randomUUID } from "node:crypto";
+    import { pathToFileURL } from "node:url";
+    const { getOrCreateAgentToken } = await import(pathToFileURL(process.env.BRIDGE_RUNTIME).href);
+    process.stdout.write(await getOrCreateAgentToken(process.env.TOKEN_FILE, `${randomUUID()}-${randomUUID()}`));
+  '
+)"
+if [ "${#ORCHESTRATOR_AUTH_TOKEN}" -lt 32 ]; then
+  echo "invalid orchestrator credential in $ORCHESTRATOR_TOKEN_FILE" >&2
+  exit 1
+fi
+
+mcp_tool_call "$SESSION_ID" register_agent "$(REGISTER_TOKEN="$REGISTER_TOKEN" AGENT_AUTH_TOKEN="$ORCHESTRATOR_AUTH_TOKEN" jq -cn --arg id "$ORCHESTRATOR_ID" --arg n "Smart Swarm Orchestrator" '{id:$id,name:$n,type:"codex",capabilities:"orchestration,experiment",onboarding_mode:"none",lifecycle:"persistent",runtime_profile:{mode:"repo",has_git:true,file_count:1,empty_dir:false,source:"client_declared"},auth_token:env.AGENT_AUTH_TOKEN} + (if (env.REGISTER_TOKEN|length)>0 then {register_token:env.REGISTER_TOKEN} else {} end)')"
 assert_success "$TOOL_RESULT" "register_orchestrator"
 ORCHESTRATOR_AUTH_TOKEN=$(printf '%s' "$TOOL_RESULT" | jq -r '.auth.token // empty')
-if [ "$USE_AUTH_TOKEN" = "true" ] && [ -z "$ORCHESTRATOR_AUTH_TOKEN" ]; then
-  echo "orchestrator auth token missing in USE_AUTH_TOKEN=true mode" >&2
+if [ -z "$ORCHESTRATOR_AUTH_TOKEN" ]; then
+  echo "register_agent did not return orchestrator auth token" >&2
   exit 1
 fi
 AUTH_MODE_HINT=$(curl -sS --connect-timeout "$MCP_HTTP_CONNECT_TIMEOUT_SEC" --max-time "$MCP_HTTP_TIMEOUT_SEC" "$HEALTH_URL" 2>/dev/null | jq -r '.auth_mode // "unknown"' 2>/dev/null || echo "unknown")

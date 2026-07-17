@@ -53,6 +53,24 @@ function parseMetadata(value: string): Record<string, unknown> {
   }
 }
 
+function getThreadRoot(threadId: string): Message | null {
+  const row = getDb().prepare(`
+    SELECT m.*
+    FROM discussion_threads dt
+    JOIN messages m ON m.id = dt.root_message_id
+    WHERE dt.thread_id = ?
+      AND dt.created_by = m.from_agent
+      AND dt.to_agent IS m.to_agent
+      AND m.trace_id = dt.thread_id
+      AND m.span_id = 'thread:start'
+      AND json_valid(m.metadata)
+      AND json_extract(m.metadata, '$.thread_id') = dt.thread_id
+      AND json_extract(m.metadata, '$.thread_role') = 'start'
+    LIMIT 1
+  `).get(threadId) as Message | undefined;
+  return row || null;
+}
+
 function formatThreadMessages(messages: Message[], mode: ThreadMode) {
   return messages.map((message) => {
     const metadata = parseMetadata(message.metadata);
@@ -94,7 +112,7 @@ export function handleStartThread(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'start_thread', args.idempotency_key, () => {
+  return withIdempotency(args.from_agent, 'start_thread', args.idempotency_key, args, () => {
     const title = String(args.title || '').trim().slice(0, MAX_THREAD_TITLE_CHARS);
     const content = String(args.content || '').trim();
     if (!title) return { success: false, error_code: 'THREAD_TITLE_REQUIRED', error: 'title is required' };
@@ -103,15 +121,29 @@ export function handleStartThread(args: {
       return { success: false, error_code: 'CONTENT_TOO_LONG', error: `content too long (${content.length})`, max_chars: MAX_THREAD_CONTENT_CHARS };
     }
     const threadId = normalizeThreadId(args.thread_id) || makeThreadId(`${args.from_agent}:${title}:${Date.now()}`);
-    const message = sendMessage(
-      args.from_agent,
-      args.to_agent || null,
-      content,
-      threadMetadata({ thread_id: threadId, title, role: 'start' }),
-      threadId,
-      'thread:start',
-    );
-    logActivity(args.from_agent, 'start_thread', `thread_id=${threadId} message_id=${message.id} to=${args.to_agent || '*'}`);
+    const d = getDb();
+    const createRoot = d.transaction(() => {
+      if (d.prepare('SELECT 1 FROM discussion_threads WHERE thread_id = ?').get(threadId)) return null;
+      const targetAgent = String(args.to_agent || '').trim() || null;
+      const rootMessage = sendMessage(
+        args.from_agent,
+        targetAgent,
+        content,
+        threadMetadata({ thread_id: threadId, title, role: 'start' }),
+        threadId,
+        'thread:start',
+      );
+      d.prepare(`
+        INSERT INTO discussion_threads (thread_id, root_message_id, title, created_by, to_agent, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(threadId, rootMessage.id, title, args.from_agent, targetAgent, rootMessage.created_at);
+      return rootMessage;
+    });
+    const message = createRoot.immediate() as Message | null;
+    if (!message) {
+      return { success: false, error_code: 'THREAD_ALREADY_EXISTS', error: 'thread_id already exists' };
+    }
+    logActivity(args.from_agent, 'start_thread', `thread_id=${threadId} message_id=${message.id} to=${message.to_agent || '*'}`);
     return {
       success: true,
       thread: { thread_id: threadId, title, root_message_id: message.id },
@@ -130,7 +162,7 @@ export function handleReplyThread(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.from_agent);
-  return withIdempotency(args.from_agent, 'reply_thread', args.idempotency_key, () => {
+  return withIdempotency(args.from_agent, 'reply_thread', args.idempotency_key, args, () => {
     const threadId = normalizeThreadId(args.thread_id);
     const content = String(args.content || '').trim();
     if (!threadId) return { success: false, error_code: 'THREAD_ID_REQUIRED', error: 'thread_id is required' };
@@ -138,16 +170,56 @@ export function handleReplyThread(args: {
     if (content.length > MAX_THREAD_CONTENT_CHARS) {
       return { success: false, error_code: 'CONTENT_TOO_LONG', error: `content too long (${content.length})`, max_chars: MAX_THREAD_CONTENT_CHARS };
     }
+    const root = getThreadRoot(threadId);
+    if (!root) {
+      return { success: false, error_code: 'THREAD_NOT_FOUND', error: 'thread_id does not exist' };
+    }
+
+    let targetAgent: string | null;
+    if (root.to_agent !== null) {
+      const participants = new Set([root.from_agent, root.to_agent]);
+      if (!participants.has(args.from_agent)) {
+        return { success: false, error_code: 'THREAD_ACCESS_DENIED', error: 'Agent is not a participant in this private thread' };
+      }
+      const inheritedTarget = args.from_agent === root.from_agent ? root.to_agent : root.from_agent;
+      const requestedTarget = String(args.to_agent || '').trim();
+      if (requestedTarget && requestedTarget !== inheritedTarget) {
+        return {
+          success: false,
+          error_code: 'THREAD_TARGET_MISMATCH',
+          error: 'Private thread replies must target the other participant',
+        };
+      }
+      targetAgent = inheritedTarget;
+    } else {
+      targetAgent = String(args.to_agent || '').trim() || null;
+    }
+
+    if (Number.isFinite(args.parent_message_id)) {
+      const parentId = Math.floor(Number(args.parent_message_id));
+      const parent = parentId > 0
+        ? getDb().prepare(`
+          SELECT 1 FROM messages
+          WHERE id = ? AND trace_id = ?
+            AND json_valid(metadata)
+            AND json_extract(metadata, '$.thread_id') = ?
+            AND (COALESCE(json_extract(metadata, '$.thread_role'), '') != 'start' OR id = ?)
+        `).get(parentId, threadId, threadId, root.id)
+        : null;
+      if (!parent) {
+        return { success: false, error_code: 'THREAD_PARENT_INVALID', error: 'parent_message_id does not belong to this thread' };
+      }
+    }
     const role = String(args.role || 'reply').trim().slice(0, 48) || 'reply';
     const message = sendMessage(
       args.from_agent,
-      args.to_agent || null,
+      targetAgent,
       content,
       threadMetadata({ thread_id: threadId, role, parent_message_id: args.parent_message_id }),
       threadId,
       `thread:${role}`,
     );
-    logActivity(args.from_agent, 'reply_thread', `thread_id=${threadId} message_id=${message.id} role=${role} to=${args.to_agent || '*'}`);
+    logActivity(args.from_agent, 'reply_thread', `thread_id=${threadId} message_id=${message.id} role=${role} to=${targetAgent || '*'}`);
     return { success: true, thread_id: threadId, message };
   });
 }
@@ -164,6 +236,11 @@ export function handleReadThread(args: {
   heartbeat(args.agent_id);
   const threadId = normalizeThreadId(args.thread_id);
   if (!threadId) return { success: false, error_code: 'THREAD_ID_REQUIRED', error: 'thread_id is required' };
+  const root = getThreadRoot(threadId);
+  if (!root) return { success: false, error_code: 'THREAD_NOT_FOUND', error: 'thread_id does not exist' };
+  if (root.to_agent !== null && args.agent_id !== root.from_agent && args.agent_id !== root.to_agent) {
+    return { success: false, error_code: 'THREAD_ACCESS_DENIED', error: 'Agent is not a participant in this private thread' };
+  }
   const mode = normalizeMode(args.response_mode);
   const order = normalizeOrder(args.order);
   const limit = Math.max(1, Math.min(MAX_THREAD_LIMIT, Math.floor(Number(args.limit ?? DEFAULT_THREAD_LIMIT))));
@@ -172,8 +249,14 @@ export function handleReadThread(args: {
   const where: string[] = [
     'm.trace_id = ?',
     '(m.to_agent = ? OR m.to_agent IS NULL OR m.from_agent = ?)',
+    "json_valid(m.metadata) AND json_extract(m.metadata, '$.thread_id') = ?",
+    "(COALESCE(json_extract(m.metadata, '$.thread_role'), '') != 'start' OR m.id = ?)",
   ];
-  const params: Array<string | number> = [args.agent_id, threadId, args.agent_id, args.agent_id];
+  const params: Array<string | number> = [args.agent_id, threadId, args.agent_id, args.agent_id, threadId, root.id];
+  if (root.to_agent !== null) {
+    where.push('m.from_agent IN (?, ?) AND m.to_agent IN (?, ?)');
+    params.push(root.from_agent, root.to_agent, root.from_agent, root.to_agent);
+  }
   if (afterMessageId > 0) {
     where.push('m.id > ?');
     params.push(afterMessageId);
@@ -206,6 +289,11 @@ export function handleReadThread(args: {
   return {
     success: true,
     thread_id: threadId,
+    thread: {
+      from_agent: root.from_agent,
+      to_agent: root.to_agent,
+      private: root.to_agent !== null,
+    },
     count: messages.length,
     messages: formatThreadMessages(messages, mode),
     next_cursor: nextCursor,
@@ -226,7 +314,7 @@ export const threadTools = {
         title: { type: 'string', description: 'Thread title' },
         content: { type: 'string', description: 'Initial message content' },
         thread_id: { type: 'string', description: 'Optional stable thread id; generated if omitted' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },
       },
       required: ['from_agent', 'title', 'content'],
@@ -244,7 +332,7 @@ export const threadTools = {
         to_agent: { type: 'string', description: 'Optional target agent; omit for broadcast reply' },
         parent_message_id: { type: 'number', description: 'Optional parent message id' },
         role: { type: 'string', description: 'Optional role label, e.g. hypothesis/review/decision' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },
       },
       required: ['from_agent', 'thread_id', 'content'],

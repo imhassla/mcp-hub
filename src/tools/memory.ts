@@ -156,7 +156,7 @@ export function handleWriteMemory(args: {
   idempotency_key?: string;
 }) {
   heartbeat(args.agent_id);
-  return withIdempotency(args.agent_id, 'write_memory', args.idempotency_key, () => {
+  return withIdempotency(args.agent_id, 'write_memory', args.idempotency_key, args, () => {
     const text = String(args.text || '').trim();
     if (!text) return { success: false, error_code: 'MEMORY_TEXT_REQUIRED', error: 'text is required' };
     if (text.length > MAX_MEMORY_TEXT_CHARS) {
@@ -323,7 +323,7 @@ export const memoryTools = {
         namespace: { type: 'string', description: `Memory namespace (default ${DEFAULT_MEMORY_NAMESPACE})` },
         tags: { type: 'array', items: { type: 'string' }, description: `Optional tags (max ${MAX_MEMORY_TAGS})` },
         importance: { type: 'number', description: 'Importance 0..1 for digest ordering (default 0.5)' },
-        idempotency_key: { type: 'string', description: 'Optional idempotency key for safe retries' },
+        idempotency_key: { type: 'string', maxLength: 256, description: 'Optional idempotency key for safe retries' },
         auth_token: { type: 'string', description: 'Optional auth token from register_agent' },
       },
       required: ['agent_id', 'key', 'text'],

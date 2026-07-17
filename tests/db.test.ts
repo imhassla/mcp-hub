@@ -1,17 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   initDb, closeDb, getDb, registerAgent, listAgents, heartbeat,
-  sendMessage, readMessages,
+  sendMessage, readMessages, getMessageForAgent,
   createTask, updateTask, listTasks, pollAndClaim, getTaskDependencies, getTaskWithDependencies,
-  claimTask, renewTaskClaim, releaseTaskClaim, listTaskClaims, cleanupExpiredTaskClaims,
+  claimTask, renewTaskClaim, releaseTaskClaim, listTaskClaims, cleanupExpiredTaskClaims, addTaskEvidence, deleteTask,
   getAgentQuality, recordTaskCompletion, recordTaskRollback,
   shareContext, getContext,
   getIdempotencyRecord, saveIdempotencyRecord,
   logActivity, getActivityLog,
   getKpiWindows, evaluateSloAlerts, listSloAlerts,
-  recordAuthEvent, getAuthCoverageSnapshot, getUpdateWatermark, runMaintenance,
+  recordAuthEvent, getAuthCoverageSnapshot, cleanupAuthEvents, getUpdateWatermark, runMaintenance,
   listStreamEventsAfter, getStreamEventWatermark,
-  createArtifactRecord, cleanupArtifacts,
+  createArtifactRecord, finalizeArtifactUpload, cleanupArtifacts, grantArtifactAccess,
+  putProtocolBlob, grantProtocolBlobAccess,
+  validateAgentToken, isAgentIdRetired,
 } from '../src/db.js';
 
 beforeEach(() => {
@@ -47,6 +52,70 @@ function dbDoneReleaseOptions(evidenceRefs = ['test:db-done']) {
 }
 
 describe('agents', () => {
+  it('migrates legacy plaintext credentials to digests without invalidating the client token', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'hub-token-migration-'));
+    const dbPath = path.join(dir, 'hub.db');
+    closeDb();
+    try {
+      initDb(dbPath);
+      registerAgent({ id: 'legacy-token', name: 'Legacy', type: 'custom', capabilities: '' });
+      getDb().prepare('UPDATE agent_tokens SET token = ? WHERE agent_id = ?').run('legacy-plaintext-secret', 'legacy-token');
+      closeDb();
+
+      initDb(dbPath);
+      const row = getDb().prepare('SELECT token FROM agent_tokens WHERE agent_id = ?').get('legacy-token') as { token: string };
+      expect(row.token).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(validateAgentToken('legacy-token', 'legacy-plaintext-secret')).toBe(true);
+    } finally {
+      closeDb();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fail-closed tombstones pre-upgrade orphan actors and retained recipients', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'hub-retired-migration-'));
+    const dbPath = path.join(dir, 'hub.db');
+    closeDb();
+    try {
+      initDb(dbPath);
+      registerAgent({ id: 'survivor', name: 'Survivor', type: 'custom', capabilities: '' });
+      registerAgent({ id: 'deleted-actor', name: 'Deleted', type: 'custom', capabilities: '' });
+      sendMessage('deleted-actor', 'survivor', 'historical actor evidence');
+      sendMessage('survivor', 'future-recipient', 'pre-registration handoff');
+      createTask({ title: 'pre-assigned', created_by: 'survivor', assigned_to: 'task-recipient' });
+      const artifact = createArtifactRecord({
+        id: 'legacy-artifact',
+        created_by: 'survivor',
+        name: 'legacy.bin',
+      });
+      grantArtifactAccess({
+        artifact_id: artifact.id,
+        to_agent: 'artifact-recipient',
+        granted_by: 'survivor',
+      });
+      const blobHash = 'a'.repeat(64);
+      putProtocolBlob(blobHash, 'legacy secret', 'survivor');
+      grantProtocolBlobAccess(blobHash, ['blob-recipient'], 'survivor');
+      // Ensure each assertion is backed by the retained object/ACL, not its derived stream event.
+      getDb().prepare('DELETE FROM stream_events').run();
+
+      getDb().prepare('DELETE FROM agent_tokens WHERE agent_id = ?').run('deleted-actor');
+      getDb().prepare('DELETE FROM retired_agent_ids WHERE agent_id = ?').run('deleted-actor');
+      getDb().prepare('DELETE FROM agents WHERE id = ?').run('deleted-actor');
+      closeDb();
+
+      initDb(dbPath);
+      expect(isAgentIdRetired('deleted-actor')).toBe(true);
+      expect(isAgentIdRetired('future-recipient')).toBe(true);
+      expect(isAgentIdRetired('task-recipient')).toBe(true);
+      expect(isAgentIdRetired('artifact-recipient')).toBe(true);
+      expect(isAgentIdRetired('blob-recipient')).toBe(true);
+    } finally {
+      closeDb();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('should register and list agents', () => {
     registerAgent({ id: 'a1', name: 'Agent 1', type: 'claude', capabilities: 'code,review' });
     registerAgent({ id: 'a2', name: 'Agent 2', type: 'codex', capabilities: 'code' });
@@ -87,7 +156,7 @@ describe('agents', () => {
     const now = Date.now();
     registerAgent({ id: 'fresh', name: 'Fresh Agent', type: 'claude', capabilities: '' });
     registerAgent({ id: 'inactive', name: 'Inactive Agent', type: 'claude', capabilities: '' });
-    registerAgent({ id: 'stale', name: 'Stale Agent', type: 'claude', capabilities: '' });
+    const staleRegistration = registerAgent({ id: 'stale', name: 'Stale Agent', type: 'claude', capabilities: '' });
 
     const db = getDb();
     db.prepare("UPDATE agents SET last_seen = ?, status = 'online' WHERE id = ?").run(now - 2 * 60 * 60 * 1000, 'inactive');
@@ -99,6 +168,7 @@ describe('agents', () => {
 
     const byId = new Map(listAgents().map((agent) => [agent.id, agent]));
     expect(byId.has('stale')).toBe(false);
+    expect(validateAgentToken('stale', staleRegistration.issued_token?.token || '')).toBe(true);
     expect(byId.get('inactive')?.status).toBe('offline');
     expect(byId.get('fresh')?.status).toBe('online');
   });
@@ -177,6 +247,14 @@ describe('messages', () => {
     expect(forA3).toHaveLength(1);
   });
 
+  it('lets the sender retrieve its own direct message without exposing it to outsiders', () => {
+    const message = sendMessage('a1', 'a2', 'private result');
+
+    expect(getMessageForAgent('a1', message.id)?.content).toBe('private result');
+    expect(getMessageForAgent('a2', message.id)?.content).toBe('private result');
+    expect(getMessageForAgent('a3', message.id)).toBeNull();
+  });
+
   it('should append replayable message events with same-millisecond ordering and visibility', () => {
     vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
 
@@ -242,6 +320,35 @@ describe('artifacts cleanup', () => {
     const rows = getDb().prepare('SELECT id FROM artifacts ORDER BY id').all() as Array<{ id: string }>;
     expect(rows.map((row) => row.id)).toEqual(['keep-artifact-ttl-disabled']);
   });
+
+  it('scopes private artifact events to the owner and explicit grantees', () => {
+    const artifact = createArtifactRecord({
+      id: 'private-artifact-events',
+      created_by: 'owner',
+      name: 'private-name.bin',
+    });
+    finalizeArtifactUpload({
+      id: artifact.id,
+      size_bytes: 7,
+      sha256: 'c'.repeat(64),
+      storage_path: '/tmp/private-artifact-events',
+    });
+    grantArtifactAccess({ artifact_id: artifact.id, to_agent: 'grantee', granted_by: 'owner' });
+
+    const ownerEvents = listStreamEventsAfter({ agent_id: 'owner', streams: ['artifacts'], after_id: 0 });
+    expect(ownerEvents.map((event) => event.op)).toEqual([
+      'artifact.created',
+      'artifact.upload.finalized',
+      'artifact.shared',
+    ]);
+    const granteeEvents = listStreamEventsAfter({ agent_id: 'grantee', streams: ['artifacts'], after_id: 0 });
+    expect(granteeEvents.map((event) => event.op)).toEqual(['artifact.shared']);
+    expect(listStreamEventsAfter({ agent_id: 'outsider', streams: ['artifacts'], after_id: 0 })).toHaveLength(0);
+
+    grantArtifactAccess({ artifact_id: artifact.id, to_agent: '*', granted_by: 'owner' });
+    const publicEvents = listStreamEventsAfter({ agent_id: 'outsider', streams: ['artifacts'], after_id: 0 });
+    expect(publicEvents.map((event) => event.op)).toEqual(['artifact.shared']);
+  });
 });
 
 describe('tasks', () => {
@@ -289,6 +396,22 @@ describe('tasks', () => {
     expect(withDeps?.depends_on).toEqual([t2.id]);
   });
 
+  it('rejects dependency updates that would create a cycle', () => {
+    const first = createTask({ title: 'first', created_by: 'a1' });
+    const second = createTask({ title: 'second', created_by: 'a1', depends_on: [first.id] });
+
+    expect(() => updateTask(first.id, { depends_on: [second.id] })).toThrow('DEPENDENCY_CYCLE');
+    expect(getTaskDependencies(first.id)).toEqual([]);
+    expect(getTaskDependencies(second.id)).toEqual([first.id]);
+  });
+
+  it('rejects a task depending on itself instead of silently dropping the dependency', () => {
+    const task = createTask({ title: 'self reference', created_by: 'a1' });
+
+    expect(() => updateTask(task.id, { depends_on: [task.id] })).toThrow('DEPENDENCY_CYCLE');
+    expect(getTaskDependencies(task.id)).toEqual([]);
+  });
+
   it('should poll only dependency-ready tasks', () => {
     const upstream = createTask({ title: 'upstream', created_by: 'a1', priority: 'medium' });
     createTask({ title: 'blocked-critical', created_by: 'a1', priority: 'critical', depends_on: [upstream.id] });
@@ -301,6 +424,138 @@ describe('tasks', () => {
     }
     const second = pollAndClaim('a2', 120);
     expect(second?.task.id).toBe(upstream.id);
+  });
+
+  it('rejects done transitions while dependencies are unmet and rolls back evidence', () => {
+    const upstream = createTask({ title: 'unfinished dependency', created_by: 'a1' });
+    const task = createTask({ title: 'must wait', created_by: 'a1', depends_on: [upstream.id] });
+
+    expect(() => updateTask(task.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:too-early'])))
+      .toThrow('Task dependencies are not completed');
+
+    expect(getTaskWithDependencies(task.id)?.status).toBe('pending');
+    expect((getDb().prepare('SELECT COUNT(*) AS c FROM task_evidence WHERE task_id = ?').get(task.id) as { c: number }).c).toBe(0);
+  });
+
+  it('rejects in_progress transitions while dependencies are unmet and rolls back assignment', () => {
+    const upstream = createTask({ title: 'unfinished start dependency', created_by: 'a1' });
+    const task = createTask({ title: 'must not start', created_by: 'a1', depends_on: [upstream.id] });
+
+    expect(() => updateTask(task.id, { status: 'in_progress', assigned_to: 'a2' }))
+      .toThrow('Task dependencies are not completed');
+
+    expect(getTaskWithDependencies(task.id)).toMatchObject({
+      status: 'pending',
+      assigned_to: null,
+    });
+  });
+
+  it('rejects an upstream rollback while active or done dependents rely on it', () => {
+    const activeUpstream = createTask({ title: 'active rollback dependency', created_by: 'a1' });
+    updateTask(activeUpstream.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:active-upstream']));
+    const activeDependent = createTask({
+      title: 'active dependent',
+      created_by: 'a1',
+      depends_on: [activeUpstream.id],
+    });
+    expect(claimTask(activeDependent.id, 'a2', 120).success).toBe(true);
+
+    expect(() => updateTask(activeUpstream.id, { status: 'pending' })).toThrow(
+      expect.objectContaining({
+        error_code: 'TASK_HAS_ACTIVE_DEPENDENTS',
+        dependent_task_ids: [activeDependent.id],
+      }),
+    );
+    expect(getTaskWithDependencies(activeUpstream.id)?.status).toBe('done');
+
+    const doneUpstream = createTask({ title: 'done rollback dependency', created_by: 'a1' });
+    updateTask(doneUpstream.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:done-upstream']));
+    const doneDependent = createTask({
+      title: 'done dependent',
+      created_by: 'a1',
+      depends_on: [doneUpstream.id],
+    });
+    updateTask(doneDependent.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:done-dependent']));
+
+    expect(() => updateTask(doneUpstream.id, { status: 'blocked' })).toThrow(
+      expect.objectContaining({
+        error_code: 'TASK_HAS_ACTIVE_DEPENDENTS',
+        dependent_task_ids: [doneDependent.id],
+      }),
+    );
+    expect(getTaskWithDependencies(doneUpstream.id)?.status).toBe('done');
+  });
+
+  it('allows an upstream rollback when every dependent is inactive', () => {
+    const upstream = createTask({ title: 'inactive rollback dependency', created_by: 'a1' });
+    updateTask(upstream.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:inactive-upstream']));
+    createTask({ title: 'pending dependent', created_by: 'a1', depends_on: [upstream.id] });
+
+    expect(updateTask(upstream.id, { status: 'pending' })?.status).toBe('pending');
+  });
+
+  it('locks dependency mutation for active, in-progress, and done tasks', () => {
+    const dependency = createTask({ title: 'dependency lock input', created_by: 'a1' });
+    const claimedTask = createTask({ title: 'claimed lock', created_by: 'a1' });
+    expect(claimTask(claimedTask.id, 'a2', 120).success).toBe(true);
+    expect(() => updateTask(claimedTask.id, { depends_on: [dependency.id] }))
+      .toThrow('Task dependencies cannot change');
+
+    const inProgress = createTask({ title: 'in progress lock', created_by: 'a1' });
+    updateTask(inProgress.id, { status: 'in_progress' });
+    expect(() => updateTask(inProgress.id, { depends_on: [dependency.id] }))
+      .toThrow('Task dependencies cannot change');
+
+    const done = createTask({ title: 'done lock', created_by: 'a1' });
+    updateTask(done.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:done-lock']));
+    expect(() => updateTask(done.id, { depends_on: [dependency.id] }))
+      .toThrow('Task dependencies cannot change');
+  });
+
+  it('rejects deleting a task that still has dependents', () => {
+    const upstream = createTask({ title: 'delete protected', created_by: 'a1' });
+    const dependent = createTask({ title: 'delete dependent', created_by: 'a1', depends_on: [upstream.id] });
+
+    expect(deleteTask(upstream.id)).toEqual({
+      success: false,
+      error_code: 'TASK_HAS_DEPENDENTS',
+      error: 'Task cannot be deleted while other tasks depend on it',
+      dependent_task_ids: [dependent.id],
+    });
+    expect(getTaskWithDependencies(upstream.id)).not.toBeNull();
+    expect(getTaskDependencies(dependent.id)).toEqual([upstream.id]);
+  });
+
+  it('keeps updated_at monotonic across readiness and an immediate claim', () => {
+    const upstream = createTask({ title: 'cursor upstream', created_by: 'a1' });
+    const dependent = createTask({ title: 'cursor dependent', created_by: 'a1', depends_on: [upstream.id] });
+    const fixedNow = Math.max(upstream.updated_at, dependent.updated_at);
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+    updateTask(upstream.id, { status: 'done' }, dbDoneUpdateOptions('a1', ['test:cursor-upstream']));
+    const ready = getTaskWithDependencies(dependent.id)!;
+    const claimed = claimTask(dependent.id, 'a2', 120);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    expect(claimed.task.updated_at).toBeGreaterThan(ready.updated_at);
+    const delta = listTasks({ cursor: { ts: ready.updated_at, id: ready.id } });
+    expect(delta.find((row) => row.id === dependent.id)?.status).toBe('in_progress');
+  });
+
+  it('prioritizes tasks assigned to the polling agent and protects them from other agents', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'a2', name: 'A2', type: 'codex', capabilities: '' });
+    const assigned = createTask({ title: 'assigned', created_by: 'a1', assigned_to: 'a2', priority: 'low' });
+    createTask({ title: 'unassigned', created_by: 'a1', priority: 'critical' });
+
+    const denied = claimTask(assigned.id, 'a1', 120);
+    expect(denied.success).toBe(false);
+    if (!denied.success) expect(denied.error_code).toBe('TASK_ASSIGNED_TO_OTHER');
+
+    const claimed = pollAndClaim('a2', 120);
+    expect(claimed?.task.id).toBe(assigned.id);
+    expect(claimed?.task.assigned_to).toBe('a2');
   });
 });
 
@@ -373,6 +628,23 @@ describe('task claims', () => {
     expect(listTaskClaims({})).toHaveLength(0);
   });
 
+  it.each(['pending', 'blocked'] as const)('can preserve assignment when releasing to %s', (nextStatus) => {
+    const task = createTask({ title: `Keep ${nextStatus} owner`, created_by: 'a1', assigned_to: 'a2' });
+    const claimed = claimTask(task.id, 'a2', 120);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    const released = releaseTaskClaim(task.id, 'a2', nextStatus, claimed.claim.claim_id, {
+      preserveAssignment: true,
+    });
+
+    expect(released.success).toBe(true);
+    if (!released.success) return;
+    expect(released.task.status).toBe(nextStatus);
+    expect(released.task.assigned_to).toBe('a2');
+    expect(listTaskClaims({})).toHaveLength(0);
+  });
+
   it('should reject direct done release without done-gate metadata', () => {
     const task = createTask({ title: 'Finish guarded', created_by: 'a1' });
     const first = claimTask(task.id, 'a2', 120);
@@ -434,8 +706,9 @@ describe('task claims', () => {
     expect(badRelease.error_code).toBe('CLAIM_ID_MISMATCH');
   });
 
-  it('should avoid assigning task when stale claim row already exists', () => {
-    const task = createTask({ title: 'Stale claim row', created_by: 'a1', priority: 'high' });
+  it('should skip a pending task with an active claim and claim the next eligible task', () => {
+    const task = createTask({ title: 'Active claim row', created_by: 'a1', priority: 'high' });
+    const fallback = createTask({ title: 'Next eligible', created_by: 'a1', priority: 'low' });
     const now = Date.now();
     const db = getDb();
     db.prepare(`
@@ -444,11 +717,82 @@ describe('task claims', () => {
     `).run(task.id, 'ghost-agent', 'ghost-claim-id', now, now + 60_000, now);
 
     const claimed = pollAndClaim('a2', 120);
-    expect(claimed).toBeNull();
+    expect(claimed?.task.id).toBe(fallback.id);
 
     const refreshed = listTasks({ status: 'pending' });
     expect(refreshed.find((t) => t.id === task.id)?.assigned_to ?? null).toBeNull();
     expect(listTaskClaims({}).find((c) => c.task_id === task.id)?.agent_id).toBe('ghost-agent');
+  });
+});
+
+describe('atomic task stream events', () => {
+  it('rolls back update_task when its primary stream event cannot be persisted', () => {
+    const task = createTask({ title: 'before update event', created_by: 'a1' });
+    getDb().exec(`
+      CREATE TRIGGER fail_task_updated
+      BEFORE INSERT ON stream_events
+      WHEN NEW.op = 'task.updated'
+      BEGIN
+        SELECT RAISE(ABORT, 'task event blocked');
+      END
+    `);
+
+    expect(() => updateTask(task.id, { title: 'after update event' })).toThrow('task event blocked');
+    expect(getTaskWithDependencies(task.id)?.title).toBe('before update event');
+  });
+
+  it('rolls back claim_task when its primary stream event cannot be persisted', () => {
+    const task = createTask({ title: 'claim event atomicity', created_by: 'a1' });
+    getDb().exec(`
+      CREATE TRIGGER fail_task_claimed
+      BEFORE INSERT ON stream_events
+      WHEN NEW.op = 'task.claimed'
+      BEGIN
+        SELECT RAISE(ABORT, 'task event blocked');
+      END
+    `);
+
+    expect(() => claimTask(task.id, 'a2', 120)).toThrow('task event blocked');
+    expect(getTaskWithDependencies(task.id)?.status).toBe('pending');
+    expect(listTaskClaims().some((row) => row.task_id === task.id)).toBe(false);
+  });
+
+  it('rolls back renew_task_claim when its primary stream event cannot be persisted', () => {
+    const task = createTask({ title: 'renew event atomicity', created_by: 'a1' });
+    const claimed = claimTask(task.id, 'a2', 120);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+    getDb().exec(`
+      CREATE TRIGGER fail_task_renewed
+      BEFORE INSERT ON stream_events
+      WHEN NEW.op = 'task.claim.renewed'
+      BEGIN
+        SELECT RAISE(ABORT, 'task event blocked');
+      END
+    `);
+
+    expect(() => renewTaskClaim(task.id, 'a2', 300, claimed.claim.claim_id)).toThrow('task event blocked');
+    const current = listTaskClaims().find((row) => row.task_id === task.id);
+    expect(current?.lease_expires_at).toBe(claimed.claim.lease_expires_at);
+  });
+
+  it('rolls back release_task_claim when its primary stream event cannot be persisted', () => {
+    const task = createTask({ title: 'release event atomicity', created_by: 'a1' });
+    const claimed = claimTask(task.id, 'a2', 120);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+    getDb().exec(`
+      CREATE TRIGGER fail_task_released
+      BEFORE INSERT ON stream_events
+      WHEN NEW.op = 'task.claim.released'
+      BEGIN
+        SELECT RAISE(ABORT, 'task event blocked');
+      END
+    `);
+
+    expect(() => releaseTaskClaim(task.id, 'a2', 'pending', claimed.claim.claim_id)).toThrow('task event blocked');
+    expect(getTaskWithDependencies(task.id)?.status).toBe('in_progress');
+    expect(listTaskClaims().some((row) => row.task_id === task.id)).toBe(true);
   });
 });
 
@@ -631,9 +975,61 @@ describe('auth coverage', () => {
     expect(coverage.valid_coverage_pct).toBeCloseTo(33.33, 2);
     expect(coverage.by_tool.length).toBeGreaterThanOrEqual(1);
   });
+
+  it('coalesces auth floods without losing coverage counts', () => {
+    for (let index = 0; index < 10_000; index += 1) {
+      recordAuthEvent(`forged-${index}`, 'list_agents', 'invalid');
+    }
+
+    const coverage = getAuthCoverageSnapshot(60_000);
+    expect(coverage.total_events).toBe(10_000);
+    expect(coverage.invalid_events).toBe(10_000);
+    expect(coverage.by_tool).toContainEqual(expect.objectContaining({
+      tool_name: 'list_agents',
+      total: 10_000,
+      invalid: 10_000,
+    }));
+    cleanupAuthEvents(Date.now() + 10_000, 60_000);
+    const rows = getDb().prepare(`
+      SELECT COUNT(*) AS count, SUM(event_count) AS events
+      FROM auth_events
+      WHERE tool_name = 'list_agents' AND status = 'invalid'
+    `).get() as { count: number; events: number };
+    expect(rows.count).toBe(1);
+    expect(rows.events).toBe(10_000);
+  });
 });
 
 describe('claim lifecycle correctness (F3/F5)', () => {
+  it('rejects renew and release after lease expiry even while cleanup is throttled', () => {
+    registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
+    const now = Date.now();
+    cleanupExpiredTaskClaims(now, { force: true });
+    const task = createTask({ title: 'Expired owner write', created_by: 'a1' });
+    const claimed = claimTask(task.id, 'a1', 300);
+    expect(claimed.success).toBe(true);
+    if (!claimed.success) return;
+
+    getDb().prepare('UPDATE task_claims SET lease_expires_at = ? WHERE task_id = ?').run(now - 1, task.id);
+
+    const renewed = renewTaskClaim(task.id, 'a1', 300, claimed.claim.claim_id);
+    expect(renewed.success).toBe(false);
+    if (!renewed.success) expect(renewed.error_code).toBe('CLAIM_EXPIRED');
+
+    const released = releaseTaskClaim(
+      task.id,
+      'a1',
+      'done',
+      claimed.claim.claim_id,
+      dbDoneReleaseOptions(['test:expired-owner'])
+    );
+    expect(released.success).toBe(false);
+    if (!released.success) expect(released.error_code).toBe('CLAIM_EXPIRED');
+
+    expect(getTaskWithDependencies(task.id)?.status).toBe('in_progress');
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM task_claims WHERE task_id = ?').get(task.id)).toEqual({ c: 1 });
+  });
+
   it('allows takeover of an expired lease even while cleanup is throttled (F3)', () => {
     registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
     registerAgent({ id: 'a2', name: 'A2', type: 'claude', capabilities: '' });
@@ -703,6 +1099,35 @@ describe('claim lifecycle correctness (F3/F5)', () => {
 });
 
 describe('atomic done-gate evidence persistence (F6)', () => {
+  it('requires verifier-authored evidence inside the release transaction', () => {
+    registerAgent({ id: 'claimant', name: 'Claimant', type: 'claude', capabilities: '' });
+    registerAgent({ id: 'verifier', name: 'Verifier', type: 'codex', capabilities: '' });
+    const task = createTask({ title: 'Strict DB gate', created_by: 'claimant', consistency_mode: 'strict' });
+    const claim = claimTask(task.id, 'claimant', 300);
+    expect(claim.success).toBe(true);
+    if (!claim.success) return;
+
+    const options = {
+      evidenceRefs: ['claimant:result'],
+      minEvidenceRefs: 2,
+      confidence: 0.98,
+      requiredConfidence: 0.95,
+      confidenceFloor: 0.95,
+      verificationPassed: true,
+      verifiedBy: 'verifier',
+      requireIndependentVerifier: true,
+    };
+    const unattested = releaseTaskClaim(task.id, 'claimant', 'done', claim.claim.claim_id, options);
+    expect(unattested.success).toBe(false);
+    if (!unattested.success) expect(unattested.error_code).toBe('VERIFIER_REQUIRED');
+    expect(listTaskClaims().some((row) => row.task_id === task.id)).toBe(true);
+
+    addTaskEvidence(task.id, 'verifier', ['review:approved']);
+    const finalized = releaseTaskClaim(task.id, 'claimant', 'done', claim.claim.claim_id, options);
+    expect(finalized.success).toBe(true);
+    if (finalized.success) expect(finalized.task.status).toBe('done');
+  });
+
   it('refuses direct update_task done without done-gate metadata and rolls back atomically', () => {
     registerAgent({ id: 'a1', name: 'A1', type: 'claude', capabilities: '' });
     const task = createTask({ title: 'Direct update guarded', created_by: 'a1' });
